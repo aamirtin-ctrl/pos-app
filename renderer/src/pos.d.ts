@@ -15,7 +15,7 @@ declare global {
       people: { list: Call; get: Call; patch: Call; merge: Call; reconnect: Call };
       query: { rank: Call };
       groups: { list: Call; create: Call; assign: Call; remove: Call; hide: Call };
-      commitments: { list: Call; confirm: Call; drop: Call };
+      commitments: { list: Call; confirm: Call; drop: Call; schedule: Call };
       tasks: { braindump: Call; list: Call; setStatus: Call };
       plan: { generate: Call; get: Call; accept: Call; push: Call };
       outcomes: { needed: Call; capture: Call; adherence: Call };
@@ -26,6 +26,7 @@ declare global {
         spend: Call; setCeiling: Call; get: Call; set: Call;
       };
       assistant: { command: Call };
+      stt: { transcribe: Call };
       drafts: { list: Call; generate: Call; setStatus: Call };
       voice: { synthesize: Call; get: Call };
       app: { openFullDiskAccess: Call };

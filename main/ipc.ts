@@ -14,6 +14,7 @@ import { listCommitments, confirmCommitment, dropCommitment } from "./crm/commit
 import { embedProfiles, makeQueryEmbedder } from "./llm/embeddings.ts";
 import * as planner from "./planner.ts";
 import { handleCommand } from "./assistant.ts";
+import { transcribe } from "./stt.ts";
 import { generateDrafts, listDrafts, setDraftStatus, synthesizeVoices, getVoices } from "./crm/drafts.ts";
 import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learning.ts";
 import { runSync, syncStatus } from "./workers.ts";
@@ -81,6 +82,20 @@ export function registerIpc(deps: IpcDeps) {
   h("commitments.list", (status?: string) => listCommitments(db, status));
   h("commitments.confirm", (id: number) => confirmCommitment(db, id));
   h("commitments.drop", (id: number) => dropCommitment(db, id));
+  // right-click → schedule: commitment becomes a task on today's plan date
+  h("commitments.schedule", (id: number) => {
+    const c = db.prepare("SELECT id, description, due_at FROM commitment WHERE id = ?").get(id) as
+      | { id: number; description: string; due_at: string | null } | undefined;
+    if (!c) throw new Error("commitment not found");
+    const today = new Date().toISOString().slice(0, 10);
+    db.prepare(
+      `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
+        commitment_id, status, plan_date, hard_deadline_at, estimate_source)
+       VALUES (?, 'admin', 2, 30, 30, ?, 'inbox', ?, ?, 'inferred')`
+    ).run(c.description.slice(0, 120), c.id, today, c.due_at);
+    db.prepare("UPDATE commitment SET status = 'scheduled' WHERE id = ?").run(id);
+    return { scheduled: true };
+  });
 
   // ── planner ──
   h("tasks.braindump", (text: string, dateISO: string) =>
@@ -168,6 +183,7 @@ export function registerIpc(deps: IpcDeps) {
   });
   h("settings.get", (key: string) => getSetting(db, key));
   h("settings.set", (key: string, value: string) => setSetting(db, key, value));
+  h("stt.transcribe", (wav: Uint8Array) => transcribe(doctrineDir, wav));
   h("app.openFullDiskAccess", () =>
     shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
   );

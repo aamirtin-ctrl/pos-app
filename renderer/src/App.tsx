@@ -84,6 +84,38 @@ function Branch({ blooms }: { blooms: number }) {
   );
 }
 
+// 16kHz mono WAV recorder for whisper.cpp
+function makeRecorder() {
+  let ctx: AudioContext, stream: MediaStream, proc: ScriptProcessorNode, chunks: Float32Array[] = [];
+  return {
+    async start() {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      ctx = new AudioContext({ sampleRate: 16000 });
+      const src = ctx.createMediaStreamSource(stream);
+      proc = ctx.createScriptProcessor(4096, 1, 1);
+      chunks = [];
+      proc.onaudioprocess = (e) => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+      src.connect(proc); proc.connect(ctx.destination);
+    },
+    stop(): Uint8Array {
+      proc.disconnect(); stream.getTracks().forEach((t) => t.stop()); ctx.close();
+      const len = chunks.reduce((a, c) => a + c.length, 0);
+      const pcm = new Int16Array(len);
+      let o = 0;
+      for (const c of chunks) for (let i = 0; i < c.length; i++) pcm[o++] = Math.max(-32768, Math.min(32767, c[i] * 32767));
+      const buf = new ArrayBuffer(44 + pcm.length * 2);
+      const v = new DataView(buf);
+      const w = (off: number, str: string) => { for (let i = 0; i < str.length; i++) v.setUint8(off + i, str.charCodeAt(i)); };
+      w(0, "RIFF"); v.setUint32(4, 36 + pcm.length * 2, true); w(8, "WAVEfmt ");
+      v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+      v.setUint32(24, 16000, true); v.setUint32(28, 32000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+      w(36, "data"); v.setUint32(40, pcm.length * 2, true);
+      new Int16Array(buf, 44).set(pcm);
+      return new Uint8Array(buf);
+    },
+  };
+}
+
 // One unified command box: small top-right button → one-line popup. Routes to
 // planning, people search, notes, or questions over everything (main/assistant.ts).
 function CommandBar() {
@@ -91,6 +123,35 @@ function CommandBar() {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [reply, setReply] = useState<null | { kind: string; reply: string; results?: { id: number; name: string }[]; hits?: { type: string; label: string; sub: string; href: string }[] }>(null);
+  const [rec, setRec] = useState<ReturnType<typeof makeRecorder> | null>(null);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement;
+      if (e.shiftKey && (e.key === "A" || e.key === "a") &&
+          !/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) && !el.isContentEditable) {
+        e.preventDefault();
+        setOpen((o) => !o);
+        setReply(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  const mic = async () => {
+    if (rec) {
+      const wav = rec.stop();
+      setRec(null);
+      setBusy(true);
+      const r = await window.pos.stt.transcribe(wav);
+      const d = r.data as { text?: string; error?: string } | undefined;
+      if (d?.text) setText((t) => (t ? t + " " : "") + d.text);
+      else setReply({ kind: "error", reply: d?.error ?? r.error ?? "transcription failed" });
+      setBusy(false);
+    } else {
+      const rc = makeRecorder();
+      try { await rc.start(); setRec(rc); } catch { setReply({ kind: "error", reply: "Microphone access denied." }); }
+    }
+  };
   const submit = async () => {
     if (!text.trim() || busy) return;
     setBusy(true);
@@ -122,10 +183,20 @@ function CommandBar() {
               value={text}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit()}
-              placeholder="Plan my day · find anything · who to ask about X · note about Sarah…"
+              placeholder="Shift+A · plan my day · find anything · note about Sarah…"
               className="flex-1 border rounded-lg px-3 py-1.5 text-sm"
               style={{ borderColor: "var(--line)" }}
             />
+            <button onClick={mic} title={rec ? "Stop and transcribe" : "Dictate (whisper.cpp)"}
+              className="px-2.5 py-1.5 rounded-lg text-sm border bg-white"
+              style={{ borderColor: rec ? "var(--danger)" : "var(--line)", color: rec ? "var(--danger)" : "var(--ink)" }}>
+              {rec ? "◼" : (
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+                  <rect x="9" y="3" width="6" height="11" rx="3" />
+                  <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
+                </svg>
+              )}
+            </button>
             <button onClick={submit} disabled={busy}
               className="px-3.5 py-1.5 rounded-lg text-sm text-white disabled:opacity-50"
               style={{ background: "linear-gradient(135deg, var(--pink-3), var(--accent))" }}>

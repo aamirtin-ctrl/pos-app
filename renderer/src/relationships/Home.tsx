@@ -174,13 +174,29 @@ function CommitmentList({
   peopleById: Map<number, PersonLite>;
   act: (fn: () => Promise<unknown>) => Promise<void>;
 }) {
+  const [menu, setMenu] = useState<{ x: number; y: number; id: number } | null>(null);
+  useEffect(() => {
+    const close = () => setMenu(null);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, []);
   if (rows.length === 0) return null;
   return (
     <div className="space-y-1.5">
+      {menu && (
+        <div className="fixed z-50 rounded-lg border bg-white shadow-lg py-1 text-sm"
+          style={{ left: menu.x, top: menu.y, borderColor: "var(--line)" }}>
+          <button className="block w-full text-left px-3 py-1 hover:bg-[var(--wash)]"
+            onClick={() => { const id = menu.id; setMenu(null); act(() => window.pos.commitments.schedule(id)); }}>
+            Add to today's plan
+          </button>
+        </div>
+      )}
       {rows.map((c) => {
         const person = c.person_id != null ? peopleById.get(c.person_id) : undefined;
         return (
-          <div key={c.id} className="rounded-md border bg-white px-2.5 py-2" style={{ borderColor: "var(--line)" }}>
+          <div key={c.id} className="rounded-md border bg-white px-2.5 py-2" style={{ borderColor: "var(--line)" }}
+            onContextMenu={(e) => { e.preventDefault(); setMenu({ x: e.clientX, y: e.clientY, id: c.id }); }}>
             <div className="text-sm leading-snug">{c.description}</div>
             <div className="flex items-center gap-2 mt-1 text-[11px]" style={{ color: "var(--muted)" }}>
               {person && (

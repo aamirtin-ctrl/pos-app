@@ -22,6 +22,7 @@ contextBridge.exposeInMainWorld("pos", {
   },
   commitments: {
     list: call("commitments.list"),
+    schedule: call("commitments.schedule"),
     confirm: call("commitments.confirm"),
     drop: call("commitments.drop"),
   },
@@ -59,6 +60,7 @@ contextBridge.exposeInMainWorld("pos", {
     set: call("settings.set"),
   },
   assistant: { command: call("assistant.command") },
+  stt: { transcribe: call("stt.transcribe") },
   drafts: { list: call("drafts.list"), generate: call("drafts.generate"), setStatus: call("drafts.setStatus") },
   voice: { synthesize: call("voice.synthesize"), get: call("voice.get") },
   app: { openFullDiskAccess: call("app.openFullDiskAccess") },
