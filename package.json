@@ -12,7 +12,7 @@
     "build:renderer": "vite build",
     "build": "npm run build:main && npm run build:preload && npm run build:renderer",
     "rebuild:node": "npm rebuild better-sqlite3",
-    "rebuild:electron": "electron-builder install-app-deps",
+    "rebuild:electron": "cd node_modules/better-sqlite3 && npx prebuild-install -r electron -t 33.4.11",
     "dev": "npm run rebuild:electron && npm run build:main && npm run build:preload && VITE_DEV=1 concurrently -k \"vite\" \"electron .\"",
     "start": "npm run rebuild:electron && npm run build && electron .",
     "test": "vitest run",

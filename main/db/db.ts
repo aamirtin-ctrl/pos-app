@@ -4,10 +4,8 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
-import { createRequire } from "node:module";
+import * as sqliteVec from "sqlite-vec";
 import { MIGRATIONS } from "./migrations.ts";
-
-const req = createRequire(import.meta.url);
 
 export type Db = Database.Database;
 
@@ -27,8 +25,9 @@ export function openDb(dbPath: string): Db {
   // sqlite-vec: best-effort. Vector retrieval degrades to keyword prefilter without it.
   vecAvailable = false;
   try {
-    const sqliteVec = req("sqlite-vec");
-    sqliteVec.load(db);
+    // In the packaged app the dylib lives in app.asar.unpacked — dlopen can't read asar.
+    const vecPath = sqliteVec.getLoadablePath().replace("app.asar" + path.sep, "app.asar.unpacked" + path.sep);
+    db.loadExtension(vecPath.replace(/\.dylib$/, "")); // sqlite re-appends the suffix
     vecAvailable = true;
   } catch (e) {
     console.warn(`sqlite-vec unavailable (${(e as Error).message}); vector search disabled`);

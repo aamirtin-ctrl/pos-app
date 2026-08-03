@@ -38,8 +38,12 @@ function createWindow() {
   });
 }
 
+// Spec-locked data location: ~/Library/Application Support/pos — pin it BEFORE ready
+// so Electron never invents a productName-cased sibling ("POS/").
+app.setPath("userData", path.join(app.getPath("appData"), "pos"));
+
 app.whenReady().then(() => {
-  const userData = app.getPath("userData"); // ~/Library/Application Support/pos
+  const userData = app.getPath("userData");
   app.setName("POS");
   db = openDb(path.join(userData, "pos.db"));
   const secrets = new SecretStore(userData);

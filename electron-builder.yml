@@ -16,4 +16,6 @@ mac:
       arch: [arm64]
   category: public.app-category.productivity
   identity: null   # unsigned local build; sign before distributing beyond this machine
-npmRebuild: true
+# Rebuild handled explicitly by `npm run rebuild:electron` (prebuild-install with the
+# electron runtime) — electron-builder's own rebuild restores the wrong (node) prebuild.
+npmRebuild: false

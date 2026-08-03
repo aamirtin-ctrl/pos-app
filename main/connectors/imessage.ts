@@ -51,7 +51,8 @@ interface SqliteDatabase {
 interface SqliteModule {
   DatabaseSync: new (path: string, options?: { readOnly?: boolean }) => SqliteDatabase;
 }
-const require = createRequire(import.meta.url);
+const req: ReturnType<typeof createRequire> =
+  typeof require === "function" ? require : createRequire(import.meta.url);
 
 const APPLE_EPOCH_MS = 978307200000; // 2001-01-01T00:00:00Z in Unix ms
 const NS_THRESHOLD = 1_000_000_000_000n; // values above this are nanoseconds, else seconds
@@ -154,7 +155,7 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
       if (existsSync(srcPath + ext)) copyFileSync(srcPath + ext, workPath + ext);
     }
 
-    const { DatabaseSync } = require("node:sqlite") as SqliteModule;
+    const { DatabaseSync } = req("node:sqlite") as SqliteModule;
     const chat = new DatabaseSync(workPath, { readOnly: true });
     try {
       chat.exec("PRAGMA query_only = ON;");

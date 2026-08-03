@@ -24,7 +24,8 @@ interface CronTask {
 interface CronModule {
   schedule(expr: string, fn: () => void | Promise<void>): CronTask;
 }
-const require = createRequire(import.meta.url);
+const req: ReturnType<typeof createRequire> =
+  typeof require === "function" ? require : createRequire(import.meta.url);
 
 export type SyncSource = "gmail" | "imessage" | "linkedin" | "mailfile";
 
@@ -146,7 +147,7 @@ export function startWorkers(
   llm: LlmClient | null,
   notify?: (msg: string) => void
 ): WorkersHandle {
-  const cron = require("node-cron") as CronModule;
+  const cron = req("node-cron") as CronModule;
   let running = false;
 
   const announce = (r: SyncReport) => {

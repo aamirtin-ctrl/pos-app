@@ -22,7 +22,8 @@ interface SqliteDatabase {
 interface SqliteModule {
   DatabaseSync: new (path: string, options?: { readOnly?: boolean }) => SqliteDatabase;
 }
-const require = createRequire(import.meta.url);
+const req: ReturnType<typeof createRequire> =
+  typeof require === "function" ? require : createRequire(import.meta.url);
 
 export interface NameHit {
   name: string;
@@ -72,7 +73,7 @@ export function buildNameIndex(): NameIndex {
 
   let DatabaseSync: SqliteModule["DatabaseSync"];
   try {
-    ({ DatabaseSync } = require("node:sqlite") as SqliteModule);
+    ({ DatabaseSync } = req("node:sqlite") as SqliteModule);
   } catch {
     return { index, people: 0, sources: 0 };
   }
