@@ -97,7 +97,7 @@ export default function ContactDetail({ id }: { id: number }) {
     return (
       <div className="p-6">
         <div className="drag-region h-4" />
-        <a href="#/contacts" className="text-sm no-drag" style={{ color: "var(--muted)" }}>&larr; Contacts</a>
+        <a href="#/relationships/contacts" className="text-sm no-drag" style={{ color: "var(--muted)" }}>&larr; Contacts</a>
         <p className="mt-6 text-sm" style={{ color: "var(--muted)" }}>Contact not found — it may have been merged away.</p>
       </div>
     );
@@ -106,7 +106,7 @@ export default function ContactDetail({ id }: { id: number }) {
   return (
     <div className="p-6 max-w-3xl mx-auto">
       <div className="drag-region h-4" />
-      <a href="#/contacts" className="text-sm no-drag" style={{ color: "var(--muted)" }}>&larr; Contacts</a>
+      <a href="#/relationships/contacts" className="text-sm no-drag" style={{ color: "var(--muted)" }}>&larr; Contacts</a>
 
       {/* ── Header ── */}
       <div className="flex items-start justify-between gap-4 mt-3 mb-1">
