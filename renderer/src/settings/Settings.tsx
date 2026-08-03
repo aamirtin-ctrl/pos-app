@@ -451,7 +451,7 @@ function Sync() {
           ))}
         </tbody>
       </table>
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
         <button
           onClick={embed}
           disabled={busy !== null}
@@ -460,6 +460,32 @@ function Sync() {
         >
           {busy === "embed" ? "Embedding…" : "Embed profiles"}
         </button>
+        {(["linkedin", "mailfile"] as const).map((src) => (
+          <button
+            key={src}
+            onClick={async () => {
+              setBusy(src);
+              setMsg(null);
+              const r = await window.pos.sync.pickAndRun(src);
+              const d = r.data as { canceled?: boolean; error?: string; ingested?: number } | undefined;
+              if (!r.ok) setMsg(`${src}: ${r.error}`);
+              else if (d?.canceled) { /* user closed the picker */ }
+              else if (d?.error) setMsg(`${src}: ${d.error}`);
+              else setMsg(`${src}: imported ${d?.ingested ?? 0} records.`);
+              setBusy(null);
+              refetch();
+            }}
+            disabled={busy !== null}
+            className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-40"
+            style={{ borderColor: "var(--line)" }}
+          >
+            {busy === src
+              ? "Importing…"
+              : src === "linkedin"
+                ? "Import LinkedIn export…"
+                : "Import mail export…"}
+          </button>
+        ))}
         {needsFda && (
           <button
             onClick={() => window.pos.app.openFullDiskAccess()}

@@ -1,7 +1,7 @@
 // ALL ipcMain handlers — the single typed boundary between renderer and main.
 // Channel names mirror the window.pos.* surface in renderer/src/pos.d.ts.
 
-import { ipcMain, shell } from "electron";
+import { ipcMain, shell, dialog } from "electron";
 import type { Db } from "./db/db.ts";
 import { getSetting, setSetting, hasVec } from "./db/db.ts";
 import { SecretStore, SECRET_NAMES } from "./secrets.ts";
@@ -112,6 +112,16 @@ export function registerIpc(deps: IpcDeps) {
 
   // ── sync / integrations ──
   h("sync.run", (source: string, extra?: string) => runSync(db, secrets, deps.llm(), source, extra));
+  // File-based imports: pick the LinkedIn export folder / a .mbox|.eml file, then sync.
+  h("sync.pickAndRun", async (source: "linkedin" | "mailfile") => {
+    const res = await dialog.showOpenDialog({
+      title: source === "linkedin" ? "Select your LinkedIn data-export folder" : "Select a .mbox or .eml export",
+      properties: source === "linkedin" ? ["openDirectory"] : ["openFile"],
+      ...(source === "mailfile" ? { filters: [{ name: "Mail exports", extensions: ["mbox", "eml"] }] } : {}),
+    });
+    if (res.canceled || res.filePaths.length === 0) return { canceled: true };
+    return runSync(db, secrets, deps.llm(), source, res.filePaths[0]);
+  });
   h("sync.status", () => syncStatus(db));
   h("sync.embed", () => embedProfiles(db, secrets));
 

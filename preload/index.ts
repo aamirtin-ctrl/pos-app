@@ -41,7 +41,12 @@ contextBridge.exposeInMainWorld("pos", {
     capture: call("outcomes.capture"),
     adherence: call("outcomes.adherence"),
   },
-  sync: { run: call("sync.run"), status: call("sync.status"), embed: call("sync.embed") },
+  sync: {
+    run: call("sync.run"),
+    status: call("sync.status"),
+    embed: call("sync.embed"),
+    pickAndRun: call("sync.pickAndRun"),
+  },
   gcal: { connect: call("gcal.connect"), connected: call("gcal.connected"), reconcile: call("gcal.reconcile") },
   settings: {
     keys: call("settings.keys"),
