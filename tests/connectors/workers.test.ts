@@ -108,7 +108,7 @@ describe("syncStatus", () => {
     db.prepare("INSERT INTO sync_state (source, cursor) VALUES ('gmail', '2026-08-01T00:00:00.000Z')").run();
 
     const status = syncStatus(db);
-    expect(status.map((s) => s.source)).toEqual(["gmail", "imessage", "linkedin", "mailfile"]);
+    expect(status.map((s) => s.source)).toEqual(["gmail", "imessage", "linkedin", "linkedin-email", "mailfile"]);
     const gmail = status[0];
     expect(gmail.last_run?.records_ingested).toBe(3); // latest run wins
     expect(gmail.last_run?.error).toBeNull();
