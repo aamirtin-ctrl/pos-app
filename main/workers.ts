@@ -12,7 +12,7 @@ import type { LlmClient } from "./llm/provider.ts";
 import { extractCommitmentsLlm } from "./crm/commitments.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import type { ConnectorDeps, SyncReport } from "./connectors/common.ts";
-import { syncGmail, gmailConfigured } from "./connectors/gmail.ts";
+import { syncAllMail, gmailConfigured } from "./connectors/gmail.ts";
 import { syncImessage, imessageAvailable } from "./connectors/imessage.ts";
 import { syncLinkedin } from "./connectors/linkedin.ts";
 import { syncMailfile } from "./connectors/mailfile.ts";
@@ -36,7 +36,7 @@ export type ConnectorFn = (deps: ConnectorDeps, extra?: string) => Promise<SyncR
 const EXTRACT_CAP = 50;
 
 const CONNECTORS: Record<SyncSource, ConnectorFn> = {
-  gmail: (deps) => syncGmail(deps),
+  gmail: (deps) => syncAllMail(deps), // every configured mail account (gmail/outlook/imap)
   imessage: (deps) => syncImessage(deps),
   linkedin: (deps, extra) =>
     extra
@@ -160,6 +160,7 @@ export function startWorkers(
     if (running) return; // never overlap
     running = true;
     try {
+      // Skip silently only when ZERO mail accounts are configured.
       if (gmailConfigured({ secrets })) {
         announce(await runSync(db, secrets, llm, "gmail"));
       }

@@ -18,6 +18,7 @@ import { transcribe } from "./stt.ts";
 import { generateDrafts, listDrafts, setDraftStatus, synthesizeVoices, getVoices } from "./crm/drafts.ts";
 import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learning.ts";
 import { runSync, syncStatus } from "./workers.ts";
+import { listMailAccounts, addMailAccount, removeMailAccount, type MailProvider } from "./connectors/gmail.ts";
 import { saveDoctrine } from "./engine/doctrine.ts";
 import { runLoopbackAuth, isGoogleConnected, hasGoogleCreds } from "./gcal/auth.ts";
 import { pushPlan, pushTasks, reconcileMovedEvents, readAnchors } from "./gcal/sync.ts";
@@ -140,6 +141,18 @@ export function registerIpc(deps: IpcDeps) {
     return runSync(db, secrets, deps.llm(), source, res.filePaths[0]);
   });
   h("sync.status", () => syncStatus(db));
+  // Mail accounts (multi-account IMAP). list NEVER returns passwords.
+  h("mail.accounts.list", () =>
+    listMailAccounts(secrets).map(({ id, provider, user, host }) => ({ id, provider, user, host }))
+  );
+  h("mail.accounts.add", (acct: { provider: MailProvider; user: string; password: string; host?: string; port?: number }) => {
+    const a = addMailAccount(secrets, acct);
+    return { id: a.id, provider: a.provider, user: a.user, host: a.host };
+  });
+  h("mail.accounts.remove", (id: string) => {
+    removeMailAccount(secrets, id);
+    return { removed: true };
+  });
   h("sync.embed", () => embedProfiles(db, secrets));
 
   // ── google ──

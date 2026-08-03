@@ -213,12 +213,10 @@ function Integrations() {
           onToggle={() => toggle("google")}
           onCredsSaved={() => { refetchKeys(); refetchGcal(); }}
         />
-        <GmailCard
-          present={present}
+        <EmailAccountsCard
           row={syncRow("gmail")}
           open={openCard === "gmail"}
           onToggle={() => toggle("gmail")}
-          onKeySaved={refetchKeys}
           refetchSync={refetchSync}
         />
         <IMessageCard
@@ -364,23 +362,59 @@ function GoogleCard({
   );
 }
 
-function GmailCard({
-  present,
+type MailAccountRow = { id: string; provider: string; user: string; host: string };
+type MailProvider = "gmail" | "outlook" | "imap";
+
+function EmailAccountsCard({
   row,
   open,
   onToggle,
-  onKeySaved,
   refetchSync,
 }: {
-  present: Record<string, boolean>;
   row: SyncRow;
   open: boolean;
   onToggle: () => void;
-  onKeySaved: () => void;
   refetchSync: () => void;
 }) {
+  const [accounts, setAccounts] = useState<MailAccountRow[] | null>(null);
+  const [provider, setProvider] = useState<MailProvider>("gmail");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [host, setHost] = useState("");
+  const [port, setPort] = useState("993");
+  const [adding, setAdding] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+
+  const refetchAccounts = useCallback(async () => {
+    const r = await window.pos.mail.list();
+    if (r.ok) setAccounts(r.data as MailAccountRow[]);
+  }, []);
+  useEffect(() => { refetchAccounts(); }, [refetchAccounts]);
+
+  const addAccount = async () => {
+    if (!email || !password || adding) return;
+    if (provider === "imap" && !host) { setMsg("Host is required for custom IMAP."); return; }
+    setAdding(true);
+    setMsg(null);
+    const r = await window.pos.mail.add({
+      provider,
+      user: email,
+      password,
+      ...(provider === "imap" ? { host, port: Number(port) || 993 } : {}),
+    });
+    if (!r.ok) setMsg(r.error ?? "could not add account");
+    else { setEmail(""); setPassword(""); setHost(""); setPort("993"); }
+    setAdding(false);
+    refetchAccounts();
+  };
+
+  const removeAccount = async (id: string) => {
+    setMsg(null);
+    const r = await window.pos.mail.remove(id);
+    if (!r.ok) setMsg(r.error ?? "could not remove account");
+    refetchAccounts();
+  };
 
   const runSync = async () => {
     setBusy(true);
@@ -388,18 +422,20 @@ function GmailCard({
     const r = await window.pos.sync.run("gmail");
     const dataError = str((r.data as RawSyncRow | undefined)?.error);
     const err = r.ok ? dataError : (r.error ?? "sync failed");
-    if (err) setMsg(`gmail: ${err}`);
+    if (err) setMsg(`mail: ${err}`);
     setBusy(false);
     refetchSync();
   };
 
-  const hasCreds = (present.GMAIL_USER ?? false) && (present.GMAIL_APP_PASSWORD ?? false);
-  const status: IntegrationStatus = hasCreds ? "connected" : "needs-setup";
+  const status: IntegrationStatus = (accounts?.length ?? 0) > 0 ? "connected" : "needs-setup";
+
+  const inputCls = "border rounded-md px-2 py-1 text-sm bg-white";
+  const inputStyle = { borderColor: "var(--line)" } as const;
 
   return (
     <IntegrationCard
-      name="Gmail"
-      description="Pull mail directly over IMAP with an app password."
+      name="Email accounts"
+      description="Pull mail over IMAP from any number of Gmail, Outlook, or custom accounts."
       status={status}
       open={open}
       onToggle={onToggle}
@@ -408,24 +444,102 @@ function GmailCard({
         "Visit myaccount.google.com/apppasswords.",
         'Create an app password named "POS".',
         "Enter your Gmail address and that 16-character password below.",
+        "Outlook: enable 2FA at account.microsoft.com/security, then create an app password.",
       ]}
     >
-      <div className="space-y-2">
-        <KeyRowView
-          row={{ name: "GMAIL_USER", present: present.GMAIL_USER ?? false }}
-          secret={false}
-          onSaved={onKeySaved}
-        />
-        <KeyRowView
-          row={{ name: "GMAIL_APP_PASSWORD", present: present.GMAIL_APP_PASSWORD ?? false }}
-          onSaved={onKeySaved}
-        />
+      {accounts == null ? (
+        <p className="text-sm" style={{ color: "var(--muted)" }}>Loading…</p>
+      ) : accounts.length === 0 ? (
+        <p className="text-sm mb-2" style={{ color: "var(--muted)" }}>No accounts yet — add one below.</p>
+      ) : (
+        <div className="space-y-1.5 mb-3">
+          {accounts.map((a) => (
+            <div
+              key={a.id}
+              className="flex items-center gap-2 rounded-lg border bg-white px-3 py-1.5"
+              style={inputStyle}
+            >
+              <span className="text-sm flex-1 truncate" style={{ color: "var(--ink)" }}>
+                {a.user}
+                <span style={{ color: "var(--muted)" }}> — {a.provider}</span>
+              </span>
+              <button
+                onClick={() => removeAccount(a.id)}
+                className="text-xs px-2 py-0.5 rounded-md border bg-white shrink-0"
+                style={{ borderColor: "var(--line)", color: "var(--danger)" }}
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="rounded-lg border bg-white px-3 py-2 space-y-1.5" style={inputStyle}>
+        <div className="text-xs font-medium" style={{ color: "var(--muted)" }}>Add an account</div>
+        <div className="flex gap-2 flex-wrap">
+          <select
+            value={provider}
+            onChange={(e) => setProvider(e.target.value as MailProvider)}
+            className={inputCls}
+            style={inputStyle}
+          >
+            <option value="gmail">Gmail</option>
+            <option value="outlook">Outlook</option>
+            <option value="imap">Custom IMAP</option>
+          </select>
+          <input
+            type="text"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="email address"
+            className={`flex-1 min-w-[140px] ${inputCls}`}
+            style={inputStyle}
+          />
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="app password"
+            className={`flex-1 min-w-[140px] ${inputCls}`}
+            style={inputStyle}
+          />
+        </div>
+        {provider === "imap" && (
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={host}
+              onChange={(e) => setHost(e.target.value)}
+              placeholder="imap.example.com"
+              className={`flex-1 ${inputCls}`}
+              style={inputStyle}
+            />
+            <input
+              type="number"
+              value={port}
+              onChange={(e) => setPort(e.target.value)}
+              placeholder="993"
+              className={`w-24 tabular-nums ${inputCls}`}
+              style={inputStyle}
+            />
+          </div>
+        )}
+        <button
+          onClick={addAccount}
+          disabled={adding || !email || !password || (provider === "imap" && !host)}
+          className="px-3 py-1 rounded-md text-sm border bg-white disabled:opacity-40"
+          style={inputStyle}
+        >
+          {adding ? "Adding…" : "Add"}
+        </button>
       </div>
+
       <button
         onClick={runSync}
         disabled={busy}
         className="mt-3 px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-40"
-        style={{ borderColor: "var(--line)" }}
+        style={inputStyle}
       >
         {busy ? "Syncing…" : "Sync now"}
       </button>

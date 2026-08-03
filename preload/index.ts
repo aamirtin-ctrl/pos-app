@@ -48,6 +48,11 @@ contextBridge.exposeInMainWorld("pos", {
     embed: call("sync.embed"),
     pickAndRun: call("sync.pickAndRun"),
   },
+  mail: {
+    list: call("mail.accounts.list"),
+    add: call("mail.accounts.add"),
+    remove: call("mail.accounts.remove"),
+  },
   gcal: { connect: call("gcal.connect"), connected: call("gcal.connected"), reconcile: call("gcal.reconcile"), events: call("gcal.events") },
   settings: {
     keys: call("settings.keys"),
