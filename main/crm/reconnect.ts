@@ -1,0 +1,67 @@
+// Reconnect cadence. Tier thresholds decide how long a relationship can go quiet before it
+// surfaces: 0=inner 14d, 1=active 30d, 2=network 90d, 3=archive never. Dismissals (kind
+// 'stale') suppress a person indefinitely (snooze_until NULL) or until the snooze expires.
+
+import type { Db } from "../db/db.ts";
+
+export const TIER_DAYS: Record<number, number> = { 0: 14, 1: 30, 2: 90, 3: Infinity };
+
+export interface ReconnectRow {
+  id: number;
+  display_name: string;
+  org: string | null;
+  tier: number;
+  last_contact_at: string | null;
+  next_touch_due_at: string;
+  overdue_days: number;
+}
+
+/** Recompute person.next_touch_due_at = last_contact_at + tier threshold. Tier 3 → NULL. */
+export function refreshNextTouch(db: Db): number {
+  const run = db.transaction(() => {
+    let changed = 0;
+    for (const [tier, days] of Object.entries(TIER_DAYS)) {
+      if (!Number.isFinite(days)) {
+        changed += db
+          .prepare("UPDATE person SET next_touch_due_at = NULL WHERE tier = ?")
+          .run(Number(tier)).changes;
+        continue;
+      }
+      changed += db
+        .prepare(
+          `UPDATE person SET next_touch_due_at =
+             CASE WHEN last_contact_at IS NULL THEN NULL
+                  ELSE datetime(last_contact_at, '+' || ? || ' days') END
+           WHERE tier = ?`
+        )
+        .run(days, Number(tier)).changes;
+    }
+    return changed;
+  });
+  return run();
+}
+
+/**
+ * Persons past their next touch, excluding active 'stale' dismissals (snooze_until NULL =
+ * dismissed indefinitely; a future snooze_until also suppresses). Ordered by tier (inner
+ * circle first), then most-overdue first.
+ */
+export function reconnectDue(db: Db, now: Date = new Date()): ReconnectRow[] {
+  const nowIso = now.toISOString().replace("T", " ").slice(0, 19);
+  return db
+    .prepare(
+      `SELECT p.id, p.display_name, p.org, p.tier, p.last_contact_at, p.next_touch_due_at,
+              CAST(julianday(?) - julianday(p.next_touch_due_at) AS INTEGER) AS overdue_days
+       FROM person p
+       WHERE p.next_touch_due_at IS NOT NULL
+         AND p.next_touch_due_at <= ?
+         AND p.tier < 3
+         AND NOT EXISTS (
+           SELECT 1 FROM dismissal d
+           WHERE d.person_id = p.id AND d.kind = 'stale'
+             AND (d.snooze_until IS NULL OR d.snooze_until > ?)
+         )
+       ORDER BY p.tier ASC, overdue_days DESC`
+    )
+    .all(nowIso, nowIso, nowIso) as ReconnectRow[];
+}
