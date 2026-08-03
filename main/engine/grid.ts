@@ -1,0 +1,123 @@
+// Stage 1 (§5.4) — DETERMINISTIC. Build the 15-minute slot grid, apply anchors,
+// score capacity, and apply hard constraints as per-type ELIGIBILITY MASKS.
+// A slot that cannot legally host a block type is removed from that type's candidate
+// set before scoring ever happens. Hard constraints are filters, not penalties.
+
+import {
+  BLOCK_TYPES, COGNITIVE_TYPES, capacityAt, hhmmToMin,
+  type BlockType, type Doctrine,
+} from "./doctrine.ts";
+
+export const SLOT_MIN = 15;
+
+export interface Anchor {
+  startMin: number; // minutes since midnight
+  endMin: number;
+  blockType: BlockType;
+  title: string;
+  /** true = external/gcal/user-locked; the planner may never move it */
+  movable?: boolean;
+}
+
+export interface Slot {
+  index: number;
+  startMin: number;
+  endMin: number;
+  hoursAfterWake: number; // at slot start
+  capacity: number;       // 0-100, energy-curve interpolated
+  free: boolean;
+  anchor?: Anchor;        // set when occupied
+  contiguousFreeBefore: number; // minutes of free time ending at this slot's start
+  contiguousFreeAfter: number;  // minutes of free time starting at this slot's start (inclusive)
+  adjacentToMeeting: boolean;   // slot directly before or after a meeting-occupied slot
+  afterMeeting: boolean;        // slot directly AFTER a meeting-occupied slot
+  inPhysicalPeak: boolean;
+  hoursToSleep: number;   // from slot END to sleep_onset
+  eligible: Record<BlockType, boolean>;
+}
+
+export interface Grid {
+  wakeMin: number;
+  sleepMin: number;
+  slots: Slot[];
+}
+
+export function buildGrid(doctrine: Doctrine, anchors: Anchor[]): Grid {
+  const wakeMin = hhmmToMin(doctrine.chronotype.wake_time);
+  let sleepMin = hhmmToMin(doctrine.chronotype.sleep_onset);
+  if (sleepMin <= wakeMin) sleepMin += 24 * 60; // past-midnight sleep
+
+  const hc = doctrine.hard_constraints;
+  const peak = doctrine.physical_curve.peak_window;
+  const n = Math.floor((sleepMin - wakeMin) / SLOT_MIN);
+
+  // 1-2. slots + anchor occupation
+  const slots: Slot[] = [];
+  for (let i = 0; i < n; i++) {
+    const startMin = wakeMin + i * SLOT_MIN;
+    const endMin = startMin + SLOT_MIN;
+    const anchor = anchors.find((a) => a.startMin < endMin && a.endMin > startMin);
+    const hoursAfterWake = (startMin - wakeMin) / 60;
+    slots.push({
+      index: i,
+      startMin,
+      endMin,
+      hoursAfterWake,
+      capacity: capacityAt(doctrine, hoursAfterWake), // 3. capacity score
+      free: !anchor,
+      anchor,
+      contiguousFreeBefore: 0,
+      contiguousFreeAfter: 0,
+      adjacentToMeeting: false,
+      afterMeeting: false,
+      inPhysicalPeak: hoursAfterWake >= peak.start_hours_after_wake && hoursAfterWake < peak.end_hours_after_wake,
+      hoursToSleep: (sleepMin - endMin) / 60,
+      eligible: Object.fromEntries(BLOCK_TYPES.map((t) => [t, false])) as Record<BlockType, boolean>,
+    });
+  }
+
+  // 4. derived fields
+  let run = 0;
+  for (const s of slots) {
+    s.contiguousFreeBefore = run;
+    run = s.free ? run + SLOT_MIN : 0;
+  }
+  run = 0;
+  for (let i = slots.length - 1; i >= 0; i--) {
+    const s = slots[i];
+    run = s.free ? run + SLOT_MIN : 0;
+    s.contiguousFreeAfter = run;
+  }
+  for (let i = 0; i < slots.length; i++) {
+    const prevMeeting = i > 0 && slots[i - 1].anchor?.blockType === "meeting";
+    const nextMeeting = i < slots.length - 1 && slots[i + 1].anchor?.blockType === "meeting";
+    slots[i].afterMeeting = prevMeeting;
+    slots[i].adjacentToMeeting = prevMeeting || nextMeeting;
+  }
+
+  // 5. eligibility masks (hard constraints as filters)
+  for (const s of slots) {
+    if (!s.free) continue; // occupied slots are eligible for nothing
+    for (const t of BLOCK_TYPES) {
+      let ok = true;
+      // No cognitive work in the first hour after wake.
+      if (COGNITIVE_TYPES.has(t) && s.hoursAfterWake < hc.no_cognitive_work_before_hours_after_wake) ok = false;
+      // No deep work immediately after a meeting (attention residue).
+      if (t === "deep_work" && hc.no_deep_work_immediately_after_meeting && s.afterMeeting) ok = false;
+      // Gym minutes must end >= min_gym_end_before_sleep_hours before sleep.
+      if (t === "gym" && s.hoursToSleep < hc.min_gym_end_before_sleep_hours) ok = false;
+      // Comms must end >= latest_comms_window_before_sleep_hours before sleep.
+      if (t === "comms" && s.hoursToSleep < hc.latest_comms_window_before_sleep_hours) ok = false;
+      s.eligible[t] = ok;
+    }
+  }
+
+  return { wakeMin, sleepMin, slots };
+}
+
+/** Largest run of consecutive free slots (minutes) — soft-pref signal. */
+export function largestContiguousFree(slots: Slot[]): number {
+  let best = 0;
+  for (const s of slots) best = Math.max(best, s.contiguousFreeAfter);
+  return best;
+}
