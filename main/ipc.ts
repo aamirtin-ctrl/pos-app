@@ -15,6 +15,7 @@ import { embedProfiles, makeQueryEmbedder } from "./llm/embeddings.ts";
 import * as planner from "./planner.ts";
 import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learning.ts";
 import { runSync, syncStatus } from "./workers.ts";
+import { saveDoctrine } from "./engine/doctrine.ts";
 import { runLoopbackAuth, isGoogleConnected, hasGoogleCreds } from "./gcal/auth.ts";
 import { pushPlan, pushTasks, reconcileMovedEvents } from "./gcal/sync.ts";
 import fs from "node:fs";
@@ -49,7 +50,7 @@ export function registerIpc(deps: IpcDeps) {
     return reconnectDue(db);
   });
   h("query.rank", async (inquiry: string) =>
-    rank(db, deps.llm(), inquiry, { embedQuery: hasVec() ? makeQueryEmbedder(db, secrets) : undefined })
+    rank(db, deps.llm(), inquiry, { embedQuery: (hasVec() && makeQueryEmbedder(db, secrets)) || undefined })
   );
 
   // ── groups / tags (sidecars) ──
@@ -132,7 +133,6 @@ export function registerIpc(deps: IpcDeps) {
   h("settings.doctrine.get", () => fs.readFileSync(path.join(doctrineDir, "doctrine.yaml"), "utf8"));
   h("settings.doctrine.set", (yamlText: string) => {
     // validates before writing — invalid YAML surfaces as an error, file untouched
-    const { saveDoctrine } = require("./engine/doctrine.ts") as typeof import("./engine/doctrine.ts");
     saveDoctrine(doctrineDir, yamlText);
     return { saved: true };
   });
