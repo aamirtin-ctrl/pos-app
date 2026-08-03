@@ -240,6 +240,7 @@ function Integrations() {
           open={openCard === "linkedin"}
           onToggle={() => toggle("linkedin")}
           refetchSync={refetchSync}
+          extra={<LinkedinEmailSync row={syncRow("linkedin-email")} refetchSync={refetchSync} />}
         />
         <PickImportCard
           id="mailfile"
@@ -626,6 +627,7 @@ function PickImportCard({
   open,
   onToggle,
   refetchSync,
+  extra,
 }: {
   id: "linkedin" | "mailfile";
   name: string;
@@ -636,6 +638,7 @@ function PickImportCard({
   open: boolean;
   onToggle: () => void;
   refetchSync: () => void;
+  extra?: React.ReactNode;
 }) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
@@ -673,7 +676,44 @@ function PickImportCard({
         {busy ? "Importing…" : buttonLabel}
       </button>
       {msg && <p className="text-xs mt-2" style={{ color: "var(--muted)" }}>{msg}</p>}
+      {extra}
     </IntegrationCard>
+  );
+}
+
+/** LinkedIn card add-on: invite/accept events pulled from LinkedIn's notification emails. */
+function LinkedinEmailSync({ row, refetchSync }: { row: SyncRow; refetchSync: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const runSync = async () => {
+    setBusy(true);
+    setMsg(null);
+    const r = await window.pos.sync.run("linkedin-email");
+    const dataError = str((r.data as RawSyncRow | undefined)?.error);
+    const err = r.ok ? dataError : (r.error ?? "sync failed");
+    if (err) setMsg(`linkedin-email: ${err}`);
+    setBusy(false);
+    refetchSync();
+  };
+
+  return (
+    <div className="mt-3 pt-3 border-t" style={{ borderColor: "var(--line)" }}>
+      <p className="text-xs mb-2" style={{ color: "var(--muted)" }}>
+        New connections also sync automatically from LinkedIn&rsquo;s notification emails (uses your
+        connected email accounts)
+      </p>
+      <button
+        onClick={runSync}
+        disabled={busy}
+        className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-40"
+        style={{ borderColor: "var(--line)" }}
+      >
+        {busy ? "Syncing…" : "Sync invites now"}
+      </button>
+      <LastRunLine row={row} />
+      {msg && <p className="text-xs mt-1" style={{ color: "var(--danger)" }}>{msg}</p>}
+    </div>
   );
 }
 

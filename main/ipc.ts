@@ -1,7 +1,7 @@
 // ALL ipcMain handlers — the single typed boundary between renderer and main.
 // Channel names mirror the window.pos.* surface in renderer/src/pos.d.ts.
 
-import { ipcMain, shell, dialog } from "electron";
+import { ipcMain, shell, dialog, BrowserWindow } from "electron";
 import type { Db } from "./db/db.ts";
 import { getSetting, setSetting, hasVec } from "./db/db.ts";
 import { SecretStore, SECRET_NAMES } from "./secrets.ts";
@@ -197,6 +197,16 @@ export function registerIpc(deps: IpcDeps) {
   h("settings.get", (key: string) => getSetting(db, key));
   h("settings.set", (key: string, value: string) => setSetting(db, key, value));
   h("stt.transcribe", (wav: Uint8Array) => transcribe(doctrineDir, wav));
+  // In-app LinkedIn messaging: your own login in a persistent child window. Read +
+  // send directly on linkedin.com — no scraping, no third-party session service.
+  h("app.openLinkedIn", () => {
+    const w = new BrowserWindow({
+      width: 1050, height: 760, title: "LinkedIn — POS",
+      webPreferences: { partition: "persist:linkedin", nodeIntegration: false, contextIsolation: true },
+    });
+    w.loadURL("https://www.linkedin.com/messaging/");
+    return { opened: true };
+  });
   h("app.openFullDiskAccess", () =>
     shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
   );

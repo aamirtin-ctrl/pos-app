@@ -2,7 +2,7 @@
 // records/error — errors are recorded, NEVER propagated), then runs the post-ingest hook:
 // commitment extraction over the newest unprocessed interactions (LLM optional), forward-only
 // last-contact advancement from outbound interactions, and the reconnect-cadence refresh.
-// startWorkers schedules gmail + imessage every 15 minutes while the app is open, guarded by
+// startWorkers schedules gmail + linkedin-email + imessage every 15 minutes while the app is open, guarded by
 // a running flag so runs never overlap; sources with missing creds/FDA are skipped silently.
 
 import { createRequire } from "node:module";
@@ -15,6 +15,7 @@ import type { ConnectorDeps, SyncReport } from "./connectors/common.ts";
 import { syncAllMail, gmailConfigured } from "./connectors/gmail.ts";
 import { syncImessage, imessageAvailable } from "./connectors/imessage.ts";
 import { syncLinkedin } from "./connectors/linkedin.ts";
+import { syncLinkedinEmail } from "./connectors/linkedin-email.ts";
 import { syncMailfile } from "./connectors/mailfile.ts";
 
 // node-cron ships no type declarations — minimal local surface via createRequire.
@@ -27,7 +28,7 @@ interface CronModule {
 const req: ReturnType<typeof createRequire> =
   typeof require === "function" ? require : createRequire(import.meta.url);
 
-export type SyncSource = "gmail" | "imessage" | "linkedin" | "mailfile";
+export type SyncSource = "gmail" | "imessage" | "linkedin" | "linkedin-email" | "mailfile";
 
 /** `extra` = LinkedIn export folder / mailfile path (unused by gmail/imessage). */
 export type ConnectorFn = (deps: ConnectorDeps, extra?: string) => Promise<SyncReport>;
@@ -38,6 +39,7 @@ const EXTRACT_CAP = 50;
 const CONNECTORS: Record<SyncSource, ConnectorFn> = {
   gmail: (deps) => syncAllMail(deps), // every configured mail account (gmail/outlook/imap)
   imessage: (deps) => syncImessage(deps),
+  "linkedin-email": (deps) => syncLinkedinEmail(deps), // LinkedIn notification mail, all accounts
   linkedin: (deps, extra) =>
     extra
       ? syncLinkedin(deps, extra)
@@ -136,7 +138,7 @@ export interface WorkersHandle {
 }
 
 /**
- * Schedule gmail + imessage every 15 minutes while the app is open. Sources that aren't
+ * Schedule gmail + linkedin-email + imessage every 15 minutes while the app is open. Sources that aren't
  * ready (no Gmail creds / no Full Disk Access) are skipped silently — no sync_run noise.
  * A running flag guarantees runs never overlap. `notify` fires with a short human message
  * when a run brought in new interactions.
@@ -163,6 +165,8 @@ export function startWorkers(
       // Skip silently only when ZERO mail accounts are configured.
       if (gmailConfigured({ secrets })) {
         announce(await runSync(db, secrets, llm, "gmail"));
+        // Same accounts, LinkedIn notification mail only (invites/accepts → people).
+        announce(await runSync(db, secrets, llm, "linkedin-email"));
       }
       if (imessageAvailable()) {
         // FDA can still be revoked between the precheck and the copy — announce() stays
@@ -200,7 +204,7 @@ export function syncStatus(db: Db): SourceStatus[] {
   );
   const state = db.prepare("SELECT cursor, last_sync_at FROM sync_state WHERE source = ?");
 
-  return (["gmail", "imessage", "linkedin", "mailfile"] as SyncSource[]).map((source) => {
+  return (["gmail", "imessage", "linkedin", "linkedin-email", "mailfile"] as SyncSource[]).map((source) => {
     const run = lastRun.get(source) as SourceStatus["last_run"] | undefined;
     const st = state.get(source) as { cursor: string | null; last_sync_at: string | null } | undefined;
     return {

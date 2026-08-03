@@ -69,6 +69,10 @@ export default function Inbox() {
           style={{ background: "linear-gradient(135deg, var(--pink-3), var(--accent))" }}>
           {busy === "generate" ? "Drafting…" : "Draft replies"}
         </button>
+        <button onClick={() => window.pos.app.openLinkedIn()}
+          className="px-3 py-1.5 rounded-lg text-sm border bg-white" style={{ borderColor: "var(--line)" }}>
+          Open LinkedIn messaging
+        </button>
         <button onClick={learnVoice} disabled={!!busy}
           className="px-3 py-1.5 rounded-lg text-sm border bg-white disabled:opacity-50" style={{ borderColor: "var(--line)" }}>
           {busy === "voice" ? "Reading your messages…" : "Re-learn my voice"}

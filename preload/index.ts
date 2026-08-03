@@ -68,5 +68,5 @@ contextBridge.exposeInMainWorld("pos", {
   stt: { transcribe: call("stt.transcribe") },
   drafts: { list: call("drafts.list"), generate: call("drafts.generate"), setStatus: call("drafts.setStatus") },
   voice: { synthesize: call("voice.synthesize"), get: call("voice.get") },
-  app: { openFullDiskAccess: call("app.openFullDiskAccess") },
+  app: { openFullDiskAccess: call("app.openFullDiskAccess"), openLinkedIn: call("app.openLinkedIn") },
 });

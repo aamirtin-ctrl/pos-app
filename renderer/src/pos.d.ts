@@ -30,7 +30,7 @@ declare global {
       stt: { transcribe: Call };
       drafts: { list: Call; generate: Call; setStatus: Call };
       voice: { synthesize: Call; get: Call };
-      app: { openFullDiskAccess: Call };
+      app: { openFullDiskAccess: Call; openLinkedIn: Call };
     };
   }
 }
