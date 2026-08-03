@@ -102,73 +102,10 @@ export default function Home() {
   return (
     <div className="p-6 max-w-4xl mx-auto">
       <div className="drag-region h-4" />
-      <h1 className="font-display text-2xl font-semibold mb-4 no-drag">Relationships</h1>
-
-      {/* ── Query hero ── */}
-      <div className="rounded-xl border bg-white p-4 mb-6" style={{ borderColor: "var(--line)" }}>
-        <div className="flex gap-2">
-          <input
-            value={inquiry}
-            onChange={(e) => setInquiry(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") runQuery(); }}
-            placeholder="Who should I talk to about…"
-            className="flex-1 border rounded-lg px-3 py-2 text-sm bg-white"
-            style={{ borderColor: "var(--line)" }}
-          />
-          <button
-            onClick={runQuery}
-            disabled={ranking || !inquiry.trim()}
-            className="px-4 py-2 rounded-lg text-sm text-white disabled:opacity-50"
-            style={{ background: "var(--accent)" }}
-          >
-            {ranking ? "Ranking…" : "Ask"}
-          </button>
-        </div>
-        {rankError && <p className="text-xs mt-2" style={{ color: "var(--danger)" }}>{rankError}</p>}
-
-        {ranked && (
-          <div className="mt-4">
-            {ranked.usedLlm === false && (
-              <span
-                className="inline-block text-[11px] px-2 py-0.5 rounded-full border mb-2"
-                style={{ borderColor: "var(--line)", color: "var(--muted)" }}
-              >
-                ranked without AI
-              </span>
-            )}
-            {ranked.results.length === 0 ? (
-              <p className="text-sm" style={{ color: "var(--muted)" }}>No matches for that — try different words.</p>
-            ) : (
-              <div className="space-y-2">
-                {ranked.results.map(({ person, reason }) => {
-                  const fresh = peopleById.get(person.id)?.freshness_days ?? null;
-                  return (
-                    <a
-                      key={person.id}
-                      href={`#/contact/${person.id}`}
-                      className="block rounded-lg border p-3 hover:shadow-sm transition-shadow"
-                      style={{ borderColor: "var(--line)", color: "var(--ink)" }}
-                    >
-                      <div className="flex items-baseline justify-between gap-3">
-                        <span className="font-medium text-sm">{person.display_name}</span>
-                        <span className="text-[11px] shrink-0" style={{ color: "var(--muted)" }}>
-                          {freshnessText(fresh)}
-                        </span>
-                      </div>
-                      {(person.org || person.role) && (
-                        <div className="text-xs mt-0.5" style={{ color: "var(--muted)" }}>
-                          {[person.role, person.org].filter(Boolean).join(" · ")}
-                        </div>
-                      )}
-                      <div className="text-sm mt-1 leading-snug">{reason}</div>
-                    </a>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
+      <h1 className="font-display text-2xl font-semibold mb-1 no-drag">Relationships</h1>
+      <p className="text-xs mb-4" style={{ color: "var(--muted)" }}>
+        Ask anything — "who should I talk to about X", "note about Sarah: …" — from the sparkle button, top right.
+      </p>
 
       <div className="grid grid-cols-2 gap-6 items-start">
         {/* ── Reconnect ── */}

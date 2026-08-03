@@ -25,6 +25,7 @@ declare global {
         keys: Call; setKey: Call; doctrineGet: Call; doctrineSet: Call;
         spend: Call; setCeiling: Call; get: Call; set: Call;
       };
+      assistant: { command: Call };
       app: { openFullDiskAccess: Call };
     };
   }

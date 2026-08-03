@@ -52,29 +52,6 @@ const DOCK: { href: string; icon: keyof typeof ICONS; label: string; lift: numbe
   { href: "#/messaging", icon: "messaging", label: "Messaging", lift: -10 },
 ];
 
-// Falling watercolor petals, diagonal from the top right (deterministic spread).
-function Petals() {
-  const petals = Array.from({ length: 12 }, (_, i) => ({
-    right: `${(i * 7.3) % 34}vw`,
-    delay: `${(i * 1.7) % 14}s`,
-    dur: `${11 + (i % 5) * 2.4}s`,
-    size: `${9 + (i % 4) * 3}px`,
-    drift: `${18 + (i % 6) * 5}vw`,
-    spin: `${220 + (i % 5) * 60}deg`,
-    op: 0.45 + (i % 4) * 0.12,
-  }));
-  return (
-    <>
-      {petals.map((p, i) => (
-        <span key={i} className="petal" style={{
-          right: p.right,
-          ["--delay" as never]: p.delay, ["--dur" as never]: p.dur, ["--size" as never]: p.size,
-          ["--drift" as never]: p.drift, ["--spin" as never]: p.spin, ["--petal-opacity" as never]: p.op,
-        }} />
-      ))}
-    </>
-  );
-}
 
 // Translucent ink branch (top-left) that grows blossoms as the app is used.
 const BLOSSOM_SPOTS: [number, number][] = [
@@ -107,6 +84,68 @@ function Branch({ blooms }: { blooms: number }) {
   );
 }
 
+// One unified command box: small top-right button → one-line popup. Routes to
+// planning, people search, notes, or questions over everything (main/assistant.ts).
+function CommandBar() {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [reply, setReply] = useState<null | { kind: string; reply: string; results?: { id: number; name: string }[] }>(null);
+  const submit = async () => {
+    if (!text.trim() || busy) return;
+    setBusy(true);
+    const r = await window.pos.assistant.command(text.trim());
+    setReply(r.ok ? (r.data as never) : { kind: "error", reply: r.error ?? "failed" });
+    setBusy(false);
+    setText("");
+    if ((r.data as { kind?: string } | undefined)?.kind === "plan") window.location.hash = "#/calendar";
+  };
+  return (
+    <>
+      <button
+        onClick={() => { setOpen((o) => !o); setReply(null); }}
+        title="Ask POS anything"
+        className="no-drag fixed top-3 right-4 z-40 watercolor-blob flex items-center justify-center w-9 h-9 shadow-md transition-transform hover:scale-110"
+        style={{ background: "radial-gradient(circle at 32% 28%, var(--pink-1) 8%, var(--pink-2) 60%, var(--pink-3) 100%)", color: "var(--ink)" }}
+      >
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+          <path d="M12 3l1.8 4.8L18.5 9l-4.7 1.7L12 15.5l-1.8-4.8L5.5 9l4.7-1.2L12 3Z" />
+          <path d="M19 15l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8.8-2Z" />
+        </svg>
+      </button>
+      {open && (
+        <div className="no-drag fixed top-14 right-4 z-40 w-[460px] rounded-2xl border bg-white shadow-xl p-2"
+          style={{ borderColor: "var(--line)" }}>
+          <div className="flex gap-2">
+            <input
+              autoFocus
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()}
+              placeholder="Plan my day, who to ask about X, note about Sarah…"
+              className="flex-1 border rounded-lg px-3 py-1.5 text-sm"
+              style={{ borderColor: "var(--line)" }}
+            />
+            <button onClick={submit} disabled={busy}
+              className="px-3.5 py-1.5 rounded-lg text-sm text-white disabled:opacity-50"
+              style={{ background: "linear-gradient(135deg, var(--pink-3), var(--accent))" }}>
+              {busy ? "…" : "Go"}
+            </button>
+          </div>
+          {reply && (
+            <div className="text-xs mt-2 px-1 leading-relaxed" style={{ color: reply.kind === "error" ? "var(--danger)" : "var(--ink)" }}>
+              {reply.reply}
+              {reply.results?.map((p) => (
+                <a key={p.id} href={`#/contact/${p.id}`} className="ml-2 underline" style={{ color: "var(--accent)" }}>{p.name}</a>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
 export default function App() {
   const route = useRoute();
   const view = route.split("/")[1] ?? "calendar";
@@ -131,7 +170,7 @@ export default function App() {
       {/* slim drag strip replaces the old sidebar's drag region */}
       <div className="drag-region absolute top-0 left-0 right-0 h-9 z-10" />
       <Branch blooms={blooms} />
-      <Petals />
+      <CommandBar />
 
       <main className="h-full overflow-auto pb-28">
         {view === "calendar" && <Calendar />}

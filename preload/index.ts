@@ -58,5 +58,6 @@ contextBridge.exposeInMainWorld("pos", {
     get: call("settings.get"),
     set: call("settings.set"),
   },
+  assistant: { command: call("assistant.command") },
   app: { openFullDiskAccess: call("app.openFullDiskAccess") },
 });

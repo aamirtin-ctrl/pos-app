@@ -119,97 +119,56 @@ export default function DayPlanner() {
           )}
         </div>
 
+        <PlanControls plan={plan} onChange={refresh} />
         {outcomes.length > 0 && <OutcomeCapture blocks={outcomes} onDone={refresh} />}
       </div>
 
-      <BraindumpCard date={date} plan={plan} onChange={refresh} />
     </div>
   );
 }
 
-/** Floating, draggable braindump + plan controls. */
-function BraindumpCard({ date, plan, onChange }: { date: string; plan: PlanView | null; onChange: () => void }) {
-  const [pos, setPos] = useState({ x: typeof window !== "undefined" ? Math.max(80, window.innerWidth / 2 - 210) : 200, y: 64 });
-  const [text, setText] = useState("");
+/** Compact narration + accept/push strip; planning itself happens in the top-right command box. */
+function PlanControls({ plan, onChange }: { plan: PlanView | null; onChange: () => void }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
-  const [open, setOpen] = useState(true);
-  const drag = useRef<{ dx: number; dy: number } | null>(null);
-
-  const onPointerDown = (e: React.PointerEvent) => {
-    drag.current = { dx: e.clientX - pos.x, dy: e.clientY - pos.y };
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-  };
-  const onPointerMove = (e: React.PointerEvent) => {
-    if (!drag.current) return;
-    setPos({ x: Math.max(8, e.clientX - drag.current.dx), y: Math.max(40, e.clientY - drag.current.dy) });
-  };
-  const onPointerUp = () => (drag.current = null);
-
+  if (!plan?.plan) return (
+    <p className="text-xs mt-3" style={{ color: "var(--muted)" }}>
+      No plan yet — use the sparkle button (top right) to braindump the day.
+    </p>
+  );
   const run = async (label: string, fn: () => Promise<unknown>) => {
     setBusy(label); setMsg(null);
     try { await fn(); onChange(); } catch (e) { setMsg(String((e as Error).message ?? e)); }
     setBusy(null);
   };
-  const generate = () =>
-    run("Planning…", async () => {
-      if (text.trim()) {
-        const r = await window.pos.tasks.braindump(text.trim(), date);
-        if (!r.ok) throw new Error(r.error);
-        setText("");
-      }
-      const g = await window.pos.plan.generate(date);
-      if (!g.ok) throw new Error(g.error);
-    });
-
   return (
-    <div className="no-drag fixed z-30 w-[420px] rounded-2xl border bg-white shadow-xl"
-      style={{ left: pos.x, top: pos.y, borderColor: "var(--line)" }}>
-      <div className="flex items-center justify-between px-4 py-2 cursor-grab active:cursor-grabbing rounded-t-2xl select-none"
-        onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}
-        style={{ background: "linear-gradient(135deg, var(--pink-1), var(--pink-2))" }}>
-        <span className="text-sm font-semibold" style={{ color: "var(--ink)" }}>Plan the day</span>
-        <button onClick={() => setOpen((o) => !o)} className="text-xs px-2 rounded" style={{ color: "var(--ink)" }}>
-          {open ? "—" : "+"}
-        </button>
-      </div>
-      {open && (
-        <div className="p-3">
-          <textarea value={text} onChange={(e) => setText(e.target.value)} rows={3}
-            placeholder='Braindump… "finish the quote, 2hrs pset, gym, reply to Sarah"'
-            className="w-full border rounded-lg p-2 text-sm resize-none" style={{ borderColor: "var(--line)" }} />
-          <div className="flex items-center gap-2 mt-2 flex-wrap">
-            <button onClick={generate} disabled={!!busy}
-              className="px-3.5 py-1.5 rounded-lg text-sm text-white disabled:opacity-50"
-              style={{ background: "linear-gradient(135deg, var(--pink-3), var(--accent))" }}>
-              {busy ?? "Generate plan"}
-            </button>
-            {plan?.plan && !plan.plan.accepted_at && (
-              <button onClick={() => run("Accepting…", () => window.pos.plan.accept(plan.plan.id))}
-                className="px-3 py-1.5 rounded-lg text-sm border bg-white" style={{ borderColor: "var(--line)" }}>Accept</button>
-            )}
-            {plan?.plan?.accepted_at && (
-              <button onClick={() => run("Pushing…", async () => {
-                  const r = await window.pos.plan.push(plan.plan.id);
-                  if (!r.ok) throw new Error(r.error ?? "connect Google in Settings first");
-                })}
-                className="px-3 py-1.5 rounded-lg text-sm border bg-white" style={{ borderColor: "var(--line)" }}>Push to Google</button>
-            )}
-          </div>
-          {msg && <div className="text-xs mt-2" style={{ color: "var(--danger)" }}>{msg}</div>}
-          {plan?.plan?.narration && (
-            <p className="text-xs mt-2 leading-relaxed border-l-2 pl-2" style={{ color: "var(--muted)", borderColor: "var(--accent-soft)" }}>
-              {plan.plan.narration}
-            </p>
-          )}
-          {(plan?.unplaced?.length ?? 0) > 0 && (
-            <div className="mt-2 text-xs rounded-lg border p-2" style={{ borderColor: "var(--danger)" }}>
-              <span style={{ color: "var(--danger)" }} className="font-medium">Didn’t fit: </span>
-              {plan!.unplaced.map((u) => `${u.title} (${u.reason.replace(/_/g, " ")})`).join(", ")}
-            </div>
-          )}
-        </div>
+    <div className="mt-3 rounded-xl border bg-white p-3" style={{ borderColor: "var(--line)" }}>
+      {plan.plan.narration && (
+        <p className="text-xs leading-relaxed mb-2" style={{ color: "var(--muted)" }}>{plan.plan.narration}</p>
       )}
+      {(plan.unplaced?.length ?? 0) > 0 && (
+        <p className="text-xs mb-2" style={{ color: "var(--danger)" }}>
+          Didn't fit: {plan.unplaced.map((u) => `${u.title} (${u.reason.replace(/_/g, " ")})`).join(", ")}
+        </p>
+      )}
+      <div className="flex gap-2">
+        {!plan.plan.accepted_at && (
+          <button onClick={() => run("Accepting…", () => window.pos.plan.accept(plan.plan.id))}
+            className="px-3 py-1 rounded-lg text-xs text-white" style={{ background: "var(--accent)" }}>
+            {busy ?? "Accept plan"}
+          </button>
+        )}
+        {plan.plan.accepted_at && (
+          <button onClick={() => run("Pushing…", async () => {
+              const r = await window.pos.plan.push(plan.plan.id);
+              if (!r.ok) throw new Error(r.error ?? "connect Google in Settings first");
+            })}
+            className="px-3 py-1 rounded-lg text-xs text-white" style={{ background: "var(--accent)" }}>
+            {busy ?? "Push to Google"}
+          </button>
+        )}
+        {msg && <span className="text-xs" style={{ color: "var(--danger)" }}>{msg}</span>}
+      </div>
     </div>
   );
 }

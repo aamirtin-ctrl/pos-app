@@ -13,6 +13,7 @@ import { reconnectDue, refreshNextTouch } from "./crm/reconnect.ts";
 import { listCommitments, confirmCommitment, dropCommitment } from "./crm/commitments.ts";
 import { embedProfiles, makeQueryEmbedder } from "./llm/embeddings.ts";
 import * as planner from "./planner.ts";
+import { handleCommand } from "./assistant.ts";
 import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learning.ts";
 import { runSync, syncStatus } from "./workers.ts";
 import { saveDoctrine } from "./engine/doctrine.ts";
@@ -130,6 +131,11 @@ export function registerIpc(deps: IpcDeps) {
   h("gcal.connected", () => ({ connected: isGoogleConnected(secrets), hasCreds: hasGoogleCreds(secrets) }));
   h("gcal.reconcile", () => reconcileMovedEvents(db, secrets));
   h("gcal.events", (dateISO: string) => readAnchors(db, secrets, dateISO));
+
+  // ── unified assistant ──
+  h("assistant.command", (text: string) =>
+    handleCommand({ db, secrets, doctrineDir, llm: deps.llm() }, text)
+  );
 
   // ── settings ──
   h("settings.keys", () => {
