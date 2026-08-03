@@ -41,7 +41,8 @@ describe("full pipeline: braindump → parse → solve → narrate (no LLM)", ()
   it("produces a plan end-to-end deterministically", async () => {
     const { tasks } = await parseBraindump(
       "3hrs physics pset, reply to Sarah, book dentist, gym, 1h essay outline",
-      doctrine
+      doctrine,
+      null
     );
     const planner = tasks.map((t, i) => ({
       id: i + 1,
