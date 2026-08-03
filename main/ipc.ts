@@ -17,7 +17,7 @@ import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learnin
 import { runSync, syncStatus } from "./workers.ts";
 import { saveDoctrine } from "./engine/doctrine.ts";
 import { runLoopbackAuth, isGoogleConnected, hasGoogleCreds } from "./gcal/auth.ts";
-import { pushPlan, pushTasks, reconcileMovedEvents } from "./gcal/sync.ts";
+import { pushPlan, pushTasks, reconcileMovedEvents, readAnchors } from "./gcal/sync.ts";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -129,6 +129,7 @@ export function registerIpc(deps: IpcDeps) {
   h("gcal.connect", () => runLoopbackAuth(secrets, (url) => shell.openExternal(url)));
   h("gcal.connected", () => ({ connected: isGoogleConnected(secrets), hasCreds: hasGoogleCreds(secrets) }));
   h("gcal.reconcile", () => reconcileMovedEvents(db, secrets));
+  h("gcal.events", (dateISO: string) => readAnchors(db, secrets, dateISO));
 
   // ── settings ──
   h("settings.keys", () => {

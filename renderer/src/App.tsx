@@ -52,9 +52,77 @@ const DOCK: { href: string; icon: keyof typeof ICONS; label: string; lift: numbe
   { href: "#/messaging", icon: "messaging", label: "Messaging", lift: -10 },
 ];
 
+// Falling watercolor petals, diagonal from the top right (deterministic spread).
+function Petals() {
+  const petals = Array.from({ length: 12 }, (_, i) => ({
+    right: `${(i * 7.3) % 34}vw`,
+    delay: `${(i * 1.7) % 14}s`,
+    dur: `${11 + (i % 5) * 2.4}s`,
+    size: `${9 + (i % 4) * 3}px`,
+    drift: `${18 + (i % 6) * 5}vw`,
+    spin: `${220 + (i % 5) * 60}deg`,
+    op: 0.45 + (i % 4) * 0.12,
+  }));
+  return (
+    <>
+      {petals.map((p, i) => (
+        <span key={i} className="petal" style={{
+          right: p.right,
+          ["--delay" as never]: p.delay, ["--dur" as never]: p.dur, ["--size" as never]: p.size,
+          ["--drift" as never]: p.drift, ["--spin" as never]: p.spin, ["--petal-opacity" as never]: p.op,
+        }} />
+      ))}
+    </>
+  );
+}
+
+// Translucent ink branch (top-left) that grows blossoms as the app is used.
+const BLOSSOM_SPOTS: [number, number][] = [
+  [178, 46], [225, 30], [262, 52], [214, 78], [300, 40], [338, 66], [286, 92],
+  [372, 34], [408, 58], [352, 108], [432, 90], [462, 44], [488, 72], [520, 56],
+  [148, 70], [246, 112], [316, 128], [396, 122], [452, 118], [508, 100],
+];
+function Branch({ blooms }: { blooms: number }) {
+  return (
+    <svg className="fixed top-0 left-0 z-0 pointer-events-none" width="560" height="170" viewBox="0 0 560 170">
+      <g stroke="#6b5544" strokeLinecap="round" fill="none" opacity="0.28">
+        <path d="M-10 20 C 90 40, 170 55, 270 60 S 460 62, 552 84" strokeWidth="7" />
+        <path d="M150 52 C 190 40, 214 34, 232 24" strokeWidth="4" />
+        <path d="M270 60 C 300 50, 320 44, 344 60 " strokeWidth="4" />
+        <path d="M360 64 C 390 52, 412 46, 438 52" strokeWidth="3.5" />
+        <path d="M300 62 C 316 84, 330 100, 322 124" strokeWidth="3" />
+        <path d="M420 68 C 440 88, 452 104, 448 122" strokeWidth="3" />
+      </g>
+      {BLOSSOM_SPOTS.slice(0, blooms).map(([x, y], i) => (
+        <g key={i} className="bloom" style={{ animationDelay: `${(i % 4) * 0.18}s` }}>
+          {[0, 72, 144, 216, 288].map((a) => (
+            <ellipse key={a} cx={x + 4.6 * Math.cos((a * Math.PI) / 180)} cy={y + 4.6 * Math.sin((a * Math.PI) / 180)}
+              rx="3.4" ry="2.6" fill={i % 3 ? "#f2a9c4" : "#e77fa8"} opacity="0.82"
+              transform={`rotate(${a} ${x} ${y})`} />
+          ))}
+          <circle cx={x} cy={y} r="1.6" fill="#fff" opacity="0.9" />
+        </g>
+      ))}
+    </svg>
+  );
+}
+
 export default function App() {
   const route = useRoute();
   const view = route.split("/")[1] ?? "calendar";
+  const [activity, setActivity] = useState(() => Number(localStorage.getItem("pos_activity") ?? 0));
+  useEffect(() => {
+    const bump = () => {
+      setActivity((a) => {
+        const n = a + 1;
+        localStorage.setItem("pos_activity", String(n));
+        return n;
+      });
+    };
+    document.addEventListener("click", bump);
+    return () => document.removeEventListener("click", bump);
+  }, []);
+  const blooms = Math.min(20, Math.floor(activity / 6)); // a blossom every ~6 interactions
   const activeDock =
     view === "contact" ? "#/relationships" : `#/${view === "settings" ? "" : view}`;
 
@@ -62,6 +130,8 @@ export default function App() {
     <div className="h-full relative">
       {/* slim drag strip replaces the old sidebar's drag region */}
       <div className="drag-region absolute top-0 left-0 right-0 h-9 z-10" />
+      <Branch blooms={blooms} />
+      <Petals />
 
       <main className="h-full overflow-auto pb-28">
         {view === "calendar" && <Calendar />}
@@ -79,33 +149,37 @@ export default function App() {
         style={{
           borderColor: "var(--line)",
           color: view === "settings" ? "var(--accent)" : "var(--muted)",
+          background: "color-mix(in srgb, white 70%, var(--pink-1))",
         }}
       >
         {ICONS.settings}
       </a>
 
-      {/* curved dock — bottom center */}
-      <nav
-        className="no-drag fixed bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-end gap-2 px-5 pt-2 pb-2.5 rounded-full border bg-white/90 backdrop-blur shadow-lg"
-        style={{ borderColor: "var(--line)" }}
-      >
-        {DOCK.map((d) => {
+      {/* three free-floating icons on a gentle arc — pink ombre, per the sketch */}
+      <nav className="no-drag fixed bottom-5 left-1/2 -translate-x-1/2 z-20 flex items-end gap-7">
+        {DOCK.map((d, i) => {
           const active = activeDock === d.href;
+          const ombre = [
+            "radial-gradient(circle at 32% 28%, var(--pink-1) 8%, var(--pink-2) 68%, var(--pink-3) 100%)",
+            "radial-gradient(circle at 32% 28%, var(--pink-2) 8%, var(--pink-3) 66%, var(--petal-deep) 100%)",
+            "radial-gradient(circle at 32% 28%, var(--pink-3) 8%, var(--petal-deep) 62%, var(--accent) 100%)",
+          ][i];
           return (
             <a
               key={d.href}
               href={d.href}
               title={d.label}
-              className="flex flex-col items-center gap-0.5 px-3 py-1 rounded-2xl transition-transform hover:scale-105"
-              style={{ transform: `translateY(${d.lift}px)`, color: active ? "var(--accent)" : "var(--muted)" }}
+              className="watercolor-blob flex items-center justify-center w-12 h-12 shadow-md transition-transform hover:scale-110"
+              style={{
+                transform: `translateY(${d.lift}px)`,
+                background: ombre,
+                color: active ? "white" : "var(--ink)",
+                boxShadow: active
+                  ? "0 4px 14px color-mix(in srgb, var(--accent) 45%, transparent)"
+                  : "0 2px 8px rgba(91,70,54,0.15)",
+              }}
             >
-              <span
-                className="flex items-center justify-center w-10 h-10 rounded-full"
-                style={{ background: active ? "var(--accent-soft)" : "transparent" }}
-              >
-                {ICONS[d.icon]}
-              </span>
-              <span className="text-[10px] font-medium">{d.label}</span>
+              {ICONS[d.icon]}
             </a>
           );
         })}

@@ -47,7 +47,7 @@ contextBridge.exposeInMainWorld("pos", {
     embed: call("sync.embed"),
     pickAndRun: call("sync.pickAndRun"),
   },
-  gcal: { connect: call("gcal.connect"), connected: call("gcal.connected"), reconcile: call("gcal.reconcile") },
+  gcal: { connect: call("gcal.connect"), connected: call("gcal.connected"), reconcile: call("gcal.reconcile"), events: call("gcal.events") },
   settings: {
     keys: call("settings.keys"),
     setKey: call("settings.setKey"),

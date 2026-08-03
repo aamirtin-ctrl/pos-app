@@ -20,7 +20,7 @@ declare global {
       plan: { generate: Call; get: Call; accept: Call; push: Call };
       outcomes: { needed: Call; capture: Call; adherence: Call };
       sync: { run: Call; status: Call; embed: Call; pickAndRun: Call };
-      gcal: { connect: Call; connected: Call; reconcile: Call };
+      gcal: { connect: Call; connected: Call; reconcile: Call; events: Call };
       settings: {
         keys: Call; setKey: Call; doctrineGet: Call; doctrineSet: Call;
         spend: Call; setCeiling: Call; get: Call; set: Call;

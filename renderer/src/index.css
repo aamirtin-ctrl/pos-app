@@ -2,13 +2,16 @@
 
 /* Ported PersonalCRM2 palette: warm off-white + single slate accent. */
 :root {
-  --bg: #faf9f7;
-  --panel: #f3f1ed;
-  --ink: #1f2937;
-  --muted: #6b7280;
-  --accent: #475569;
-  --accent-soft: #cbd5e1;
-  --line: #e7e4de;
+  --bg: #fbf7ef;          /* cream */
+  --panel: #f5efe3;
+  --ink: #5b4636;         /* brown */
+  --muted: #9c8672;
+  --accent: #d68aa4;      /* Alyssum-family pink, deepened for contrast */
+  --accent-soft: #f2ccd8; /* ALYSSUM SW 6589 */
+  --pink-1: #f7dde6;      /* ombre stops */
+  --pink-2: #f0c3d2;
+  --pink-3: #e2a2ba;
+  --line: #e8ddcc;
   --danger: #b45309;
 }
 
@@ -25,3 +28,33 @@ body {
 .no-drag { -webkit-app-region: no-drag; }
 input, textarea, select, button { user-select: auto; }
 ::selection { background: var(--accent-soft); }
+
+/* ── cherry-blossom watercolor system ── */
+:root {
+  --ink-gray: #55525a;      /* ink-wash gray from the artwork */
+  --petal: #f2a9c4;
+  --petal-deep: #e77fa8;
+  --wash: #fdf3f6;          /* pale blossom wash */
+}
+body {
+  background:
+    radial-gradient(1100px 500px at 85% -5%, color-mix(in srgb, var(--petal) 16%, transparent), transparent 60%),
+    radial-gradient(900px 600px at -10% 100%, color-mix(in srgb, var(--ink-gray) 7%, transparent), transparent 55%),
+    var(--bg);
+}
+@keyframes petalFall {
+  0%   { transform: translate(0, -4vh) rotate(0deg); opacity: 0; }
+  8%   { opacity: var(--petal-opacity, .7); }
+  100% { transform: translate(calc(-1 * var(--drift, 30vw)), 108vh) rotate(var(--spin, 300deg)); opacity: 0; }
+}
+.petal {
+  position: fixed; top: 0; pointer-events: none; z-index: 15;
+  width: var(--size, 12px); height: calc(var(--size, 12px) * 0.85);
+  background: radial-gradient(circle at 35% 30%, var(--petal) 0%, var(--petal-deep) 85%);
+  border-radius: 70% 30% 65% 35% / 60% 45% 55% 40%;
+  filter: blur(0.4px);
+  animation: petalFall var(--dur, 14s) linear var(--delay, 0s) infinite;
+}
+@keyframes bloomIn { from { opacity: 0; transform: scale(.3); } to { opacity: 1; transform: scale(1); } }
+.bloom { animation: bloomIn 1.2s ease-out both; transform-origin: center; }
+.watercolor-blob { border-radius: 55% 45% 60% 40% / 50% 60% 40% 55%; }
