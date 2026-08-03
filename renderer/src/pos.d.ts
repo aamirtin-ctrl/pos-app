@@ -26,6 +26,8 @@ declare global {
         spend: Call; setCeiling: Call; get: Call; set: Call;
       };
       assistant: { command: Call };
+      drafts: { list: Call; generate: Call; setStatus: Call };
+      voice: { synthesize: Call; get: Call };
       app: { openFullDiskAccess: Call };
     };
   }

@@ -59,5 +59,7 @@ contextBridge.exposeInMainWorld("pos", {
     set: call("settings.set"),
   },
   assistant: { command: call("assistant.command") },
+  drafts: { list: call("drafts.list"), generate: call("drafts.generate"), setStatus: call("drafts.setStatus") },
+  voice: { synthesize: call("voice.synthesize"), get: call("voice.get") },
   app: { openFullDiskAccess: call("app.openFullDiskAccess") },
 });

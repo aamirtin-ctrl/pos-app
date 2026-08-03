@@ -90,7 +90,7 @@ function CommandBar() {
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
-  const [reply, setReply] = useState<null | { kind: string; reply: string; results?: { id: number; name: string }[] }>(null);
+  const [reply, setReply] = useState<null | { kind: string; reply: string; results?: { id: number; name: string }[]; hits?: { type: string; label: string; sub: string; href: string }[] }>(null);
   const submit = async () => {
     if (!text.trim() || busy) return;
     setBusy(true);
@@ -122,7 +122,7 @@ function CommandBar() {
               value={text}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && submit()}
-              placeholder="Plan my day, who to ask about X, note about Sarah…"
+              placeholder="Plan my day · find anything · who to ask about X · note about Sarah…"
               className="flex-1 border rounded-lg px-3 py-1.5 text-sm"
               style={{ borderColor: "var(--line)" }}
             />
@@ -138,6 +138,17 @@ function CommandBar() {
               {reply.results?.map((p) => (
                 <a key={p.id} href={`#/contact/${p.id}`} className="ml-2 underline" style={{ color: "var(--accent)" }}>{p.name}</a>
               ))}
+              {reply.hits && (
+                <div className="mt-1.5 space-y-1">
+                  {reply.hits.map((h, i) => (
+                    <a key={i} href={h.href} className="block rounded-lg border px-2 py-1 hover:shadow-sm" style={{ borderColor: "var(--line)" }}>
+                      <span className="text-[10px] uppercase mr-2" style={{ color: "var(--accent)" }}>{h.type}</span>
+                      <span style={{ color: "var(--ink)" }}>{h.label}</span>
+                      <span className="ml-2" style={{ color: "var(--muted)" }}>{h.sub}</span>
+                    </a>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>

@@ -13,9 +13,10 @@ import { reconnectDue, refreshNextTouch } from "./crm/reconnect.ts";
 import * as planner from "./planner.ts";
 
 export interface AssistantResult {
-  kind: "plan" | "people" | "note" | "answer" | "error";
+  kind: "plan" | "people" | "note" | "answer" | "search" | "error";
   reply: string;
   results?: { id: number; name: string; reason: string }[];
+  hits?: { type: string; label: string; sub: string; href: string }[];
 }
 
 const today = () => new Date().toISOString().slice(0, 10);
@@ -37,10 +38,11 @@ export async function handleCommand(
       "assistant_route",
       "fast",
       `Classify this personal-assistant command. STRICT JSON only:
-{"intent":"plan_day"|"find_people"|"add_note"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>"}
+{"intent":"plan_day"|"find_people"|"add_note"|"search"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>"}
 "plan_day" = a braindump of tasks to schedule, or asking to plan the day.
 "find_people" = who should I talk to / reach out to / intro ideas.
 "add_note" = remember/save a fact about a person in the network.
+"search" = find/look up specific info they saved (a person, message, commitment, task, note).
 "question" = anything else about their calendar, commitments, or contacts.
 Command: """${t.slice(0, 600)}"""`,
       { json: true }
@@ -58,6 +60,7 @@ Command: """${t.slice(0, 600)}"""`,
     if (/\b(who|reach out|talk to|intro|connect me)\b/i.test(t) && /\babout|for|on|who\b/i.test(t)) intent = "find_people";
     if (/^(note|remember|met|log)\b/i.test(t)) intent = "add_note";
     if (/\b(plan|schedule|braindump)\b/i.test(t) || /\d+\s*(h|hr|hrs|hours|min)/i.test(t)) intent = "plan_day";
+    if (/^(find|search|look ?up|show me|when did|what did)\b/i.test(t)) intent = "search";
   }
 
   try {
@@ -93,6 +96,36 @@ Command: """${t.slice(0, 600)}"""`,
       patchPerson(db, hit.id, { bio: `${hit.bio ? hit.bio + "\n" : ""}${line}` });
       db.prepare("UPDATE person SET last_contact_at = COALESCE(last_contact_at, datetime('now')) WHERE id = ?").run(hit.id);
       return { kind: "note", reply: `Noted on ${hit.display_name}: "${line}"`, results: [{ id: hit.id, name: hit.display_name, reason: "updated" }] };
+    }
+
+    if (intent === "search") {
+      const q = `%${content.replace(/^(find|search|look ?up|show me)\s*/i, "").trim() || t}%`;
+      const hits: { type: string; label: string; sub: string; href: string }[] = [];
+      for (const r of db.prepare(
+        "SELECT id, display_name, org, role, bio FROM person WHERE display_name LIKE ? OR org LIKE ? OR role LIKE ? OR bio LIKE ? LIMIT 5"
+      ).all(q, q, q, q) as any[]) {
+        hits.push({ type: "person", label: r.display_name, sub: [r.role, r.org].filter(Boolean).join(" · ") || (r.bio ?? "").slice(0, 70), href: `#/contact/${r.id}` });
+      }
+      for (const r of db.prepare(
+        `SELECT i.id, i.channel, i.subject, i.body_summary, i.occurred_at, p.id AS pid, p.display_name AS who
+         FROM interaction i JOIN person p ON p.id=i.person_id
+         WHERE i.subject LIKE ? OR i.body_summary LIKE ? ORDER BY i.occurred_at DESC LIMIT 5`
+      ).all(q, q) as any[]) {
+        hits.push({ type: r.channel, label: `${r.who}: ${(r.subject ?? r.body_summary ?? "").slice(0, 60)}`, sub: String(r.occurred_at ?? "").slice(0, 10), href: `#/contact/${r.pid}` });
+      }
+      for (const r of db.prepare(
+        "SELECT c.id, c.description, c.due_at, p.id AS pid FROM commitment c LEFT JOIN person p ON p.id=c.person_id WHERE c.description LIKE ? LIMIT 4"
+      ).all(q) as any[]) {
+        hits.push({ type: "commitment", label: r.description.slice(0, 70), sub: r.due_at ? `due ${String(r.due_at).slice(0, 10)}` : "open", href: r.pid ? `#/contact/${r.pid}` : "#/relationships" });
+      }
+      for (const r of db.prepare(
+        "SELECT id, title, plan_date, status FROM task WHERE title LIKE ? ORDER BY created_at DESC LIMIT 4"
+      ).all(q) as any[]) {
+        hits.push({ type: "task", label: r.title, sub: `${r.status} · ${r.plan_date ?? ""}`, href: "#/calendar" });
+      }
+      return hits.length
+        ? { kind: "search", reply: `${hits.length} result${hits.length > 1 ? "s" : ""}:`, hits }
+        : { kind: "search", reply: "Nothing matched across contacts, messages, commitments, or tasks." };
     }
 
     // question → answer over a unified context snapshot

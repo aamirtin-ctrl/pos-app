@@ -14,6 +14,7 @@ import { listCommitments, confirmCommitment, dropCommitment } from "./crm/commit
 import { embedProfiles, makeQueryEmbedder } from "./llm/embeddings.ts";
 import * as planner from "./planner.ts";
 import { handleCommand } from "./assistant.ts";
+import { generateDrafts, listDrafts, setDraftStatus, synthesizeVoices, getVoices } from "./crm/drafts.ts";
 import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learning.ts";
 import { runSync, syncStatus } from "./workers.ts";
 import { saveDoctrine } from "./engine/doctrine.ts";
@@ -131,6 +132,13 @@ export function registerIpc(deps: IpcDeps) {
   h("gcal.connected", () => ({ connected: isGoogleConnected(secrets), hasCreds: hasGoogleCreds(secrets) }));
   h("gcal.reconcile", () => reconcileMovedEvents(db, secrets));
   h("gcal.events", (dateISO: string) => readAnchors(db, secrets, dateISO));
+
+  // ── messaging drafts + voices ──
+  h("drafts.list", () => listDrafts(db));
+  h("drafts.generate", () => generateDrafts(db, deps.llm()));
+  h("drafts.setStatus", (id: number, status: "dismissed" | "sent") => setDraftStatus(db, id, status));
+  h("voice.synthesize", () => synthesizeVoices(db, deps.llm()));
+  h("voice.get", () => getVoices(db));
 
   // ── unified assistant ──
   h("assistant.command", (text: string) =>

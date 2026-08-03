@@ -222,4 +222,22 @@ CREATE TABLE profile_embedding_meta (
 );
 `,
   },
+  {
+    version: 3,
+    name: "drafts",
+    sql: `
+-- Auto-drafted replies. One suggested draft per inbound interaction; the user
+-- copies/edits and sends from the native app (no auto-send, ever).
+CREATE TABLE draft (
+  id INTEGER PRIMARY KEY,
+  interaction_id INTEGER NOT NULL UNIQUE REFERENCES interaction(id) ON DELETE CASCADE,
+  person_id INTEGER NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+  channel TEXT NOT NULL,
+  body TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'suggested',  -- suggested | dismissed | sent
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_draft_status ON draft(status);
+`,
+  },
 ];
