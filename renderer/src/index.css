@@ -1,0 +1,27 @@
+@import "tailwindcss";
+
+/* Ported PersonalCRM2 palette: warm off-white + single slate accent. */
+:root {
+  --bg: #faf9f7;
+  --panel: #f3f1ed;
+  --ink: #1f2937;
+  --muted: #6b7280;
+  --accent: #475569;
+  --accent-soft: #cbd5e1;
+  --line: #e7e4de;
+  --danger: #b45309;
+}
+
+html, body, #root { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: ui-sans-serif, -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+.font-display { font-family: ui-serif, "New York", Georgia, serif; }
+.drag-region { -webkit-app-region: drag; }
+.no-drag { -webkit-app-region: no-drag; }
+input, textarea, select, button { user-select: auto; }
+::selection { background: var(--accent-soft); }

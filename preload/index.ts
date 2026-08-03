@@ -1,0 +1,57 @@
+// contextBridge: the ONLY surface the renderer can reach. Mirrors main/ipc.ts.
+
+import { contextBridge, ipcRenderer } from "electron";
+
+const call = (channel: string) => (...args: unknown[]) => ipcRenderer.invoke(channel, ...args);
+
+contextBridge.exposeInMainWorld("pos", {
+  people: {
+    list: call("people.list"),
+    get: call("people.get"),
+    patch: call("people.patch"),
+    merge: call("people.merge"),
+    reconnect: call("people.reconnect"),
+  },
+  query: { rank: call("query.rank") },
+  groups: {
+    list: call("groups.list"),
+    create: call("groups.create"),
+    assign: call("groups.assign"),
+    remove: call("groups.remove"),
+    hide: call("groups.hide"),
+  },
+  commitments: {
+    list: call("commitments.list"),
+    confirm: call("commitments.confirm"),
+    drop: call("commitments.drop"),
+  },
+  tasks: {
+    braindump: call("tasks.braindump"),
+    list: call("tasks.list"),
+    setStatus: call("tasks.setStatus"),
+  },
+  plan: {
+    generate: call("plan.generate"),
+    get: call("plan.get"),
+    accept: call("plan.accept"),
+    push: call("plan.push"),
+  },
+  outcomes: {
+    needed: call("outcomes.needed"),
+    capture: call("outcomes.capture"),
+    adherence: call("outcomes.adherence"),
+  },
+  sync: { run: call("sync.run"), status: call("sync.status"), embed: call("sync.embed") },
+  gcal: { connect: call("gcal.connect"), connected: call("gcal.connected"), reconcile: call("gcal.reconcile") },
+  settings: {
+    keys: call("settings.keys"),
+    setKey: call("settings.setKey"),
+    doctrineGet: call("settings.doctrine.get"),
+    doctrineSet: call("settings.doctrine.set"),
+    spend: call("settings.spend"),
+    setCeiling: call("settings.setCeiling"),
+    get: call("settings.get"),
+    set: call("settings.set"),
+  },
+  app: { openFullDiskAccess: call("app.openFullDiskAccess") },
+});

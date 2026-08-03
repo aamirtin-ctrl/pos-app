@@ -1,0 +1,19 @@
+appId: com.aamir.pos
+productName: POS
+directories:
+  output: release
+files:
+  - dist-main/**
+  - dist-renderer/**
+asarUnpack:
+  - "node_modules/better-sqlite3/**"
+  - "node_modules/sqlite-vec*/**"
+  - "node_modules/bindings/**"
+  - "node_modules/file-uri-to-path/**"
+mac:
+  target:
+    - target: dir
+      arch: [arm64]
+  category: public.app-category.productivity
+  identity: null   # unsigned local build; sign before distributing beyond this machine
+npmRebuild: true
