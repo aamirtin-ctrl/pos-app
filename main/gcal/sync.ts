@@ -15,6 +15,7 @@ import type { Db } from "../db/db.ts";
 import { getSetting, setSetting } from "../db/db.ts";
 import type { SecretStore } from "../secrets.ts";
 import { isGoogleConnected, oauthClient } from "./auth.ts";
+import { confirmCommitment } from "../crm/commitments.ts";
 
 export const POS_CALENDAR_NAME = "POS — Planned";
 export const POS_TASKLIST_NAME = "POS";
@@ -191,12 +192,26 @@ export interface ExternalAnchor {
 /** Only ask for what we read — and crucially, ask for iCalUID. */
 const EVENT_FIELDS = "items(id,status,summary,start,end,attendees,iCalUID),nextPageToken";
 
+// Day-flipping in the planner calls readAnchors once per flip; without a cache every
+// flip is a live round-trip to Google (calendarList + one events.list per calendar).
+// Mirrors the googleICalUids cache below: per-date, in-process, short TTL.
+const ANCHORS_TTL_MS = 60_000;
+const anchorsCache = new Map<string, { at: number; anchors: ExternalAnchor[] }>();
+
+/** Drop the in-process anchors cache — called after any write (pushPlan/reconcile) so reads stay fresh. */
+export function clearAnchorsCache(): void {
+  anchorsCache.clear();
+}
+
 /**
  * Read anchors for a date from ALL calendars except the POS calendar.
- * External events are immovable by definition.
+ * External events are immovable by definition. Cached per-date for 60s;
+ * pushPlan/reconcileMovedEvents clear the cache so pushes read back fresh.
  */
 export async function readAnchors(db: Db, secrets: SecretStore, dateISO: string): Promise<ExternalAnchor[]> {
   if (!isGoogleConnected(secrets)) return [];
+  const hit = anchorsCache.get(dateISO);
+  if (hit && Date.now() - hit.at < ANCHORS_TTL_MS) return hit.anchors;
   const cal = calApi(secrets);
   const posId = getSetting(db, "pos_calendar_id");
   const dayStart = new Date(`${dateISO}T00:00:00`);
@@ -228,6 +243,7 @@ export async function readAnchors(db: Db, secrets: SecretStore, dateISO: string)
       });
     }
   }
+  anchorsCache.set(dateISO, { at: Date.now(), anchors });
   return anchors;
 }
 
@@ -409,6 +425,7 @@ export async function pushPlan(db: Db, secrets: SecretStore, planId: number): Pr
     pushed++;
   }
   db.prepare("UPDATE plan SET pushed_at = datetime('now') WHERE id = ?").run(planId);
+  clearAnchorsCache(); // the day just changed in Google — next read must be live
   return { pushed };
 }
 
@@ -444,6 +461,7 @@ export async function reconcileMovedEvents(db: Db, secrets: SecretStore): Promis
       db.prepare("UPDATE block SET gcal_event_id = NULL WHERE id = ?").run(b.id);
     }
   }
+  clearAnchorsCache(); // reconcile may have moved/dropped events — invalidate cached reads
   return { locked };
 }
 
@@ -543,4 +561,103 @@ export async function pushTasks(db: Db, secrets: SecretStore): Promise<{ pushed:
     }
   }
   return { pushed, completed };
+}
+
+// ── commitment → task / event (extracted from ipc.ts so they are testable) ───
+//
+// These are the bodies of the "Add task" / "Add event" buttons on the Relationships
+// dashboard. All LOCAL database work happens first and unconditionally; the Google
+// push is best-effort, time-boxed, and reported — it can never block or lose the
+// local write. (The old inline handler awaited a full un-timed Google Tasks push
+// before returning, so a slow/stale-token network call made the button look dead.)
+
+/** Reject-after-timeout wrapper. Does not cancel `p`; the local DB state is already consistent. */
+function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(message)), ms);
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
+const GOOGLE_PUSH_TIMEOUT_MS = 15_000;
+
+export interface CommitmentToTaskResult {
+  task: boolean;
+  /** True when an open task for this commitment already existed (double-click guard). */
+  duplicate: boolean;
+  google: boolean;
+  reason?: string;
+  pushed?: number;
+  completed?: number;
+}
+
+/**
+ * Confirm (if needed) + create a local task for a commitment, then push to Google
+ * Tasks. Idempotent: an existing open task for the same commitment is reused, not
+ * duplicated. Throws only when the commitment does not exist.
+ */
+export async function commitmentToTask(db: Db, secrets: SecretStore, id: number): Promise<CommitmentToTaskResult> {
+  const c = db.prepare("SELECT id, description, due_at, confirmed_by_user FROM commitment WHERE id = ?").get(id) as
+    | { id: number; description: string; due_at: string | null; confirmed_by_user: number } | undefined;
+  if (!c) throw new Error("commitment not found");
+  if (c.confirmed_by_user === 0) confirmCommitment(db, id);
+
+  // Double-click guard: the observed failure mode was two identical tasks created
+  // seconds apart because the button gave no feedback while Google was slow.
+  const existing = db
+    .prepare("SELECT id FROM task WHERE commitment_id = ? AND status IN ('inbox','planned','in_progress')")
+    .get(id) as { id: number } | undefined;
+  let duplicate = false;
+  if (existing) {
+    duplicate = true;
+  } else {
+    const today = new Date().toISOString().slice(0, 10);
+    const due = c.due_at ? c.due_at.slice(0, 10) : null;
+    const planDate = due && due > today ? due : today;
+    db.prepare(
+      `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
+        commitment_id, status, plan_date, hard_deadline_at, estimate_source)
+       VALUES (?, 'admin', 2, 30, 30, ?, 'inbox', ?, ?, 'inferred')`
+    ).run(c.description.slice(0, 120), c.id, planDate, c.due_at);
+  }
+  db.prepare("UPDATE commitment SET status = 'scheduled' WHERE id = ?").run(id);
+
+  if (!isGoogleConnected(secrets)) return { task: true, duplicate, google: false, reason: "Google not connected" };
+  try {
+    const res = await withTimeout(pushTasks(db, secrets), GOOGLE_PUSH_TIMEOUT_MS, "Google Tasks push timed out");
+    return { task: true, duplicate, google: true, ...res };
+  } catch (err) {
+    return { task: true, duplicate, google: false, reason: (err as Error).message };
+  }
+}
+
+export interface CommitmentToEventResult {
+  event?: boolean;
+  needsDate?: boolean;
+  starts_at?: string;
+}
+
+/**
+ * Pin a 60-min personal block for a commitment on its due date (or the supplied
+ * date/time). No due date and no supplied date → { needsDate: true } so the UI can
+ * ask. Throws when the commitment does not exist or the date/time is invalid.
+ */
+export function commitmentToEvent(db: Db, id: number, dateISO?: string, hhmm?: string): CommitmentToEventResult {
+  const c = db.prepare("SELECT id, description, due_at FROM commitment WHERE id = ?").get(id) as
+    | { id: number; description: string; due_at: string | null } | undefined;
+  if (!c) throw new Error("commitment not found");
+  const date = dateISO || (c.due_at ? c.due_at.slice(0, 10) : null);
+  if (!date) return { needsDate: true };
+  const time = hhmm && /^\d{2}:\d{2}$/.test(hhmm) ? hhmm : "10:00";
+  const startsAt = `${date}T${time}:00`;
+  const start = new Date(startsAt);
+  if (Number.isNaN(start.getTime())) throw new Error("invalid date/time");
+  const end = new Date(start.getTime() + 60 * 60_000);
+  const endsAt = `${end.getFullYear()}-${pad2(end.getMonth() + 1)}-${pad2(end.getDate())}T${pad2(end.getHours())}:${pad2(end.getMinutes())}:00`;
+  db.prepare(
+    `INSERT INTO block (task_id, block_type, title, starts_at, ends_at, is_anchor, is_locked, plan_id)
+     VALUES (NULL, 'personal', ?, ?, ?, 0, 1, NULL)`
+  ).run(c.description.slice(0, 120), startsAt, endsAt);
+  db.prepare("UPDATE commitment SET status = 'scheduled' WHERE id = ?").run(id);
+  return { event: true, starts_at: startsAt };
 }

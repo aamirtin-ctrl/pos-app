@@ -166,7 +166,7 @@ function CommandBar() {
       <button
         onClick={() => { setOpen((o) => !o); setReply(null); }}
         title="Ask POS anything"
-        className="no-drag fixed top-3 right-4 z-40 watercolor-blob flex items-center justify-center w-9 h-9 shadow-md transition-transform hover:scale-110"
+        className="no-drag fixed top-3 right-4 z-40 watercolor-blob flex items-center justify-center w-9 h-9 shadow-md transition-transform duration-[120ms] hover:scale-110 active:scale-95"
         style={{ background: "radial-gradient(circle at 32% 28%, var(--pink-1) 8%, var(--pink-2) 60%, var(--pink-3) 100%)", color: "var(--ink)" }}
       >
         <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
@@ -254,7 +254,8 @@ export default function App() {
       <Branch blooms={blooms} />
       <CommandBar />
 
-      <main className="h-full overflow-auto pb-28">
+      {/* keyed by view: switching sections re-enters with a gentle fade+rise */}
+      <main key={view} className="h-full overflow-auto pb-28 view-enter">
         {view === "calendar" && <Calendar />}
         {view === "relationships" && <Relationships subroute={route.split("/")[2] ?? ""} />}
         {view === "contact" && <ContactDetail id={Number(route.split("/")[2])} />}
@@ -266,7 +267,7 @@ export default function App() {
       <a
         href="#/settings"
         title="Settings"
-        className="no-drag fixed bottom-4 left-4 z-20 flex items-center justify-center w-9 h-9 rounded-full border bg-white/90 backdrop-blur shadow-sm transition-transform hover:scale-105"
+        className="no-drag fixed bottom-4 left-4 z-20 flex items-center justify-center w-9 h-9 rounded-full border bg-white/90 backdrop-blur shadow-sm transition-transform duration-[120ms] hover:scale-110 active:scale-95"
         style={{
           borderColor: "var(--line)",
           color: view === "settings" ? "var(--accent)" : "var(--muted)",
@@ -290,7 +291,7 @@ export default function App() {
               key={d.href}
               href={d.href}
               title={d.label}
-              className="watercolor-blob flex items-center justify-center w-12 h-12 shadow-md transition-transform hover:scale-110"
+              className="watercolor-blob flex items-center justify-center w-12 h-12 shadow-md transition-[transform,scale,box-shadow] duration-[120ms] hover:scale-110 active:scale-95"
               style={{
                 transform: `translateY(${d.lift}px)`,
                 background: ombre,

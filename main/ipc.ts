@@ -23,7 +23,7 @@ import { listMsgPlans } from "./msgplans.ts";
 import { listMailAccounts, addMailAccount, removeMailAccount, type MailProvider } from "./connectors/gmail.ts";
 import { saveDoctrine } from "./engine/doctrine.ts";
 import { runLoopbackAuth, cancelLoopbackAuth, isGoogleConnected, hasGoogleCreds } from "./gcal/auth.ts";
-import { pushPlan, pushTasks, reconcileMovedEvents, readAnchors } from "./gcal/sync.ts";
+import { pushPlan, pushTasks, reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent } from "./gcal/sync.ts";
 import { notionAvailable, searchTargets, syncNotion, PARENT_PAGE_KEY } from "./notion.ts";
 import {
   appleCalendarAvailable,
@@ -113,51 +113,13 @@ export function registerIpc(deps: IpcDeps) {
     db.prepare("UPDATE commitment SET status = 'scheduled' WHERE id = ?").run(id);
     return { scheduled: true };
   });
-  // "Add task" button: confirm if needed, create the local task, then push to Google Tasks now.
-  h("commitments.toTask", async (id: number) => {
-    const c = db.prepare("SELECT id, description, due_at, confirmed_by_user FROM commitment WHERE id = ?").get(id) as
-      | { id: number; description: string; due_at: string | null; confirmed_by_user: number } | undefined;
-    if (!c) throw new Error("commitment not found");
-    if (c.confirmed_by_user === 0) confirmCommitment(db, id);
-    const today = new Date().toISOString().slice(0, 10);
-    const due = c.due_at ? c.due_at.slice(0, 10) : null;
-    const planDate = due && due > today ? due : today;
-    db.prepare(
-      `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
-        commitment_id, status, plan_date, hard_deadline_at, estimate_source)
-       VALUES (?, 'admin', 2, 30, 30, ?, 'inbox', ?, ?, 'inferred')`
-    ).run(c.description.slice(0, 120), c.id, planDate, c.due_at);
-    db.prepare("UPDATE commitment SET status = 'scheduled' WHERE id = ?").run(id);
-    if (!isGoogleConnected(secrets)) return { task: true, google: false, reason: "Google not connected" };
-    try {
-      const res = await pushTasks(db, secrets);
-      return { task: true, google: true, ...res };
-    } catch (err) {
-      return { task: true, google: false, reason: (err as Error).message };
-    }
-  });
+  // "Add task" button: confirm if needed, create the local task, then push to Google Tasks.
+  // Body lives in gcal/sync.ts (commitmentToTask) so it is testable without electron;
+  // local DB work is unconditional, the Google push is time-boxed and best-effort.
+  h("commitments.toTask", (id: number) => commitmentToTask(db, secrets, id));
   // "Add event" button: pin a 60-min personal block on the due date at 10:00.
   // Without a due date the renderer supplies dateISO ("YYYY-MM-DD") + hhmm ("HH:MM").
-  h("commitments.toEvent", (id: number, dateISO?: string, hhmm?: string) => {
-    const c = db.prepare("SELECT id, description, due_at FROM commitment WHERE id = ?").get(id) as
-      | { id: number; description: string; due_at: string | null } | undefined;
-    if (!c) throw new Error("commitment not found");
-    const date = dateISO || (c.due_at ? c.due_at.slice(0, 10) : null);
-    if (!date) return { needsDate: true };
-    const time = hhmm && /^\d{2}:\d{2}$/.test(hhmm) ? hhmm : "10:00";
-    const startsAt = `${date}T${time}:00`;
-    const start = new Date(startsAt);
-    if (Number.isNaN(start.getTime())) throw new Error("invalid date/time");
-    const end = new Date(start.getTime() + 60 * 60_000);
-    const pad2 = (n: number) => String(n).padStart(2, "0");
-    const endsAt = `${end.getFullYear()}-${pad2(end.getMonth() + 1)}-${pad2(end.getDate())}T${pad2(end.getHours())}:${pad2(end.getMinutes())}:00`;
-    db.prepare(
-      `INSERT INTO block (task_id, block_type, title, starts_at, ends_at, is_anchor, is_locked, plan_id)
-       VALUES (NULL, 'personal', ?, ?, ?, 0, 1, NULL)`
-    ).run(c.description.slice(0, 120), startsAt, endsAt);
-    db.prepare("UPDATE commitment SET status = 'scheduled' WHERE id = ?").run(id);
-    return { event: true, starts_at: startsAt };
-  });
+  h("commitments.toEvent", (id: number, dateISO?: string, hhmm?: string) => commitmentToEvent(db, id, dateISO, hhmm));
 
   // ── planner ──
   h("tasks.braindump", (text: string, dateISO: string) =>

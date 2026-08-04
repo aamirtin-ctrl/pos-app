@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { GroupChips } from "./Home.tsx";
 
-// Contacts list: debounced search over name/org/role, freshness dot (opacity
-// decays with days since last contact), multi-select → merge duplicates.
+// Contacts list: debounced search over name/org/role, group chips (migrated CRM
+// groups; click to filter, "All" resets), freshness dot (opacity decays with days
+// since last contact), multi-select → merge duplicates.
 
 type PersonListItem = {
   id: number;
@@ -25,6 +27,8 @@ function freshnessOpacity(days: number | null): number {
   return 1 - ((days - 30) / 150) * 0.85;
 }
 
+type GroupRow = { id: number; name: string; hidden: number; members: number };
+
 export default function Contacts() {
   const [q, setQ] = useState("");
   const [people, setPeople] = useState<PersonListItem[]>([]);
@@ -32,6 +36,8 @@ export default function Contacts() {
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [merging, setMerging] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [groups, setGroups] = useState<GroupRow[]>([]);
+  const [groupFilter, setGroupFilter] = useState<string | null>(null);
   const debounce = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refetch = useCallback(async (query: string) => {
@@ -41,6 +47,14 @@ export default function Contacts() {
   }, []);
 
   useEffect(() => { refetch(""); }, [refetch]);
+  useEffect(() => {
+    window.pos.groups.list().then((r) => {
+      if (r.ok) setGroups((r.data as GroupRow[]).filter((g) => !g.hidden));
+    });
+  }, []);
+
+  // people.list already returns each person's groups — filter client-side
+  const shown = groupFilter ? people.filter((p) => (p.groups ?? []).includes(groupFilter)) : people;
 
   const onSearch = (value: string) => {
     setQ(value);
@@ -72,27 +86,31 @@ export default function Contacts() {
       <div className="drag-region h-4" />
       <div className="flex items-baseline justify-between mb-4 no-drag">
         <h1 className="font-display text-2xl font-semibold">Contacts</h1>
-        <span className="text-xs tabular-nums" style={{ color: "var(--muted)" }}>{people.length}</span>
+        <span className="text-xs tabular-nums" style={{ color: "var(--muted)" }}>{shown.length}</span>
       </div>
 
       <input
         value={q}
         onChange={(e) => onSearch(e.target.value)}
         placeholder="Search name, org, role…"
-        className="w-full border rounded-lg px-3 py-2 text-sm bg-white mb-4"
+        className="w-full border rounded-lg px-3 py-2 text-sm bg-white mb-3"
         style={{ borderColor: "var(--line)" }}
       />
 
-      {loaded && people.length === 0 ? (
+      <GroupChips groups={groups.map((g) => g.name)} active={groupFilter} onPick={setGroupFilter} />
+
+      {loaded && shown.length === 0 ? (
         <p className="text-sm py-6 text-center" style={{ color: "var(--muted)" }}>
-          {q.trim() ? "No matches." : "No contacts yet — run a sync in Settings to pull them in."}
+          {groupFilter
+            ? `Nobody in "${groupFilter}"${q.trim() ? " matches this search" : ""}.`
+            : q.trim() ? "No matches." : "No contacts yet — run a sync in Settings to pull them in."}
         </p>
       ) : (
         <div className="rounded-xl border bg-white divide-y" style={{ borderColor: "var(--line)" }}>
-          {people.map((p) => (
+          {shown.map((p) => (
             <div
               key={p.id}
-              className="flex items-center gap-3 px-3 py-2 hover:bg-black/[0.02]"
+              className="flex items-center gap-3 px-3 py-2 hover:bg-black/[0.02] transition-colors duration-[120ms]"
               style={{ borderColor: "var(--line)" }}
             >
               <input

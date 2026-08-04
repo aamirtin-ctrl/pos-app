@@ -14,6 +14,8 @@ export interface ReconnectRow {
   last_contact_at: string | null;
   next_touch_due_at: string;
   overdue_days: number;
+  /** Names of the groups this person belongs to (migrated CRM groups). */
+  groups: string[];
 }
 
 /** Recompute person.next_touch_due_at = last_contact_at + tier threshold. Tier 3 → NULL. */
@@ -41,17 +43,24 @@ export function refreshNextTouch(db: Db): number {
   return run();
 }
 
+// Unit separator — cannot appear in a group name, so group_concat splits safely.
+const GROUP_SEP = String.fromCharCode(31);
+
 /**
  * Persons past their next touch, excluding active 'stale' dismissals (snooze_until NULL =
- * dismissed indefinitely; a future snooze_until also suppresses). Ordered by tier (inner
- * circle first), then most-overdue first.
+ * dismissed indefinitely; a future snooze_until also suppresses) and excluding anyone who
+ * belongs to a group with suppress_follow_ups = 1 (e.g. the migrated "family group").
+ * Each row carries the person's group names. Ordered by tier (inner circle first), then
+ * most-overdue first.
  */
 export function reconnectDue(db: Db, now: Date = new Date()): ReconnectRow[] {
   const nowIso = now.toISOString().replace("T", " ").slice(0, 19);
-  return db
+  const rows = db
     .prepare(
       `SELECT p.id, p.display_name, p.org, p.tier, p.last_contact_at, p.next_touch_due_at,
-              CAST(julianday(?) - julianday(p.next_touch_due_at) AS INTEGER) AS overdue_days
+              CAST(julianday(?) - julianday(p.next_touch_due_at) AS INTEGER) AS overdue_days,
+              (SELECT group_concat(g.name, char(31)) FROM person_group pg
+                 JOIN grp g ON g.id = pg.group_id WHERE pg.person_id = p.id) AS group_names
        FROM person p
        WHERE p.next_touch_due_at IS NOT NULL
          AND p.next_touch_due_at <= ?
@@ -61,7 +70,15 @@ export function reconnectDue(db: Db, now: Date = new Date()): ReconnectRow[] {
            WHERE d.person_id = p.id AND d.kind = 'stale'
              AND (d.snooze_until IS NULL OR d.snooze_until > ?)
          )
+         AND NOT EXISTS (
+           SELECT 1 FROM person_group pg JOIN grp g ON g.id = pg.group_id
+           WHERE pg.person_id = p.id AND g.suppress_follow_ups = 1
+         )
        ORDER BY p.tier ASC, overdue_days DESC`
     )
-    .all(nowIso, nowIso, nowIso) as ReconnectRow[];
+    .all(nowIso, nowIso, nowIso) as (Omit<ReconnectRow, "groups"> & { group_names: string | null })[];
+  return rows.map(({ group_names, ...r }) => ({
+    ...r,
+    groups: group_names ? group_names.split(GROUP_SEP).sort() : [],
+  }));
 }

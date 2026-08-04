@@ -92,12 +92,27 @@ type Item = {
   external: boolean; anchor: boolean; locked: boolean;
 };
 
+/** Everything one day's view needs — cached per date so flips render instantly. */
+type DayData = { plan: PlanView | null; external: ExternalEvent[]; outcomes: any[] };
+
+const FLIP_FETCH_DEBOUNCE_MS = 250; // settle time before hitting IPC after day flips
+
 export default function DayPlanner() {
   const [date, setDate] = useState(todayISO());
+  // slide direction for the timeline enter animation (1 = forward/next day)
+  const slideDir = React.useRef(1);
+  const setDateAnimated = (next: string) => {
+    setDate((d) => {
+      slideDir.current = next >= d ? 1 : -1;
+      return next;
+    });
+  };
   // trackpad horizontal scroll pages between days (accumulated so one swipe = one day)
   const dayWheel = React.useRef(0);
-  const shiftDay = (n: number) =>
+  const shiftDay = (n: number) => {
+    slideDir.current = n > 0 ? 1 : -1;
     setDate((d: string) => new Date(new Date(`${d}T12:00:00`).getTime() + n * 86400000).toISOString().slice(0, 10));
+  };
   const onDayWheel = (e: React.WheelEvent) => {
     if (Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
     dayWheel.current += e.deltaX;
@@ -109,16 +124,44 @@ export default function DayPlanner() {
   const [outcomes, setOutcomes] = useState<any[]>([]);
   const [now, setNow] = useState(new Date());
 
+  // Per-date client cache: flipping to a seen day renders instantly from here while
+  // the (debounced) fetch revalidates in the background.
+  const dayCache = React.useRef(new Map<string, DayData>());
+  const dateRef = React.useRef(date);
+  dateRef.current = date;
+
+  const applyDay = (d: DayData) => {
+    setPlan(d.plan);
+    setExternal(d.external);
+    setOutcomes(d.outcomes);
+  };
+
   const refresh = useCallback(async () => {
-    const r = await window.pos.plan.get(date);
-    setPlan(r.ok ? (r.data as PlanView | null) : null);
-    const g = await window.pos.gcal.events(date);
-    setExternal(g.ok && Array.isArray(g.data) ? (g.data as ExternalEvent[]) : []);
-    const yday = new Date(new Date(date).getTime() - 86400000).toISOString().slice(0, 10);
-    const o = await window.pos.outcomes.needed(yday);
-    setOutcomes(o.ok ? (o.data as any[]) : []);
+    const forDate = date;
+    const yday = new Date(new Date(forDate).getTime() - 86400000).toISOString().slice(0, 10);
+    const [r, g, o] = await Promise.all([
+      window.pos.plan.get(forDate),
+      window.pos.gcal.events(forDate),
+      window.pos.outcomes.needed(yday),
+    ]);
+    const data: DayData = {
+      plan: r.ok ? (r.data as PlanView | null) : null,
+      external: g.ok && Array.isArray(g.data) ? (g.data as ExternalEvent[]) : [],
+      outcomes: o.ok ? (o.data as any[]) : [],
+    };
+    dayCache.current.set(forDate, data);
+    if (dateRef.current === forDate) applyDay(data); // ignore stale responses after more flips
   }, [date]);
-  useEffect(() => { refresh(); }, [refresh]);
+
+  useEffect(() => {
+    // Optimistic flip: paint the cached day immediately (or clear to a blank day),
+    // then fetch only after the flipping settles — rapid flips cost zero IPC.
+    const cached = dayCache.current.get(date);
+    if (cached) applyDay(cached);
+    else { setPlan(null); setExternal([]); setOutcomes([]); }
+    const t = setTimeout(() => { refresh(); }, FLIP_FETCH_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [date, refresh]);
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 60000);
     return () => clearInterval(t);
@@ -230,13 +273,13 @@ export default function DayPlanner() {
             </h1>
             <div className="flex items-center gap-2 shrink-0">
               {!isToday && (
-                <button onClick={() => setDate(todayISO())}
-                  className="px-2.5 py-1 rounded-full text-[11px] font-medium border bg-white"
+                <button onClick={() => setDateAnimated(todayISO())}
+                  className="px-2.5 py-1 rounded-full text-[11px] font-medium border bg-white transition-transform duration-[120ms] hover:scale-105 active:scale-95"
                   style={{ borderColor: "var(--line)", color: "var(--accent)" }}>
                   Today
                 </button>
               )}
-              <input type="date" value={date} onChange={(e) => setDate(e.target.value)}
+              <input type="date" value={date} onChange={(e) => e.target.value && setDateAnimated(e.target.value)}
                 aria-label="Pick a date"
                 className="border rounded-full px-2.5 py-1 text-[11px] bg-white"
                 style={{ borderColor: "var(--line)", color: "var(--muted)" }} />
@@ -249,8 +292,8 @@ export default function DayPlanner() {
               const selected = d.iso === date;
               const today = d.iso === todayISO();
               return (
-                <button key={d.iso} onClick={() => setDate(d.iso)}
-                  className="flex flex-col items-center gap-0.5 rounded-2xl py-1.5 transition-colors"
+                <button key={d.iso} onClick={() => setDateAnimated(d.iso)}
+                  className="flex flex-col items-center gap-0.5 rounded-2xl py-1.5 transition-[background-color,transform] duration-[120ms] hover:scale-105 active:scale-95"
                   style={selected
                     ? { background: "var(--accent)", color: "white", boxShadow: "0 2px 8px rgba(214,138,164,0.4)" }
                     : { background: "color-mix(in srgb, white 55%, transparent)", color: "var(--ink)" }}>
@@ -269,9 +312,9 @@ export default function DayPlanner() {
         </div>
       </div>
 
-      {/* timeline */}
+      {/* timeline — keyed by date so each flip re-enters with a subtle slide+fade */}
       <div className="px-6 pb-32">
-        <div className="max-w-xl mx-auto">
+        <div key={date} className={`max-w-xl mx-auto ${slideDir.current >= 0 ? "day-enter-fwd" : "day-enter-back"}`}>
           {items.length > 0 ? (
             <div className="mt-1">{rows}</div>
           ) : (

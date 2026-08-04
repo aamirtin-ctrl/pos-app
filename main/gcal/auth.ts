@@ -9,8 +9,9 @@ import { google } from "googleapis";
 import type { SecretStore } from "../secrets.ts";
 
 export const GOOGLE_SCOPES = [
-  "https://www.googleapis.com/auth/calendar.events",
-  "https://www.googleapis.com/auth/calendar.readonly",
+  // full calendar scope: creating the dedicated POS calendars (calendars.insert)
+  // needs more than events+readonly — "Insufficient Permission" otherwise.
+  "https://www.googleapis.com/auth/calendar",
   "https://www.googleapis.com/auth/tasks",
 ];
 

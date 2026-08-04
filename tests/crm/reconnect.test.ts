@@ -88,4 +88,41 @@ describe("reconnectDue", () => {
     db.prepare("INSERT INTO dismissal (person_id, kind, snooze_until) VALUES (?, 'followup', NULL)").run(p);
     expect(reconnectDue(db, NOW).map((x) => x.display_name)).toEqual(["Followup Dismissed"]);
   });
+
+  const addGroup = (name: string, suppress = 0): number => {
+    const r = db.prepare("INSERT INTO grp (name, suppress_follow_ups) VALUES (?, ?)").run(name, suppress);
+    return Number(r.lastInsertRowid);
+  };
+  const assign = (personId: number, groupId: number) =>
+    db.prepare("INSERT INTO person_group (person_id, group_id) VALUES (?, ?)").run(personId, groupId);
+
+  it("excludes members of a group with suppress_follow_ups = 1", () => {
+    const family = addGroup("family group", 1);
+    const friends = addGroup("Friends", 0);
+    const mom = addPerson("Mom", 0, "2026-01-01 00:00:00");
+    const friend = addPerson("Overdue Friend", 1, "2026-01-01 00:00:00");
+    const both = addPerson("Friend And Family", 1, "2026-01-01 00:00:00");
+    assign(mom, family);
+    assign(friend, friends);
+    assign(both, friends);
+    assign(both, family); // any suppressed group membership wins
+    refreshNextTouch(db);
+
+    expect(reconnectDue(db, NOW).map((x) => x.display_name)).toEqual(["Overdue Friend"]);
+  });
+
+  it("returns each row's group names (empty array when ungrouped)", () => {
+    const friends = addGroup("Friends");
+    const stanford = addGroup("Stanford Peers");
+    const grouped = addPerson("Grouped", 1, "2026-01-01 00:00:00");
+    addPerson("Ungrouped", 1, "2026-02-01 00:00:00");
+    assign(grouped, stanford);
+    assign(grouped, friends);
+    refreshNextTouch(db);
+
+    const due = reconnectDue(db, NOW);
+    const byName = new Map(due.map((r) => [r.display_name, r]));
+    expect(byName.get("Grouped")?.groups).toEqual(["Friends", "Stanford Peers"]); // sorted
+    expect(byName.get("Ungrouped")?.groups).toEqual([]);
+  });
 });

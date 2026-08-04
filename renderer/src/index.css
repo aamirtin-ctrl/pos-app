@@ -68,3 +68,27 @@ body {
 .watercolor-blob { animation: blobMorph 9s ease-in-out infinite, blobFloat 5s ease-in-out infinite; }
 .watercolor-blob:nth-of-type(2) { animation-delay: -3s, -1.6s; }
 .watercolor-blob:nth-of-type(3) { animation-delay: -6s, -3.2s; }
+
+/* ── view + day transitions ──
+   Gentle fade+rise when switching sections; subtle slide+fade when the planner
+   flips days. All suppressed under prefers-reduced-motion. */
+@keyframes viewEnter {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.view-enter { animation: viewEnter 180ms ease-out both; }
+
+@keyframes dayEnterFwd {
+  from { opacity: 0; transform: translateX(16px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes dayEnterBack {
+  from { opacity: 0; transform: translateX(-16px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.day-enter-fwd  { animation: dayEnterFwd 200ms ease-out both; }
+.day-enter-back { animation: dayEnterBack 200ms ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .view-enter, .day-enter-fwd, .day-enter-back { animation: none; }
+}

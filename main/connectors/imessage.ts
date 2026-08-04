@@ -122,13 +122,65 @@ export interface ImessageOptions {
   months?: number | null;
 }
 
+/** SyncReport plus a skip breakdown, so a 0-ingested run is explainable at a glance. */
+export interface ImessageSyncReport extends SyncReport {
+  /** Counterparts that resolved to nobody (unknown number, ambiguous, or not in Contacts). */
+  skippedUnmatched: number;
+  /** Rows already ingested on a previous run (idempotent dedupe). */
+  skippedDuplicates: number;
+}
+
+export interface ImessageCursor {
+  /** Only messages with ROWID above this are read (the normal incremental cursor). */
+  sinceRowid: bigint;
+  /** Apple-epoch NANOSECOND floor on m.date (legacy date-based cursors land here). */
+  dateFloor: bigint;
+}
+
+// A chat.db message ROWID is a small counter (thousands–millions). Anything above this
+// cannot be a ROWID and must be a date-shaped cursor left behind by the old CRM.
+const MAX_PLAUSIBLE_ROWID = 100_000_000n;
+
+/**
+ * Interpret the sync_state cursor for 'imessage'. This code writes max-ROWID cursors, but
+ * migrated databases carry the OLD CRM's cursor formats: an Apple-epoch timestamp (ns or s)
+ * of the last message, or an ISO date string. Comparing those against m.ROWID silently
+ * matches zero rows forever (the observed "ingested 0, no error" failure — the live DB held
+ * 804350114209962112, an Apple-ns timestamp, as the ROWID cursor). Legacy cursors become a
+ * date floor instead; unparseable cursors fall back to a full (window-bounded) scan.
+ */
+export function parseImessageCursor(raw: string | null): ImessageCursor {
+  const none: ImessageCursor = { sinceRowid: 0n, dateFloor: 0n };
+  const t = raw?.trim();
+  if (!t) return none;
+  let n: bigint | null = null;
+  try {
+    n = BigInt(t);
+  } catch {
+    n = null;
+  }
+  if (n !== null) {
+    if (n <= 0n) return none;
+    if (n > NS_THRESHOLD) return { sinceRowid: 0n, dateFloor: n }; // apple-epoch ns
+    if (n > MAX_PLAUSIBLE_ROWID) return { sinceRowid: 0n, dateFloor: n * 1_000_000_000n }; // apple-epoch s
+    return { sinceRowid: n, dateFloor: 0n }; // a real ROWID cursor
+  }
+  const ms = Date.parse(t); // e.g. an ISO date string from the old CRM
+  if (!Number.isNaN(ms)) {
+    return { sinceRowid: 0n, dateFloor: BigInt(Math.max(0, ms - APPLE_EPOCH_MS)) * 1_000_000n };
+  }
+  return none; // unrecognized — rescan; INSERT OR IGNORE keeps it idempotent
+}
+
 function sha256(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = {}): Promise<SyncReport> {
+export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = {}): Promise<ImessageSyncReport> {
   const { db } = deps;
-  const report: SyncReport = { source: "imessage", ingested: 0, skipped: 0, created: 0 };
+  const report: ImessageSyncReport = {
+    source: "imessage", ingested: 0, skipped: 0, created: 0, skippedUnmatched: 0, skippedDuplicates: 0,
+  };
   const srcPath = opts.chatDbPath ?? DEFAULT_CHAT_DB;
   const lookbackMonths = opts.months === undefined ? DEFAULT_LOOKBACK_MONTHS : opts.months;
 
@@ -164,20 +216,17 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
     try {
       chat.exec("PRAGMA query_only = ON;");
 
-      // Incremental cursor = max message ROWID already ingested; window floor bounds the
-      // first run (modern chat.db stores Apple-epoch nanoseconds in m.date).
-      const cursorRaw = getCursor(db, "imessage");
-      let cursor = 0n;
-      try {
-        cursor = cursorRaw ? BigInt(cursorRaw) : 0n;
-      } catch {
-        cursor = 0n;
-      }
+      // Incremental cursor = max message ROWID already ingested; legacy (migrated) cursors
+      // are date-shaped and become a floor on m.date instead (see parseImessageCursor).
+      // The lookback window additionally bounds the first run (modern chat.db stores
+      // Apple-epoch nanoseconds in m.date).
+      const { sinceRowid, dateFloor } = parseImessageCursor(getCursor(db, "imessage"));
       let windowFloor = 0n;
       if (lookbackMonths !== null) {
         const cutoffMs = Date.now() - lookbackMonths * 30.44 * 86_400_000;
         windowFloor = BigInt(Math.max(0, Math.round((cutoffMs - APPLE_EPOCH_MS) * 1_000_000)));
       }
+      if (dateFloor > windowFloor) windowFloor = dateFloor;
 
       // 1:1 conversations only (chats with exactly one handle). Group chats are noisy.
       const stmt = chat.prepare(`
@@ -196,7 +245,7 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
         ORDER BY m.ROWID ASC
       `);
       stmt.safeIntegers(true);
-      const rows = stmt.all(cursor, windowFloor) as Array<{
+      const rows = stmt.all(sinceRowid, windowFloor) as Array<{
         rowid: bigint;
         guid: string | null;
         text: string | null;
@@ -218,12 +267,14 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
         const counterpart = (row.counterpart ?? "").trim();
         if (!counterpart) {
           report.skipped++;
+          report.skippedUnmatched++;
           continue;
         }
         const email = counterpart.includes("@") ? normalizeEmail(counterpart) : null;
         const phone = !email ? normalizePhone(counterpart) : null;
         if (!email && !phone) {
           report.skipped++; // unparseable handle — don't guess
+          report.skippedUnmatched++;
           continue;
         }
         const key = email?.norm ?? phone!.norm;
@@ -263,6 +314,7 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
 
         if (personId === null) {
           report.skipped++;
+          report.skippedUnmatched++;
           continue;
         }
 
@@ -276,7 +328,10 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
           externalId: row.guid ?? `imessage:${row.rowid}`,
         });
         if (inserted) report.ingested++;
-        else report.skipped++; // already ingested — idempotent
+        else {
+          report.skipped++; // already ingested — idempotent
+          report.skippedDuplicates++;
+        }
       }
     } finally {
       chat.close();
