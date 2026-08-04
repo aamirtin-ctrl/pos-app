@@ -70,6 +70,7 @@ contextBridge.exposeInMainWorld("pos", {
     get: call("settings.get"),
     set: call("settings.set"),
   },
+  msgplans: { run: call("msgplans.run"), list: call("msgplans.list") },
   assistant: { command: call("assistant.command") },
   stt: { transcribe: call("stt.transcribe") },
   drafts: { list: call("drafts.list"), generate: call("drafts.generate"), setStatus: call("drafts.setStatus") },

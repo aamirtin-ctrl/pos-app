@@ -18,6 +18,7 @@ import { transcribe } from "./stt.ts";
 import { generateDrafts, listDrafts, setDraftStatus, synthesizeVoices, getVoices } from "./crm/drafts.ts";
 import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learning.ts";
 import { runSync, syncStatus } from "./workers.ts";
+import { listMsgPlans } from "./msgplans.ts";
 import { listMailAccounts, addMailAccount, removeMailAccount, type MailProvider } from "./connectors/gmail.ts";
 import { saveDoctrine } from "./engine/doctrine.ts";
 import { runLoopbackAuth, cancelLoopbackAuth, isGoogleConnected, hasGoogleCreds } from "./gcal/auth.ts";
@@ -179,6 +180,11 @@ export function registerIpc(deps: IpcDeps) {
   h("applecal.calendars", () => listAppleCalendars());
   h("applecal.events", (dateISO: string) => readAppleEvents(dateISO, { exclude: excludedCalendarNames(db) }));
   h("applecal.mirror", (dateISO: string) => mirrorToGoogle(db, secrets, dateISO));
+
+  // ── plans from messages ──
+  // Manual trigger; the same connector also runs on the 15-min cron.
+  h("msgplans.run", () => runSync(db, secrets, deps.llm(), "msgplans"));
+  h("msgplans.list", () => listMsgPlans(db));
 
   // ── messaging drafts + voices ──
   h("drafts.list", () => listDrafts(db));

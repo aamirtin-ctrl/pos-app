@@ -27,6 +27,7 @@ declare global {
         keys: Call; setKey: Call; doctrineGet: Call; doctrineSet: Call;
         spend: Call; setCeiling: Call; get: Call; set: Call;
       };
+      msgplans: { run: Call; list: Call };
       assistant: { command: Call };
       stt: { transcribe: Call };
       drafts: { list: Call; generate: Call; setStatus: Call };

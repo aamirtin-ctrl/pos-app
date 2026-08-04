@@ -155,7 +155,11 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
       if (existsSync(srcPath + ext)) copyFileSync(srcPath + ext, workPath + ext);
     }
 
-    const { DatabaseSync } = req("node:sqlite") as SqliteModule;
+    const BetterSqlite = req("better-sqlite3");
+    const DatabaseSync = (function (p: string, o?: { readOnly?: boolean }) {
+      // Electron's Node has no node:sqlite — better-sqlite3 (already bundled) stands in.
+      return new BetterSqlite(p, { readonly: !!o?.readOnly, fileMustExist: true });
+    }) as unknown as SqliteModule["DatabaseSync"];
     const chat = new DatabaseSync(workPath, { readOnly: true });
     try {
       chat.exec("PRAGMA query_only = ON;");
@@ -191,7 +195,7 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
         AND m.date > ?
         ORDER BY m.ROWID ASC
       `);
-      stmt.setReadBigInts(true);
+      stmt.safeIntegers(true);
       const rows = stmt.all(cursor, windowFloor) as Array<{
         rowid: bigint;
         guid: string | null;

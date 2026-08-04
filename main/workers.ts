@@ -18,6 +18,7 @@ import { syncLinkedin } from "./connectors/linkedin.ts";
 import { syncLinkedinEmail } from "./connectors/linkedin-email.ts";
 import { syncMailfile } from "./connectors/mailfile.ts";
 import { runCapture } from "./capture.ts";
+import { runMsgPlans } from "./msgplans.ts";
 import { getSetting } from "./db/db.ts";
 
 // node-cron ships no type declarations — minimal local surface via createRequire.
@@ -30,7 +31,14 @@ interface CronModule {
 const req: ReturnType<typeof createRequire> =
   typeof require === "function" ? require : createRequire(import.meta.url);
 
-export type SyncSource = "gmail" | "imessage" | "linkedin" | "linkedin-email" | "mailfile" | "capture";
+export type SyncSource =
+  | "gmail"
+  | "imessage"
+  | "linkedin"
+  | "linkedin-email"
+  | "mailfile"
+  | "capture"
+  | "msgplans";
 
 /** `extra` = LinkedIn export folder / mailfile path (unused by gmail/imessage). */
 export type ConnectorFn = (deps: ConnectorDeps, extra?: string) => Promise<SyncReport>;
@@ -53,6 +61,9 @@ const CONNECTORS: Record<SyncSource, ConnectorFn> = {
   // Morning capture: self-messages (note-to-self email + iMessage) routed through the
   // unified assistant. Needs the llm from runSync's deps threading.
   capture: (deps) => runCapture(deps),
+  // Plans from messages: scheduling talk in iMessage threads → one event per conversation
+  // on the dedicated "POS — From Messages" Google calendar. Never writes anywhere else.
+  msgplans: (deps) => runMsgPlans(deps),
 };
 
 /**
@@ -159,6 +170,11 @@ export function startWorkers(
 
   const announce = (r: SyncReport) => {
     if (r.error || r.ingested === 0) return; // quiet unless something new landed
+    if (r.source === "msgplans") {
+      // msgplans counts calendar changes, not interactions — say so.
+      notify?.(`Plans from messages: ${r.ingested} calendar change${r.ingested === 1 ? "" : "s"}`);
+      return;
+    }
     const people = r.created > 0 ? `, ${r.created} new ${r.created === 1 ? "person" : "people"}` : "";
     notify?.(`Synced ${r.source}: ${r.ingested} new interaction${r.ingested === 1 ? "" : "s"}${people}`);
   };
@@ -182,6 +198,9 @@ export function startWorkers(
         // FDA can still be revoked between the precheck and the copy — announce() stays
         // quiet on any error, so that failure mode is silent too.
         announce(await runSync(db, secrets, llm, "imessage"));
+        // Plans from messages. Same precheck (unreadable chat.db / missing FDA is skipped
+        // silently); the connector itself reports 'full_disk_access' if it's revoked mid-run.
+        announce(await runSync(db, secrets, llm, "msgplans"));
       }
     } catch (e) {
       console.warn(`workers: scheduled sync failed: ${(e as Error).message}`);
@@ -214,7 +233,7 @@ export function syncStatus(db: Db): SourceStatus[] {
   );
   const state = db.prepare("SELECT cursor, last_sync_at FROM sync_state WHERE source = ?");
 
-  return (["gmail", "imessage", "linkedin", "linkedin-email", "mailfile"] as SyncSource[]).map((source) => {
+  return (["gmail", "imessage", "linkedin", "linkedin-email", "mailfile", "msgplans"] as SyncSource[]).map((source) => {
     const run = lastRun.get(source) as SourceStatus["last_run"] | undefined;
     const st = state.get(source) as { cursor: string | null; last_sync_at: string | null } | undefined;
     return {

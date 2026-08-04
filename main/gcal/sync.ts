@@ -49,6 +49,131 @@ export async function ensurePosCalendar(db: Db, secrets: SecretStore): Promise<s
   return created.data.id!;
 }
 
+// ── "POS — From Messages": the ONLY calendar main/msgplans.ts may touch ──────
+//
+// Message-derived events are guesses made from private texts. They live on their own
+// calendar so the user can delete every one of them by deleting a single calendar, and so
+// a bug here can never touch the primary calendar, the planner's calendar, or the
+// Apple-mirror calendar. That is enforced structurally below, not by convention.
+
+/** Dedicated calendar for events inferred from iMessage threads. */
+export const MSGPLANS_CALENDAR_NAME = "POS — From Messages";
+/** settings key holding its id (distinct from pos_calendar_id / apple_mirror_calendar_id). */
+export const MSGPLANS_SETTING_KEY = "msgplans_calendar_id";
+
+/**
+ * Hard guard: a message-derived event must NEVER land on the primary calendar, the
+ * planner's "POS — Planned" calendar, or the Apple-mirror calendar. Any resolution path
+ * that would produce one of those throws instead of writing.
+ */
+export function assertMessagesCalendarId(db: Db, id: string | null | undefined): string {
+  const candidate = (id ?? "").trim();
+  if (!candidate) throw new Error("msgplans: no calendar id resolved");
+  const reserved = new Map<string, string>([["primary", "the primary calendar"]]);
+  const planned = getSetting(db, "pos_calendar_id");
+  if (planned) reserved.set(planned, `the planner calendar (${POS_CALENDAR_NAME})`);
+  const appleMirror = getSetting(db, "apple_mirror_calendar_id");
+  if (appleMirror) reserved.set(appleMirror, "the Apple-mirror calendar");
+  const hit = reserved.get(candidate);
+  if (hit) {
+    throw new Error(
+      `msgplans: refusing to write message-derived events to ${hit}; only "${MSGPLANS_CALENDAR_NAME}" is allowed`
+    );
+  }
+  return candidate;
+}
+
+/**
+ * Find-or-create "POS — From Messages"; id cached in setting `msgplans_calendar_id`.
+ * Every return path passes through assertMessagesCalendarId.
+ */
+export async function ensureMessagesCalendar(db: Db, secrets: SecretStore): Promise<string> {
+  const cal = calApi(secrets);
+  const cached = getSetting(db, MSGPLANS_SETTING_KEY);
+  if (cached) {
+    const id = assertMessagesCalendarId(db, cached);
+    try {
+      const got = await cal.calendars.get({ calendarId: id });
+      // A cached id whose calendar was renamed/replaced is not ours — fall through.
+      if (got.data.summary === MSGPLANS_CALENDAR_NAME) return id;
+    } catch {
+      /* deleted upstream — recreate below */
+    }
+  }
+  const list = await cal.calendarList.list({ maxResults: 250 });
+  const existing = list.data.items?.find((c) => c.summary === MSGPLANS_CALENDAR_NAME);
+  if (existing?.id) {
+    const id = assertMessagesCalendarId(db, existing.id);
+    setSetting(db, MSGPLANS_SETTING_KEY, id);
+    return id;
+  }
+  const created = await cal.calendars.insert({ requestBody: { summary: MSGPLANS_CALENDAR_NAME } });
+  const id = assertMessagesCalendarId(db, created.data.id);
+  setSetting(db, MSGPLANS_SETTING_KEY, id);
+  return id;
+}
+
+export interface MessagesEventInput {
+  /** Existing Google event id for this conversation, or null to insert a new one. */
+  eventId?: string | null;
+  title: string;
+  start: Date;
+  end: Date;
+  allDay: boolean;
+  description?: string;
+}
+
+const pad2 = (n: number) => String(n).padStart(2, "0");
+/** Local calendar date "YYYY-MM-DD" (all-day events are date-only in Google's API). */
+const localDate = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+
+/**
+ * Create or update THE event for one conversation on "POS — From Messages".
+ * Returns the Google event id. Resolves the calendar itself, so no caller can aim this
+ * at another calendar. A stale eventId (deleted in Google) falls back to an insert.
+ */
+export async function upsertMessagesEvent(
+  db: Db,
+  secrets: SecretStore,
+  ev: MessagesEventInput
+): Promise<string> {
+  const calendarId = await ensureMessagesCalendar(db, secrets);
+  const cal = calApi(secrets);
+  // Defence in depth against the "start date must be before the end date" failure the
+  // Python watcher hit: msgplans.ensureEnd already fixes it, and so does this.
+  const end = ev.end.getTime() > ev.start.getTime() ? ev.end : new Date(ev.start.getTime() + 60 * 60_000);
+  const body: calendar_v3.Schema$Event = {
+    summary: ev.title,
+    description: ev.description,
+    ...(ev.allDay
+      ? { start: { date: localDate(ev.start) }, end: { date: localDate(end) } }
+      : { start: { dateTime: ev.start.toISOString() }, end: { dateTime: end.toISOString() } }),
+  };
+  if (ev.eventId) {
+    try {
+      const updated = await cal.events.update({ calendarId, eventId: ev.eventId, requestBody: body });
+      return updated.data.id ?? ev.eventId;
+    } catch {
+      /* deleted in Google — insert a fresh one below */
+    }
+  }
+  const created = await cal.events.insert({ calendarId, requestBody: body });
+  if (!created.data.id) throw new Error("msgplans: Google returned no event id");
+  return created.data.id;
+}
+
+/** Delete one conversation's event. Resolves the calendar itself; never deletes elsewhere. */
+export async function deleteMessagesEvent(db: Db, secrets: SecretStore, eventId: string): Promise<void> {
+  if (!eventId) return;
+  const calendarId = await ensureMessagesCalendar(db, secrets);
+  const cal = calApi(secrets);
+  try {
+    await cal.events.delete({ calendarId, eventId });
+  } catch {
+    /* already gone — deleting a deleted event is success */
+  }
+}
+
 export interface ExternalAnchor {
   startMin: number;
   endMin: number;

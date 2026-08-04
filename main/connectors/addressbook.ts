@@ -73,7 +73,7 @@ export function buildNameIndex(): NameIndex {
 
   let DatabaseSync: SqliteModule["DatabaseSync"];
   try {
-    ({ DatabaseSync } = req("node:sqlite") as SqliteModule);
+    DatabaseSync = ((pth: string, o?: { readOnly?: boolean }) => new (req("better-sqlite3"))(pth, { readonly: !!o?.readOnly, fileMustExist: true })) as unknown as SqliteModule["DatabaseSync"];
   } catch {
     return { index, people: 0, sources: 0 };
   }

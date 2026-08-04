@@ -235,6 +235,12 @@ function Integrations() {
           onToggle={() => toggle("imessage")}
           refetchSync={refetchSync}
         />
+        <MsgPlansCard
+          row={syncRow("msgplans")}
+          open={openCard === "msgplans"}
+          onToggle={() => toggle("msgplans")}
+          refetchSync={refetchSync}
+        />
         <PickImportCard
           id="linkedin"
           name="LinkedIn"
@@ -904,6 +910,141 @@ function IMessageCard({
       </div>
       <LastRunLine row={row} />
       {msg && <p className="text-xs mt-1" style={{ color: "var(--danger)" }}>{msg}</p>}
+    </IntegrationCard>
+  );
+}
+
+/** One tracked plan, as main/msgplans.ts listMsgPlans returns it. */
+type MsgPlanRow = {
+  id: number;
+  title: string | null;
+  startsAt: string | null;
+  endsAt: string | null;
+  allDay: boolean;
+  confidence: number | null;
+  personName: string | null;
+};
+
+/** "Sat Jun 6, 8:00 PM" from the stored local wall-clock string. */
+function formatPlanWhen(startsAt: string | null, allDay: boolean): string {
+  if (!startsAt) return "—";
+  const d = new Date(startsAt);
+  if (Number.isNaN(d.getTime())) return startsAt.slice(0, 16).replace("T", " ");
+  const day = d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+  if (allDay) return `${day}, all day`;
+  return `${day}, ${d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
+}
+
+/**
+ * Plans from messages: scheduling talk in iMessage becomes one event per conversation on a
+ * dedicated Google calendar, updated or cancelled as the plan changes.
+ */
+function MsgPlansCard({
+  row,
+  open,
+  onToggle,
+  refetchSync,
+}: {
+  row: SyncRow;
+  open: boolean;
+  onToggle: () => void;
+  refetchSync: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [plans, setPlans] = useState<MsgPlanRow[]>([]);
+
+  const refetchPlans = useCallback(async () => {
+    const r = await window.pos.msgplans.list();
+    setPlans(r.ok && Array.isArray(r.data) ? (r.data as MsgPlanRow[]) : []);
+  }, []);
+
+  useEffect(() => {
+    if (open) refetchPlans();
+  }, [open, refetchPlans]);
+
+  const scan = async () => {
+    setBusy(true);
+    setMsg(null);
+    const r = await window.pos.msgplans.run();
+    const d = r.data as RawSyncRow | undefined;
+    const err = r.ok ? str(d?.error) : (r.error ?? "scan failed");
+    if (err) setMsg(`Plans from messages: ${err}`);
+    else setMsg(str(d?.summary));
+    setBusy(false);
+    refetchSync();
+    refetchPlans();
+  };
+
+  const status: IntegrationStatus = row.error?.includes("full_disk_access")
+    ? "needs-setup"
+    : row.lastRun && !row.error
+      ? "connected"
+      : "ready";
+
+  return (
+    <IntegrationCard
+      name="Plans from messages"
+      description="Texts about plans become events on a dedicated Google calendar"
+      status={status}
+      open={open}
+      onToggle={onToggle}
+      steps={[
+        "Needs iMessage access (see the iMessage card) and Google connected.",
+        "POS watches for scheduling talk and creates one event per conversation, updating or cancelling it as the plan changes.",
+        'Events land on "POS — From Messages" — delete that calendar any time to remove them all.',
+      ]}
+    >
+      <div className="flex items-center gap-2 flex-wrap">
+        <button
+          onClick={scan}
+          disabled={busy}
+          className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-40"
+          style={{ borderColor: "var(--line)" }}
+        >
+          {busy ? "Scanning…" : "Scan now"}
+        </button>
+      </div>
+      <LastRunLine row={row} />
+      {msg && <p className="text-xs mt-1" style={{ color: "var(--muted)" }}>{msg}</p>}
+
+      <div className="mt-3">
+        <div className="text-xs font-medium mb-1" style={{ color: "var(--ink)" }}>
+          Active plans
+        </div>
+        {plans.length === 0 ? (
+          <p className="text-xs" style={{ color: "var(--muted)" }}>
+            Nothing tracked yet.
+          </p>
+        ) : (
+          <ul className="space-y-1">
+            {plans.map((p) => (
+              <li
+                key={p.id}
+                className="flex items-baseline gap-2 text-xs border-t pt-1"
+                style={{ borderColor: "var(--line)" }}
+              >
+                <span className="flex-1 min-w-0 truncate" style={{ color: "var(--ink)" }}>
+                  {p.title ?? "Plans"}
+                </span>
+                <span className="shrink-0" style={{ color: "var(--muted)" }}>
+                  {formatPlanWhen(p.startsAt, p.allDay)}
+                </span>
+                {p.personName && (
+                  <span className="shrink-0 truncate max-w-[9rem]" style={{ color: "var(--muted)" }}>
+                    {p.personName}
+                  </span>
+                )}
+                {p.confidence != null && (
+                  <span className="shrink-0 tabular-nums" style={{ color: "var(--muted)" }}>
+                    {Math.round(p.confidence * 100)}%
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </IntegrationCard>
   );
 }

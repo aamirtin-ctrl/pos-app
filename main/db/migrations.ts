@@ -240,4 +240,28 @@ CREATE TABLE draft (
 CREATE INDEX idx_draft_status ON draft(status);
 `,
   },
+  {
+    version: 4,
+    name: "msgplans",
+    sql: `
+-- Plans from messages (main/msgplans.ts): ONE tracked event per conversation, mirroring
+-- the Python watcher's state.json {event, last_decided_rowid} per conversation.
+-- The message-scan cursor lives in the existing sync_state under source 'msgplans'.
+CREATE TABLE msg_plan (
+  id INTEGER PRIMARY KEY,
+  conversation_key TEXT NOT NULL UNIQUE,   -- chat guid, else the handle
+  person_id INTEGER REFERENCES person(id) ON DELETE SET NULL,
+  title TEXT,
+  starts_at TEXT,
+  ends_at TEXT,
+  all_day INTEGER NOT NULL DEFAULT 0,
+  gcal_event_id TEXT,                      -- the single event on "POS — From Messages"
+  confidence REAL,
+  status TEXT NOT NULL DEFAULT 'active',   -- active | cancelled | idle (decided, no event)
+  last_decided_rowid INTEGER,              -- never re-decide the same thread
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_msg_plan_status ON msg_plan(status);
+`,
+  },
 ];
