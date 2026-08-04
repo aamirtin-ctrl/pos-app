@@ -1,33 +1,20 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import PreviewColumn from "./PreviewColumn.tsx";
+import {
+  COLORS, FALLBACK_COLOR, addDaysISO, buildItems, fmtDur, fmtMin, todayISO,
+  type DayData, type ExternalEvent, type Item, type PlanView,
+} from "./shared.ts";
 
 // Structured-style day view on the cream/pink/brown watercolor theme:
 // a single centered vertical timeline with tinted icon circles, rounded event
 // cards, free-time gaps and a pulsing now indicator. External Google events
 // populate the timeline even before a plan exists; a generated plan overlays
 // them as anchors. All plan/gcal/outcomes behavior is unchanged.
-
-type Block = {
-  id: number; block_type: string; title: string; starts_at: string; ends_at: string;
-  is_anchor: number; is_locked: number;
-};
-type PlanView = { plan: any; blocks: Block[]; unplaced: { title: string; reason: string }[] };
-type ExternalEvent = { startMin: number; endMin: number; title: string; blockType: string };
-
-// Watercolor washes: translucent pinks + ink grays, like the artwork.
-const COLORS: Record<string, { bg: string; fg: string }> = {
-  deep_work: { bg: "rgba(231,127,168,0.85)", fg: "white" },
-  focused_work: { bg: "rgba(242,169,196,0.8)", fg: "#5b4636" },
-  admin: { bg: "rgba(85,82,90,0.28)", fg: "#55525a" },
-  comms: { bg: "rgba(214,138,164,0.45)", fg: "#5b4636" },
-  meeting: { bg: "rgba(85,82,90,0.55)", fg: "white" },
-  gym: { bg: "rgba(163,177,138,0.6)", fg: "#3f4a33" },
-  break: { bg: "rgba(253,243,246,0.9)", fg: "#9c8672" },
-  meal: { bg: "rgba(230,204,178,0.6)", fg: "#5b4636" },
-  transition: { bg: "rgba(245,239,227,0.8)", fg: "#9c8672" },
-  shutdown: { bg: "rgba(107,85,68,0.6)", fg: "white" },
-  personal: { bg: "rgba(200,182,166,0.55)", fg: "#5b4636" },
-};
-const FALLBACK_COLOR = { bg: "rgba(200,182,166,0.55)", fg: "#5b4636" };
+//
+// Around the center column, a multi-day carousel: adjacent days render as
+// narrow no-text preview columns that taper in width and opacity toward the
+// edges (a soft perspective effect). Previews draw from the same per-date
+// cache, prefetched in the background after the center day loads.
 
 /* ── small inline SVG icons per block type (no emoji) ── */
 const ICON_PATHS: Record<string, React.ReactNode> = {
@@ -78,24 +65,11 @@ const LockGlyph = () => (
   </svg>
 );
 
-const todayISO = () => new Date().toISOString().slice(0, 10);
-const minOf = (iso: string) => parseInt(iso.slice(11, 13), 10) * 60 + parseInt(iso.slice(14, 16), 10);
-const fmtMin = (m: number) => {
-  const h = Math.floor(m / 60) % 24, mm = m % 60;
-  return `${((h + 11) % 12) + 1}:${String(mm).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`;
-};
-const fmtDur = (m: number) =>
-  m < 60 ? `${m} min` : m % 60 === 0 ? `${m / 60} hr` : `${Math.floor(m / 60)} hr ${m % 60} min`;
-
-type Item = {
-  key: string; startMin: number; endMin: number; title: string; type: string;
-  external: boolean; anchor: boolean; locked: boolean;
-};
-
-/** Everything one day's view needs — cached per date so flips render instantly. */
-type DayData = { plan: PlanView | null; external: ExternalEvent[]; outcomes: any[] };
-
 const FLIP_FETCH_DEBOUNCE_MS = 250; // settle time before hitting IPC after day flips
+
+// Carousel geometry: |offset| → column width / opacity, tapering to the edges.
+const PREVIEW_WIDTH: Record<number, number> = { 1: 90, 2: 56, 3: 36 };
+const PREVIEW_OPACITY: Record<number, number> = { 1: 0.85, 2: 0.6, 3: 0.4 };
 
 export default function DayPlanner() {
   const [date, setDate] = useState(todayISO());
@@ -129,12 +103,37 @@ export default function DayPlanner() {
   const dayCache = React.useRef(new Map<string, DayData>());
   const dateRef = React.useRef(date);
   dateRef.current = date;
+  // bumped whenever a background prefetch lands so cached previews repaint silently
+  const [cacheTick, setCacheTick] = useState(0);
 
   const applyDay = (d: DayData) => {
     setPlan(d.plan);
     setExternal(d.external);
     setOutcomes(d.outcomes);
   };
+
+  // Warm the carousel: fetch plan + gcal for ±3 days around the center, fully in
+  // the background (fire-and-forget, after the center day has loaded). Outcomes
+  // are center-only; keep whatever a full refresh cached for that date.
+  const prefetchNeighbors = useCallback((centerIso: string) => {
+    for (const off of [-1, 1, -2, 2, -3, 3]) {
+      const iso = addDaysISO(centerIso, off);
+      void (async () => {
+        try {
+          const [r, g] = await Promise.all([window.pos.plan.get(iso), window.pos.gcal.events(iso)]);
+          const prev = dayCache.current.get(iso);
+          dayCache.current.set(iso, {
+            plan: r.ok ? (r.data as PlanView | null) : null,
+            external: g.ok && Array.isArray(g.data) ? (g.data as ExternalEvent[]) : [],
+            outcomes: prev?.outcomes ?? [],
+          });
+          setCacheTick((t) => t + 1);
+        } catch {
+          /* previews are best-effort; the center day is unaffected */
+        }
+      })();
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     const forDate = date;
@@ -151,7 +150,8 @@ export default function DayPlanner() {
     };
     dayCache.current.set(forDate, data);
     if (dateRef.current === forDate) applyDay(data); // ignore stale responses after more flips
-  }, [date]);
+    prefetchNeighbors(forDate); // never awaited — previews fill in silently
+  }, [date, prefetchNeighbors]);
 
   useEffect(() => {
     // Optimistic flip: paint the cached day immediately (or clear to a blank day),
@@ -171,26 +171,31 @@ export default function DayPlanner() {
   const isToday = date === todayISO();
   const isPastDay = date < todayISO();
 
-  // hide external events that a plan already shows as anchors
-  const externalsToShow = useMemo(() => {
-    if (!plan) return external;
-    const spans = new Set(plan.blocks.map((b) => `${minOf(b.starts_at)}-${minOf(b.ends_at)}`));
-    return external.filter((e) => !spans.has(`${e.startMin}-${e.endMin}`));
-  }, [plan, external]);
-
   // one chronological stream: plan blocks + remaining external events
-  const items = useMemo<Item[]>(() => {
-    const fromPlan: Item[] = (plan?.blocks ?? []).map((b) => ({
-      key: `b${b.id}`, startMin: minOf(b.starts_at), endMin: minOf(b.ends_at),
-      title: b.title || b.block_type.replace(/_/g, " "), type: b.block_type,
-      external: false, anchor: !!b.is_anchor, locked: !!b.is_locked,
-    }));
-    const fromGcal: Item[] = externalsToShow.map((e, i) => ({
-      key: `x${i}`, startMin: e.startMin, endMin: e.endMin, title: e.title,
-      type: e.blockType || "event", external: true, anchor: false, locked: false,
-    }));
-    return [...fromPlan, ...fromGcal].sort((a, b) => a.startMin - b.startMin || a.endMin - b.endMin);
-  }, [plan, externalsToShow]);
+  // (externals that a plan already shows as anchors are hidden inside buildItems)
+  const items = useMemo<Item[]>(() => buildItems(plan, external), [plan, external]);
+
+  // responsive carousel depth: ±3 needs ≥1200px, ±2 needs ≥1000px, else ±1
+  const [winW, setWinW] = useState(() => window.innerWidth);
+  useEffect(() => {
+    const onResize = () => setWinW(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  const maxOffset = winW >= 1200 ? 3 : winW >= 1000 ? 2 : 1;
+
+  // flanking preview columns, rendered straight from the per-date cache
+  // (cacheTick invalidates this memo when a background prefetch lands)
+  const previews = useMemo(() => {
+    void cacheTick;
+    const offsets: number[] = [];
+    for (let o = -maxOffset; o <= maxOffset; o++) if (o !== 0) offsets.push(o);
+    return offsets.map((off) => {
+      const iso = addDaysISO(date, off);
+      const cached = dayCache.current.get(iso);
+      return { iso, off, items: cached ? buildItems(cached.plan, cached.external) : [] };
+    });
+  }, [date, maxOffset, cacheTick]);
 
   // week strip (Monday-first, week containing the selected date)
   const week = useMemo(() => {
@@ -252,8 +257,22 @@ export default function DayPlanner() {
   });
   if (!nowPlaced && items.length > 0) pushNow();
 
+  const previewCols = (side: "left" | "right") =>
+    previews
+      .filter((p) => (side === "left" ? p.off < 0 : p.off > 0))
+      .map((p) => (
+        <PreviewColumn
+          key={p.iso}
+          iso={p.iso}
+          items={p.items}
+          width={PREVIEW_WIDTH[Math.abs(p.off)]}
+          opacity={PREVIEW_OPACITY[Math.abs(p.off)]}
+          onSelect={setDateAnimated}
+        />
+      ));
+
   return (
-    <div className="h-full overflow-auto relative" onWheel={onDayWheel}>
+    <div className="h-full flex flex-col relative" onWheel={onDayWheel}>
       <style>{`
         @keyframes plannerPulse {
           0% { box-shadow: 0 0 0 0 rgba(217,93,93,0.45); }
@@ -263,8 +282,8 @@ export default function DayPlanner() {
         .now-dot { animation: plannerPulse 2s ease-out infinite; }
       `}</style>
 
-      {/* compact date header + weekday strip */}
-      <div className="sticky top-0 z-10 px-6 pt-8 pb-3 no-drag"
+      {/* compact date header + weekday strip (fixed above the carousel row) */}
+      <div className="shrink-0 z-10 px-6 pt-8 pb-3 no-drag"
         style={{ background: "color-mix(in srgb, var(--bg) 88%, transparent)", backdropFilter: "blur(6px)" }}>
         <div className="max-w-xl mx-auto">
           <div className="flex items-baseline justify-between gap-3">
@@ -312,9 +331,13 @@ export default function DayPlanner() {
         </div>
       </div>
 
-      {/* timeline — keyed by date so each flip re-enters with a subtle slide+fade */}
-      <div className="px-6 pb-32">
-        <div key={date} className={`max-w-xl mx-auto ${slideDir.current >= 0 ? "day-enter-fwd" : "day-enter-back"}`}>
+      {/* carousel row: tapering no-text preview columns flank the scrolling center day */}
+      <div className="flex-1 min-h-0 px-4 pb-3 flex items-stretch justify-center gap-2.5">
+        {previewCols("left")}
+
+        {/* center day — keyed by date so each flip re-enters with a subtle slide+fade */}
+        <div className="w-full max-w-xl min-w-0 overflow-y-auto px-2 pb-32">
+        <div key={date} className={slideDir.current >= 0 ? "day-enter-fwd" : "day-enter-back"}>
           {items.length > 0 ? (
             <div className="mt-1">{rows}</div>
           ) : (
@@ -332,6 +355,9 @@ export default function DayPlanner() {
           <PlanControls plan={plan} onChange={refresh} />
           {outcomes.length > 0 && <OutcomeCapture blocks={outcomes} onDone={refresh} />}
         </div>
+        </div>
+
+        {previewCols("right")}
       </div>
     </div>
   );

@@ -232,6 +232,33 @@ export default function App() {
   const route = useRoute();
   const view = route.split("/")[1] ?? "calendar";
   const [activity, setActivity] = useState(() => Number(localStorage.getItem("pos_activity") ?? 0));
+  // Global undo/redo: ⌘Z / ⌘⇧Z → main-process journal, feedback via a transient toast.
+  const [toast, setToast] = useState<string | null>(null);
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const show = (text: string) => {
+      setToast(text);
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => setToast(null), 2200);
+    };
+    const onKey = async (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "z" || e.altKey) return;
+      // Leave text-field undo alone — the journal is for app actions only.
+      const el = e.target as HTMLElement;
+      if (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || el.isContentEditable) return;
+      e.preventDefault();
+      const redo = e.shiftKey;
+      const r = redo ? await window.pos.undo.redo() : await window.pos.undo.do();
+      const d = r.ok ? (r.data as { ok: boolean; label?: string; reason?: string }) : null;
+      if (d?.ok && d.label) show(`${redo ? "Redid" : "Undid"}: ${d.label}`);
+      else show(`Nothing to ${redo ? "redo" : "undo"}`);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
   useEffect(() => {
     const bump = () => {
       setActivity((a) => {
@@ -262,6 +289,16 @@ export default function App() {
         {view === "messaging" && <Inbox />}
         {view === "settings" && <Settings />}
       </main>
+
+      {/* transient undo/redo toast — bottom center, above the dock */}
+      {toast && (
+        <div
+          className="no-drag fixed bottom-24 left-1/2 -translate-x-1/2 z-50 px-3.5 py-1.5 rounded-full border bg-white shadow-md text-xs view-enter"
+          style={{ borderColor: "var(--line)", color: "var(--ink)" }}
+        >
+          {toast}
+        </div>
+      )}
 
       {/* settings gear — bottom left */}
       <a

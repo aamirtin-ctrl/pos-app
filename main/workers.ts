@@ -11,6 +11,8 @@ import type { SecretStore } from "./secrets.ts";
 import type { LlmClient } from "./llm/provider.ts";
 import { extractCommitmentsLlm } from "./crm/commitments.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
+import { commitmentToTask } from "./gcal/sync.ts";
+import { distillWeek, distillWeekKey } from "./worklog.ts";
 import type { ConnectorDeps, SyncReport } from "./connectors/common.ts";
 import { syncAllMail, gmailConfigured } from "./connectors/gmail.ts";
 import { syncImessage, imessageAvailable } from "./connectors/imessage.ts";
@@ -146,7 +148,13 @@ export async function runSync(
             )
             .all(EXTRACT_CAP) as { id: number }[]
         ).map((r) => r.id);
-        if (ids.length) await extractCommitmentsLlm(db, llm, ids);
+        if (ids.length) {
+          const beforeMax = (
+            db.prepare("SELECT COALESCE(MAX(id), 0) AS m FROM commitment").get() as { m: number }
+          ).m;
+          await extractCommitmentsLlm(db, llm, ids);
+          await autoTentativeTasks(db, secrets, beforeMax);
+        }
       }
       advanceLastContact(db);
       refreshNextTouch(db);
@@ -156,6 +164,32 @@ export async function runSync(
   }
 
   return report;
+}
+
+/**
+ * Full autonomy: every NEWLY extracted commitment (id > `beforeMaxId`, any
+ * confidence) immediately becomes a local task + a Google task titled
+ * "Tentative: …" (local title stays clean). Idempotent: a commitment with ANY
+ * existing task — open or done — is skipped. This is an automatic action, so it
+ * records NO undo entries; dropping the commitment later cleans the task up
+ * (dropCommitmentCascade). Failures are logged and never propagate.
+ */
+export async function autoTentativeTasks(db: Db, secrets: SecretStore, beforeMaxId: number): Promise<number> {
+  const fresh = db
+    .prepare("SELECT id, due_at FROM commitment WHERE id > ? AND status = 'open'")
+    .all(beforeMaxId) as { id: number; due_at: string | null }[];
+  let created = 0;
+  for (const c of fresh) {
+    if (db.prepare("SELECT 1 FROM task WHERE commitment_id = ?").get(c.id)) continue; // idempotent
+    const dateISO = c.due_at ? c.due_at.slice(0, 10) : new Date().toISOString().slice(0, 10);
+    try {
+      const res = await commitmentToTask(db, secrets, c.id, dateISO, { tentative: true });
+      if (!res.duplicate) created++;
+    } catch (e) {
+      console.warn(`workers: auto task for commitment ${c.id} failed: ${(e as Error).message}`);
+    }
+  }
+  return created;
 }
 
 export interface WorkersHandle {
@@ -220,6 +254,13 @@ export function startWorkers(
       // writes error rows to sync_run.
       if (notionConfigured(db, secrets)) {
         announce(await runSync(db, secrets, llm, "notion"));
+      }
+      // Weekly worklog distillation: from Friday on, once per ISO week (the setting
+      // key makes re-checks free; skipped silently without an LLM).
+      const dow = new Date().getDay();
+      if ((dow === 5 || dow === 6 || dow === 0) && !getSetting(db, distillWeekKey())) {
+        const d = await distillWeek(db, llm);
+        if (d.inserted > 0) notify?.(`Worklog: distilled ${d.inserted} entr${d.inserted === 1 ? "y" : "ies"} for the week`);
       }
     } catch (e) {
       console.warn(`workers: scheduled sync failed: ${(e as Error).message}`);

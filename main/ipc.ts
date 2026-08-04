@@ -10,7 +10,19 @@ import { monthSpend, getCeiling, setCeiling } from "./llm/meter.ts";
 import { listPeople, getPerson, patchPerson, mergePeople } from "./crm/people.ts";
 import { rank } from "./crm/ranking.ts";
 import { reconnectDue, refreshNextTouch } from "./crm/reconnect.ts";
-import { listCommitments, confirmCommitment, dropCommitment } from "./crm/commitments.ts";
+import { listCommitments, confirmCommitment } from "./crm/commitments.ts";
+import {
+  journal,
+  commitmentPrior,
+  makeToTaskEntry,
+  makeToEventEntry,
+  makeDropEntry,
+  makeConfirmEntry,
+  makeUpdateTextEntry,
+  makeTaskStatusEntry,
+  makeDraftStatusEntry,
+} from "./undo.ts";
+import { addManual, entriesSince, catchUpParagraph } from "./worklog.ts";
 import { embedProfiles, makeQueryEmbedder } from "./llm/embeddings.ts";
 import * as planner from "./planner.ts";
 import { handleCommand } from "./assistant.ts";
@@ -23,7 +35,7 @@ import { listMsgPlans } from "./msgplans.ts";
 import { listMailAccounts, addMailAccount, removeMailAccount, type MailProvider } from "./connectors/gmail.ts";
 import { saveDoctrine } from "./engine/doctrine.ts";
 import { runLoopbackAuth, cancelLoopbackAuth, isGoogleConnected, hasGoogleCreds } from "./gcal/auth.ts";
-import { pushPlan, pushTasks, reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent } from "./gcal/sync.ts";
+import { pushPlan, pushTasks, reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent, dropCommitmentCascade } from "./gcal/sync.ts";
 import { notionAvailable, searchTargets, syncNotion, PARENT_PAGE_KEY } from "./notion.ts";
 import {
   appleCalendarAvailable,
@@ -90,13 +102,28 @@ export function registerIpc(deps: IpcDeps) {
   );
 
   // ── commitments ──
+  // User-initiated mutations record their inverse in the undo journal (⌘Z).
+  // Automatic pipelines (workers.ts) call the same helpers directly and record nothing.
   h("commitments.list", (status?: string) => listCommitments(db, status));
-  h("commitments.confirm", (id: number) => confirmCommitment(db, id));
-  h("commitments.drop", (id: number) => dropCommitment(db, id));
+  h("commitments.confirm", (id: number) => {
+    const prior = commitmentPrior(db, id);
+    confirmCommitment(db, id);
+    if (prior) journal.record(makeConfirmEntry(db, id, prior));
+  });
+  // Drop (button AND swipe-delete) cascades: linked open local tasks are deleted and
+  // their Google counterparts completed best-effort (time-boxed inside the helper).
+  h("commitments.drop", (id: number) => {
+    const prior = commitmentPrior(db, id);
+    const res = dropCommitmentCascade(db, secrets, id);
+    if (prior) journal.record(makeDropEntry(db, secrets, id, prior, res.deletedTasks));
+    return res;
+  });
   h("commitments.updateText", (id: number, description: string) => {
     if (!description?.trim()) throw new Error("empty description");
+    const prior = commitmentPrior(db, id);
     // editing the text is confirmation — the user touched it, so it's real
     db.prepare("UPDATE commitment SET description = ?, confirmed_by_user = 1 WHERE id = ?").run(description.trim(), id);
+    if (prior) journal.record(makeUpdateTextEntry(db, id, prior, description.trim()));
     return { saved: true };
   });
   // right-click → schedule: commitment becomes a task on today's plan date
@@ -116,21 +143,38 @@ export function registerIpc(deps: IpcDeps) {
   // "Add task" button: confirm if needed, create the local task, then push to Google Tasks.
   // Body lives in gcal/sync.ts (commitmentToTask) so it is testable without electron;
   // local DB work is unconditional, the Google push is time-boxed and best-effort.
-  h("commitments.toTask", (id: number) => commitmentToTask(db, secrets, id));
-  // "Add event" button: pin a 60-min personal block on the due date at 10:00.
-  // Without a due date the renderer supplies dateISO ("YYYY-MM-DD") + hhmm ("HH:MM").
-  h("commitments.toEvent", (id: number, dateISO?: string, hhmm?: string) => commitmentToEvent(db, id, dateISO, hhmm));
+  // The renderer's inline picker always supplies dateISO (plan date + Google due).
+  h("commitments.toTask", async (id: number, dateISO?: string) => {
+    const prior = commitmentPrior(db, id);
+    const res = await commitmentToTask(db, secrets, id, dateISO);
+    if (prior) journal.record(makeToTaskEntry(db, secrets, id, prior, !res.duplicate, dateISO));
+    return res;
+  });
+  // "Add event" button: pin a 60-min personal block. The renderer's inline picker
+  // always supplies dateISO ("YYYY-MM-DD") + hhmm ("HH:MM"); needsDate is the fallback.
+  h("commitments.toEvent", (id: number, dateISO?: string, hhmm?: string) => {
+    const prior = commitmentPrior(db, id);
+    const res = commitmentToEvent(db, id, dateISO, hhmm);
+    if (!res.needsDate && prior) {
+      journal.record(makeToEventEntry(db, id, prior, res.block_id ?? null, dateISO, hhmm));
+    }
+    return res;
+  });
 
   // ── planner ──
   h("tasks.braindump", (text: string, dateISO: string) =>
     planner.braindump(db, doctrineDir, deps.llm(), text, dateISO)
   );
   h("tasks.list", (dateISO: string) => planner.listTasks(db, dateISO));
-  h("tasks.setStatus", (id: number, status: string) =>
-    db.prepare(
+  h("tasks.setStatus", (id: number, status: string) => {
+    const prior = db.prepare("SELECT status, completed_at FROM task WHERE id = ?").get(id) as
+      | { status: string; completed_at: string | null } | undefined;
+    const res = db.prepare(
       "UPDATE task SET status = ?, completed_at = CASE WHEN ? = 'done' THEN datetime('now') ELSE completed_at END WHERE id = ?"
-    ).run(status, status, id)
-  );
+    ).run(status, status, id);
+    if (prior) journal.record(makeTaskStatusEntry(db, id, prior, status));
+    return res;
+  });
   h("plan.generate", (dateISO: string) => planner.generatePlan(db, doctrineDir, secrets, deps.llm(), dateISO));
   h("plan.get", (dateISO: string) => planner.getPlan(db, dateISO));
   h("plan.accept", (planId: number) => planner.acceptPlan(db, planId));
@@ -221,9 +265,25 @@ export function registerIpc(deps: IpcDeps) {
   // ── messaging drafts + voices ──
   h("drafts.list", () => listDrafts(db));
   h("drafts.generate", () => generateDrafts(db, deps.llm()));
-  h("drafts.setStatus", (id: number, status: "dismissed" | "sent") => setDraftStatus(db, id, status));
+  h("drafts.setStatus", (id: number, status: "dismissed" | "sent") => {
+    const prior = db.prepare("SELECT status FROM draft WHERE id = ?").get(id) as { status: string } | undefined;
+    const res = setDraftStatus(db, id, status);
+    if (prior) journal.record(makeDraftStatusEntry(db, id, prior.status, status));
+    return res;
+  });
   h("voice.synthesize", () => synthesizeVoices(db, deps.llm()));
   h("voice.get", () => getVoices(db));
+
+  // ── undo / redo (⌘Z / ⌘⇧Z) ──
+  h("undo.do", () => journal.undoLast());
+  h("undo.redo", () => journal.redoLast());
+
+  // ── worklog memory ──
+  h("worklog.list", (sinceISO?: string) =>
+    entriesSince(db, sinceISO ?? new Date(Date.now() - 30 * 24 * 60 * 60_000).toISOString())
+  );
+  h("worklog.add", (title: string) => addManual(db, title));
+  h("worklog.catchUp", (personId: number) => catchUpParagraph(db, deps.llm(), personId));
 
   // ── unified assistant ──
   h("assistant.command", (text: string) =>

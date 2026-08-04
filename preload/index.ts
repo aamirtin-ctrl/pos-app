@@ -80,6 +80,8 @@ contextBridge.exposeInMainWorld("pos", {
     set: call("settings.set"),
   },
   msgplans: { run: call("msgplans.run"), list: call("msgplans.list") },
+  undo: { do: call("undo.do"), redo: call("undo.redo") },
+  worklog: { list: call("worklog.list"), add: call("worklog.add"), catchUp: call("worklog.catchUp") },
   assistant: { command: call("assistant.command") },
   stt: { transcribe: call("stt.transcribe") },
   inbox: {

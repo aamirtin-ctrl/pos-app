@@ -264,4 +264,22 @@ CREATE TABLE msg_plan (
 CREATE INDEX idx_msg_plan_status ON msg_plan(status);
 `,
   },
+  {
+    version: 5,
+    name: "worklog",
+    sql: `
+-- Worklog memory (main/worklog.ts): durable "what I actually did" entries. 'auto' rows
+-- come from the weekly distillation of completed tasks / accepted plans; 'manual' rows
+-- from the sparkle box ("log: …"). Feeds catch-up updates and the assistant's context.
+CREATE TABLE worklog (
+  id INTEGER PRIMARY KEY,
+  happened_at TEXT NOT NULL,
+  title TEXT NOT NULL,
+  detail TEXT,
+  source TEXT NOT NULL DEFAULT 'auto',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_worklog_happened ON worklog(happened_at);
+`,
+  },
 ];

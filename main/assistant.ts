@@ -11,6 +11,7 @@ import { makeQueryEmbedder } from "./llm/embeddings.ts";
 import { patchPerson } from "./crm/people.ts";
 import { reconnectDue, refreshNextTouch } from "./crm/reconnect.ts";
 import * as planner from "./planner.ts";
+import { addManual } from "./worklog.ts";
 
 export interface AssistantResult {
   kind: "plan" | "people" | "note" | "answer" | "search" | "event" | "error";
@@ -38,11 +39,12 @@ export async function handleCommand(
       "assistant_route",
       "fast",
       `Classify this personal-assistant command. STRICT JSON only:
-{"intent":"plan_day"|"add_event"|"find_people"|"add_note"|"search"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>"}
+{"intent":"plan_day"|"add_event"|"find_people"|"add_note"|"log_work"|"search"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>"}
 "plan_day" = a braindump of tasks to schedule, or asking to plan the day.
 "add_event" = ONE specific commitment at a stated time ("lunch with Raj Thursday 1pm", "dentist tomorrow at 9"). A time must be stated or clearly implied.
 "find_people" = who should I talk to / reach out to / intro ideas.
 "add_note" = remember/save a fact about a person in the network.
+"log_work" = record something the USER did into their worklog ("log: shipped the deck", "log closed the Series A intro").
 "search" = find/look up specific info they saved (a person, message, commitment, task, note).
 "question" = anything else about their calendar, commitments, or contacts.
 Command: """${t.slice(0, 600)}"""`,
@@ -65,8 +67,17 @@ Command: """${t.slice(0, 600)}"""`,
     // a single item with an explicit clock time is an event, not a braindump
     if (/\b(\d{1,2})(:\d{2})?\s*(am|pm)\b/i.test(t) && !/[,;\n]/.test(t)) intent = "add_event";
   }
+  // Deterministic worklog prefix wins over everything (incl. the add_note "log" regex).
+  if (/^log[:\s]/i.test(t)) intent = "log_work";
 
   try {
+    if (intent === "log_work") {
+      const line = t.replace(/^log[:\s]+/i, "").trim();
+      if (!line) return { kind: "error", reply: "What should I log? Try: 'log: shipped the deck'." };
+      addManual(db, line);
+      return { kind: "note", reply: "Logged." };
+    }
+
     if (intent === "plan_day") {
       await planner.braindump(db, doctrineDir, llm, t, today());
       const view = await planner.generatePlan(db, doctrineDir, secrets, llm, today());
@@ -164,7 +175,12 @@ Command: """${t.slice(0, 600)}"""`,
       .all() as any[])
       .map((r) => `${r.who}: ${r.subject ?? r.body_summary ?? ""}`.slice(0, 90))
       .join("; ");
-    const context = `TODAY'S PLAN: ${blocks || "(none generated)"}\nOPEN COMMITMENTS: ${commitments || "(none)"}\nRECONNECT DUE: ${due || "(none)"}\nRECENT MESSAGES: ${recent || "(none)"}`;
+    const worklog = (db
+      .prepare("SELECT happened_at, title, detail FROM worklog ORDER BY datetime(happened_at) DESC, id DESC LIMIT 5")
+      .all() as { happened_at: string; title: string; detail: string | null }[])
+      .map((w) => `${w.happened_at.slice(0, 10)}: ${w.title}${w.detail ? ` (${w.detail})` : ""}`)
+      .join("; ");
+    const context = `TODAY'S PLAN: ${blocks || "(none generated)"}\nOPEN COMMITMENTS: ${commitments || "(none)"}\nRECONNECT DUE: ${due || "(none)"}\nRECENT MESSAGES: ${recent || "(none)"}\nRECENT WORKLOG: ${worklog || "(none)"}`;
     if (llm) {
       const res = await llm.call(
         "assistant_answer",

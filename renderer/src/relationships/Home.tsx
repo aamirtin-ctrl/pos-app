@@ -241,7 +241,10 @@ function CommitmentList({
   const [addedIds, setAddedIds] = useState<Set<number>>(new Set());
   const [pending, setPending] = useState<{ id: number; action: "task" | "event" } | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
-  const [eventPicker, setEventPicker] = useState<{ id: number; date: string; time: string } | null>(null);
+  // Always-prompt picker: "Add task" (date) and "Add event" (date+time) BOTH open this
+  // inline picker first, prefilled from the commitment's due date; nothing is created
+  // until Create is clicked with explicit values.
+  const [picker, setPicker] = useState<{ id: number; mode: "task" | "event"; date: string; time: string } | null>(null);
   useEffect(() => {
     const close = () => setMenu(null);
     window.addEventListener("click", close);
@@ -282,12 +285,33 @@ function CommitmentList({
     await act(async () => {});
   };
 
-  const addTask = async (id: number) => {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const isoDate = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+
+  /** Prefill: task date = due date else today; event date = due date else tomorrow,
+   *  time = the due date's clock time when it has one (non-midnight), else 10:00. */
+  const openPicker = (c: CommitmentRow, mode: "task" | "event") => {
+    setNotice(null);
+    const due = c.due_at ? c.due_at.slice(0, 10) : null;
+    if (mode === "task") {
+      setPicker({ id: c.id, mode, date: due ?? isoDate(new Date()), time: "" });
+    } else {
+      const dueTime = c.due_at ? c.due_at.slice(11, 16) : "";
+      setPicker({
+        id: c.id,
+        mode,
+        date: due ?? isoDate(new Date(Date.now() + 24 * 60 * 60_000)),
+        time: dueTime && dueTime !== "00:00" ? dueTime : "10:00",
+      });
+    }
+  };
+
+  const addTask = async (id: number, dateISO: string) => {
     if (pending) return;
     setPending({ id, action: "task" });
     setNotice(null);
     try {
-      const r = await window.pos.commitments.toTask(id);
+      const r = await window.pos.commitments.toTask(id, dateISO);
       if (!r.ok) {
         setNotice({ text: `Could not add task: ${r.error ?? "unknown error"}`, kind: "error" });
         return;
@@ -302,13 +326,14 @@ function CommitmentList({
       } else {
         setNotice({ text: d.duplicate ? "Task already existed — synced to Google." : "Task added and synced to Google.", kind: "info" });
       }
+      setPicker(null);
       await markAdded(id);
     } finally {
       setPending(null);
     }
   };
 
-  const addEvent = async (id: number, dateISO?: string, hhmm?: string) => {
+  const addEvent = async (id: number, dateISO: string, hhmm: string) => {
     if (pending) return;
     setPending({ id, action: "event" });
     setNotice(null);
@@ -320,13 +345,12 @@ function CommitmentList({
       }
       const d = r.data as { needsDate?: boolean; starts_at?: string };
       if (d.needsDate) {
-        const t = new Date(Date.now() + 24 * 60 * 60_000);
-        const pad = (n: number) => String(n).padStart(2, "0");
-        setEventPicker({ id, date: `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}`, time: "10:00" });
+        // Shouldn't happen (the picker always sends a date) — reopen it as a fallback.
+        setPicker({ id, mode: "event", date: isoDate(new Date(Date.now() + 24 * 60 * 60_000)), time: "10:00" });
         setNotice({ text: "No due date on this commitment — pick a date below.", kind: "info" });
         return;
       }
-      setEventPicker(null);
+      setPicker(null);
       setNotice({ text: `Event pinned for ${d.starts_at ? d.starts_at.replace("T", " at ").slice(0, 19) : "the chosen time"}.`, kind: "info" });
       await markAdded(id);
     } finally {
@@ -424,7 +448,7 @@ function CommitmentList({
                 ) : (
                   <>
                     <button
-                      onClick={() => addTask(c.id)}
+                      onClick={() => openPicker(c, "task")}
                       disabled={rowPending !== null}
                       className="px-1.5 py-0.5 rounded border hover:bg-white disabled:opacity-60 transition-[background-color,transform] duration-[120ms] active:scale-95"
                       style={{ borderColor: "var(--line)", color: "var(--accent)" }}
@@ -432,7 +456,7 @@ function CommitmentList({
                       {rowPending === "task" ? "Adding…" : "Add task"}
                     </button>
                     <button
-                      onClick={() => addEvent(c.id)}
+                      onClick={() => openPicker(c, "event")}
                       disabled={rowPending !== null}
                       className="px-1.5 py-0.5 rounded border hover:bg-white disabled:opacity-60 transition-[background-color,transform] duration-[120ms] active:scale-95"
                       style={{ borderColor: "var(--line)", color: "var(--muted)" }}
@@ -461,33 +485,39 @@ function CommitmentList({
                 )}
               </span>
             </div>
-            {eventPicker?.id === c.id && (
+            {picker?.id === c.id && (
               <div className="flex items-center gap-1.5 mt-1.5 text-[11px]" style={{ color: "var(--muted)" }}>
-                <span>No due date — pick one:</span>
+                <span>{picker.mode === "task" ? "Task date:" : "Event date + time:"}</span>
                 <input
                   type="date"
-                  value={eventPicker.date}
-                  onChange={(e) => setEventPicker({ ...eventPicker, date: e.target.value })}
+                  value={picker.date}
+                  onChange={(e) => setPicker({ ...picker, date: e.target.value })}
                   className="px-1 py-0.5 rounded border bg-white"
                   style={{ borderColor: "var(--line)", color: "var(--ink)" }}
                 />
-                <input
-                  type="time"
-                  value={eventPicker.time}
-                  onChange={(e) => setEventPicker({ ...eventPicker, time: e.target.value })}
-                  className="px-1 py-0.5 rounded border bg-white"
-                  style={{ borderColor: "var(--line)", color: "var(--ink)" }}
-                />
+                {picker.mode === "event" && (
+                  <input
+                    type="time"
+                    value={picker.time}
+                    onChange={(e) => setPicker({ ...picker, time: e.target.value })}
+                    className="px-1 py-0.5 rounded border bg-white"
+                    style={{ borderColor: "var(--line)", color: "var(--ink)" }}
+                  />
+                )}
                 <button
-                  onClick={() => addEvent(c.id, eventPicker.date, eventPicker.time)}
-                  disabled={rowPending !== null}
+                  onClick={() =>
+                    picker.mode === "task"
+                      ? addTask(c.id, picker.date)
+                      : addEvent(c.id, picker.date, picker.time)
+                  }
+                  disabled={rowPending !== null || !picker.date}
                   className="px-1.5 py-0.5 rounded border hover:bg-white disabled:opacity-60"
                   style={{ borderColor: "var(--line)", color: "var(--accent)" }}
                 >
-                  {rowPending === "event" ? "Creating…" : "Create"}
+                  {rowPending !== null ? "Creating…" : "Create"}
                 </button>
                 <button
-                  onClick={() => setEventPicker(null)}
+                  onClick={() => setPicker(null)}
                   className="px-1.5 py-0.5 rounded border hover:bg-white"
                   style={{ borderColor: "var(--line)", color: "var(--muted)" }}
                 >

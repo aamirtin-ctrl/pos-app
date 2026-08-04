@@ -57,6 +57,11 @@ export default function ContactDetail({ id }: { id: number }) {
   const [saving, setSaving] = useState(false);
   const [newGroup, setNewGroup] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // "Catch-up update": worklog-backed "since we last talked" paragraph, in the
+  // user's own channel voice (deterministic bullet fallback without an LLM key).
+  const [catchUp, setCatchUp] = useState<string | null>(null);
+  const [catchUpBusy, setCatchUpBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   const refetch = useCallback(async () => {
     const r = await window.pos.people.get(id);
@@ -90,6 +95,23 @@ export default function ContactDetail({ id }: { id: number }) {
     await window.pos.groups.assign(id, name);
     setNewGroup("");
     await refetch();
+  };
+
+  const makeCatchUp = async () => {
+    if (catchUpBusy) return;
+    setCatchUpBusy(true);
+    setCopied(false);
+    setError(null);
+    const r = await window.pos.worklog.catchUp(id);
+    if (r.ok) setCatchUp((r.data as { paragraph: string }).paragraph);
+    else setError(r.error ?? "catch-up failed");
+    setCatchUpBusy(false);
+  };
+
+  const copyCatchUp = async () => {
+    if (!catchUp) return;
+    await navigator.clipboard.writeText(catchUp);
+    setCopied(true);
   };
 
   if (!loaded) return <div className="p-6" />;
@@ -132,11 +154,42 @@ export default function ContactDetail({ id }: { id: number }) {
           </select>
         </label>
       </div>
-      <div className="text-xs mb-4" style={{ color: "var(--muted)" }}>
-        {person.freshness_days == null
-          ? "Never contacted"
-          : `Last contact ${person.freshness_days === 0 ? "today" : `${person.freshness_days}d ago`}`}
+      <div className="flex items-center gap-3 text-xs mb-4" style={{ color: "var(--muted)" }}>
+        <span>
+          {person.freshness_days == null
+            ? "Never contacted"
+            : `Last contact ${person.freshness_days === 0 ? "today" : `${person.freshness_days}d ago`}`}
+        </span>
+        <button
+          onClick={makeCatchUp}
+          disabled={catchUpBusy}
+          className="px-2 py-0.5 rounded border bg-white hover:shadow-sm disabled:opacity-60 transition-[background-color,transform] duration-[120ms] active:scale-95"
+          style={{ borderColor: "var(--line)", color: "var(--accent)" }}
+        >
+          {catchUpBusy ? "Writing…" : "Catch-up update"}
+        </button>
       </div>
+      {catchUp !== null && (
+        <div className="mb-5 rounded-lg border p-3" style={{ borderColor: "var(--accent-soft)", background: "var(--wash)" }}>
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-xs font-medium" style={{ color: "var(--muted)" }}>Since you last talked</span>
+            <button
+              onClick={copyCatchUp}
+              className="text-[11px] px-2 py-0.5 rounded border bg-white hover:shadow-sm"
+              style={{ borderColor: "var(--line)", color: copied ? "var(--accent)" : "var(--muted)" }}
+            >
+              {copied ? "Copied" : "Copy"}
+            </button>
+          </div>
+          <textarea
+            readOnly
+            value={catchUp}
+            rows={Math.min(8, Math.max(3, catchUp.split("\n").length + 1))}
+            className="w-full text-sm leading-relaxed bg-transparent resize-none outline-none"
+            style={{ color: "var(--ink)" }}
+          />
+        </div>
+      )}
       {error && <p className="text-xs mb-3" style={{ color: "var(--danger)" }}>{error}</p>}
 
       {/* ── Tags + groups ── */}

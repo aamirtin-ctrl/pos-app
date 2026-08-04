@@ -15,7 +15,7 @@ import type { Db } from "../db/db.ts";
 import { getSetting, setSetting } from "../db/db.ts";
 import type { SecretStore } from "../secrets.ts";
 import { isGoogleConnected, oauthClient } from "./auth.ts";
-import { confirmCommitment } from "../crm/commitments.ts";
+import { confirmCommitment, dropCommitment } from "../crm/commitments.ts";
 
 export const POS_CALENDAR_NAME = "POS — Planned";
 export const POS_TASKLIST_NAME = "POS";
@@ -595,12 +595,25 @@ export interface CommitmentToTaskResult {
  * Confirm (if needed) + create a local task for a commitment, then push to Google
  * Tasks. Idempotent: an existing open task for the same commitment is reused, not
  * duplicated. Throws only when the commitment does not exist.
+ *
+ * `dateISO` ("YYYY-MM-DD", from the always-prompt picker) overrides the plan date AND
+ * the Google Tasks due date. `tentative` (automatic pipeline only) prefixes the GOOGLE
+ * title with "Tentative: " — the local task title stays clean — and pushes only this
+ * one task instead of running a full pushTasks.
  */
-export async function commitmentToTask(db: Db, secrets: SecretStore, id: number): Promise<CommitmentToTaskResult> {
+export async function commitmentToTask(
+  db: Db,
+  secrets: SecretStore,
+  id: number,
+  dateISO?: string,
+  opts: { tentative?: boolean } = {}
+): Promise<CommitmentToTaskResult> {
   const c = db.prepare("SELECT id, description, due_at, confirmed_by_user FROM commitment WHERE id = ?").get(id) as
     | { id: number; description: string; due_at: string | null; confirmed_by_user: number } | undefined;
   if (!c) throw new Error("commitment not found");
   if (c.confirmed_by_user === 0) confirmCommitment(db, id);
+
+  const pickedDate = dateISO && /^\d{4}-\d{2}-\d{2}$/.test(dateISO) ? dateISO : null;
 
   // Double-click guard: the observed failure mode was two identical tasks created
   // seconds apart because the button gave no feedback while Google was slow.
@@ -608,22 +621,46 @@ export async function commitmentToTask(db: Db, secrets: SecretStore, id: number)
     .prepare("SELECT id FROM task WHERE commitment_id = ? AND status IN ('inbox','planned','in_progress')")
     .get(id) as { id: number } | undefined;
   let duplicate = false;
+  let taskId: number | null = existing?.id ?? null;
   if (existing) {
     duplicate = true;
   } else {
     const today = new Date().toISOString().slice(0, 10);
     const due = c.due_at ? c.due_at.slice(0, 10) : null;
-    const planDate = due && due > today ? due : today;
-    db.prepare(
+    const planDate = pickedDate ?? (due && due > today ? due : today);
+    const deadline = pickedDate ? `${pickedDate}T00:00:00` : c.due_at;
+    const r = db.prepare(
       `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
         commitment_id, status, plan_date, hard_deadline_at, estimate_source)
        VALUES (?, 'admin', 2, 30, 30, ?, 'inbox', ?, ?, 'inferred')`
-    ).run(c.description.slice(0, 120), c.id, planDate, c.due_at);
+    ).run(c.description.slice(0, 120), c.id, planDate, deadline);
+    taskId = Number(r.lastInsertRowid);
   }
   db.prepare("UPDATE commitment SET status = 'scheduled' WHERE id = ?").run(id);
 
   if (!isGoogleConnected(secrets)) return { task: true, duplicate, google: false, reason: "Google not connected" };
   try {
+    if (opts.tentative) {
+      // Targeted single-task push (never a full pushTasks from an automatic run).
+      if (duplicate || taskId == null) return { task: true, duplicate, google: false, reason: "duplicate" };
+      const t = db.prepare("SELECT title, hard_deadline_at FROM task WHERE id = ?").get(taskId) as
+        | { title: string; hard_deadline_at: string | null } | undefined;
+      if (!t) return { task: true, duplicate, google: false, reason: "task vanished" };
+      const listId = await withTimeout(ensurePosTasklist(db, secrets), GOOGLE_PUSH_TIMEOUT_MS, "Google Tasks push timed out");
+      const created = await withTimeout(
+        tasksApi(secrets).tasks.insert({
+          tasklist: listId,
+          requestBody: {
+            title: `Tentative: ${t.title}`,
+            due: t.hard_deadline_at ? new Date(t.hard_deadline_at).toISOString() : undefined,
+          },
+        }),
+        GOOGLE_PUSH_TIMEOUT_MS,
+        "Google Tasks push timed out"
+      );
+      db.prepare("UPDATE task SET gtasks_id = ? WHERE id = ?").run(created.data.id, taskId);
+      return { task: true, duplicate, google: true, pushed: 1, completed: 0 };
+    }
     const res = await withTimeout(pushTasks(db, secrets), GOOGLE_PUSH_TIMEOUT_MS, "Google Tasks push timed out");
     return { task: true, duplicate, google: true, ...res };
   } catch (err) {
@@ -631,10 +668,79 @@ export async function commitmentToTask(db: Db, secrets: SecretStore, id: number)
   }
 }
 
+/**
+ * Best-effort, time-boxed cleanup: mark a pushed Google task completed (used by
+ * undo and by dropping a commitment). Swallows every error — the local DB is the
+ * source of truth and is already consistent.
+ */
+export async function closeGoogleTask(db: Db, secrets: SecretStore, gtasksId: string): Promise<void> {
+  if (!gtasksId || !isGoogleConnected(secrets)) return;
+  try {
+    const listId = getSetting(db, "pos_tasklist_id");
+    if (!listId) return;
+    await withTimeout(
+      tasksApi(secrets).tasks.update({
+        tasklist: listId,
+        task: gtasksId,
+        requestBody: { id: gtasksId, status: "completed" },
+      }),
+      GOOGLE_PUSH_TIMEOUT_MS,
+      "Google Tasks cleanup timed out"
+    );
+  } catch {
+    /* best-effort */
+  }
+}
+
+/** Full task row as deleted by dropCommitmentCascade (for undo re-insertion). */
+export interface DeletedTaskRow {
+  id: number;
+  title: string;
+  notes: string | null;
+  block_type: string;
+  cognitive_load: number | null;
+  estimated_minutes: number | null;
+  raw_estimate_minutes: number | null;
+  is_mit: number;
+  hard_deadline_at: string | null;
+  project: string | null;
+  commitment_id: number | null;
+  status: string;
+  splittable: number;
+  estimate_source: string | null;
+  plan_date: string | null;
+  gtasks_id: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
+/**
+ * Drop a commitment AND clean up what it spawned: delete still-open local tasks
+ * linked to it and best-effort complete their Google counterparts (time-boxed,
+ * fire-and-forget). Returns the deleted rows so undo can re-insert them.
+ */
+export function dropCommitmentCascade(
+  db: Db,
+  secrets: SecretStore,
+  id: number
+): { dropped: boolean; deletedTasks: DeletedTaskRow[] } {
+  dropCommitment(db, id);
+  const tasks = db
+    .prepare("SELECT * FROM task WHERE commitment_id = ? AND status IN ('inbox','planned','in_progress')")
+    .all(id) as DeletedTaskRow[];
+  for (const t of tasks) {
+    db.prepare("DELETE FROM task WHERE id = ?").run(t.id);
+    if (t.gtasks_id) void closeGoogleTask(db, secrets, t.gtasks_id);
+  }
+  return { dropped: true, deletedTasks: tasks };
+}
+
 export interface CommitmentToEventResult {
   event?: boolean;
   needsDate?: boolean;
   starts_at?: string;
+  /** Local block row id (for undo). */
+  block_id?: number;
 }
 
 /**
@@ -654,10 +760,10 @@ export function commitmentToEvent(db: Db, id: number, dateISO?: string, hhmm?: s
   if (Number.isNaN(start.getTime())) throw new Error("invalid date/time");
   const end = new Date(start.getTime() + 60 * 60_000);
   const endsAt = `${end.getFullYear()}-${pad2(end.getMonth() + 1)}-${pad2(end.getDate())}T${pad2(end.getHours())}:${pad2(end.getMinutes())}:00`;
-  db.prepare(
+  const r = db.prepare(
     `INSERT INTO block (task_id, block_type, title, starts_at, ends_at, is_anchor, is_locked, plan_id)
      VALUES (NULL, 'personal', ?, ?, ?, 0, 1, NULL)`
   ).run(c.description.slice(0, 120), startsAt, endsAt);
   db.prepare("UPDATE commitment SET status = 'scheduled' WHERE id = ?").run(id);
-  return { event: true, starts_at: startsAt };
+  return { event: true, starts_at: startsAt, block_id: Number(r.lastInsertRowid) };
 }
