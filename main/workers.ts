@@ -17,6 +17,8 @@ import { syncImessage, imessageAvailable } from "./connectors/imessage.ts";
 import { syncLinkedin } from "./connectors/linkedin.ts";
 import { syncLinkedinEmail } from "./connectors/linkedin-email.ts";
 import { syncMailfile } from "./connectors/mailfile.ts";
+import { runCapture } from "./capture.ts";
+import { getSetting } from "./db/db.ts";
 
 // node-cron ships no type declarations — minimal local surface via createRequire.
 interface CronTask {
@@ -28,7 +30,7 @@ interface CronModule {
 const req: ReturnType<typeof createRequire> =
   typeof require === "function" ? require : createRequire(import.meta.url);
 
-export type SyncSource = "gmail" | "imessage" | "linkedin" | "linkedin-email" | "mailfile";
+export type SyncSource = "gmail" | "imessage" | "linkedin" | "linkedin-email" | "mailfile" | "capture";
 
 /** `extra` = LinkedIn export folder / mailfile path (unused by gmail/imessage). */
 export type ConnectorFn = (deps: ConnectorDeps, extra?: string) => Promise<SyncReport>;
@@ -48,6 +50,9 @@ const CONNECTORS: Record<SyncSource, ConnectorFn> = {
     extra
       ? syncMailfile(deps, extra)
       : Promise.resolve({ source: "mailfile", ingested: 0, skipped: 0, created: 0, error: "path-required" }),
+  // Morning capture: self-messages (note-to-self email + iMessage) routed through the
+  // unified assistant. Needs the llm from runSync's deps threading.
+  capture: (deps) => runCapture(deps),
 };
 
 /**
@@ -167,6 +172,11 @@ export function startWorkers(
         announce(await runSync(db, secrets, llm, "gmail"));
         // Same accounts, LinkedIn notification mail only (invites/accepts → people).
         announce(await runSync(db, secrets, llm, "linkedin-email"));
+      }
+      // Morning capture: runs when there's any source for self-messages (a mail account
+      // or configured self iMessage handles).
+      if (gmailConfigured({ secrets }) || (getSetting(db, "capture_self_handles") ?? "").trim()) {
+        announce(await runSync(db, secrets, llm, "capture"));
       }
       if (imessageAvailable()) {
         // FDA can still be revoked between the precheck and the copy — announce() stays

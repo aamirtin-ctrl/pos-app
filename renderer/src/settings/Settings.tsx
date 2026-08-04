@@ -206,6 +206,12 @@ function Integrations() {
   return (
     <Section title="Integrations">
       <div className="space-y-2">
+        <MorningCaptureCard
+          row={syncRow("capture")}
+          open={openCard === "capture"}
+          onToggle={() => toggle("capture")}
+          refetchSync={refetchSync}
+        />
         <GoogleCard
           gcal={gcal}
           present={present}
@@ -265,6 +271,111 @@ function Integrations() {
       </div>
       <EmbedProfiles />
     </Section>
+  );
+}
+
+/** Morning capture: self-messages (note-to-self email / iMessage) → the unified assistant. */
+function MorningCaptureCard({
+  row,
+  open,
+  onToggle,
+  refetchSync,
+}: {
+  row: SyncRow;
+  open: boolean;
+  onToggle: () => void;
+  refetchSync: () => void;
+}) {
+  const [handles, setHandles] = useState("");
+  const [savedHandles, setSavedHandles] = useState("");
+  const [mailAccounts, setMailAccounts] = useState(0);
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      const r = await window.pos.settings.get("capture_self_handles");
+      if (r.ok && typeof r.data === "string") {
+        setHandles(r.data);
+        setSavedHandles(r.data);
+      }
+      const a = await window.pos.mail.list();
+      if (a.ok && Array.isArray(a.data)) setMailAccounts((a.data as unknown[]).length);
+      setLoaded(true);
+    })();
+  }, []);
+
+  const save = async () => {
+    if (saving) return;
+    setSaving(true);
+    const v = handles.trim();
+    const r = await window.pos.settings.set("capture_self_handles", v);
+    if (r.ok) setSavedHandles(v);
+    else setMsg(r.error ?? "could not save");
+    setSaving(false);
+  };
+
+  const scan = async () => {
+    setBusy(true);
+    setMsg(null);
+    const r = await window.pos.sync.run("capture");
+    const d = r.data as (RawSyncRow & { summary?: unknown; ingested?: unknown }) | undefined;
+    const err = r.ok ? str(d?.error) : (r.error ?? "scan failed");
+    if (err) setMsg(`capture: ${err}`);
+    else setMsg(str(d?.summary) ?? `Scanned — ${num(d?.ingested) ?? 0} new.`);
+    setBusy(false);
+    refetchSync();
+  };
+
+  const status: IntegrationStatus =
+    savedHandles.trim() || mailAccounts > 0 ? "connected" : "needs-setup";
+
+  return (
+    <IntegrationCard
+      name="Morning capture"
+      description="Text or email yourself — POS turns it into your day"
+      status={status}
+      open={open}
+      onToggle={onToggle}
+      steps={[
+        "Email: send a note to yourself from any connected account (same from/to address).",
+        "iMessage: text your own number (the note-to-self thread) — enter your own phone/email handles below so POS knows which thread is yours.",
+        "It's picked up within 15 minutes, or hit Scan now.",
+      ]}
+    >
+      <div className="flex gap-2 mb-2">
+        <input
+          type="text"
+          value={handles}
+          onChange={(e) => setHandles(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") save(); }}
+          disabled={!loaded}
+          placeholder="+1214…, you@icloud.com"
+          className="flex-1 border rounded-md px-2 py-1 text-sm bg-white"
+          style={{ borderColor: "var(--line)" }}
+        />
+        <button
+          onClick={save}
+          disabled={saving || !loaded || handles.trim() === savedHandles.trim()}
+          className="px-3 py-1 rounded-md text-sm border bg-white disabled:opacity-40"
+          style={{ borderColor: "var(--line)" }}
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+      </div>
+      <button
+        onClick={scan}
+        disabled={busy}
+        className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-40"
+        style={{ borderColor: "var(--line)" }}
+      >
+        {busy ? "Scanning…" : "Scan now"}
+      </button>
+      <LastRunLine row={row} />
+      {msg && <p className="text-xs mt-1" style={{ color: "var(--muted)" }}>{msg}</p>}
+    </IntegrationCard>
   );
 }
 
