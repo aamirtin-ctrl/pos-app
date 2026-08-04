@@ -13,7 +13,7 @@ import { reconnectDue, refreshNextTouch } from "./crm/reconnect.ts";
 import * as planner from "./planner.ts";
 
 export interface AssistantResult {
-  kind: "plan" | "people" | "note" | "answer" | "search" | "error";
+  kind: "plan" | "people" | "note" | "answer" | "search" | "event" | "error";
   reply: string;
   results?: { id: number; name: string; reason: string }[];
   hits?: { type: string; label: string; sub: string; href: string }[];
@@ -38,8 +38,9 @@ export async function handleCommand(
       "assistant_route",
       "fast",
       `Classify this personal-assistant command. STRICT JSON only:
-{"intent":"plan_day"|"find_people"|"add_note"|"search"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>"}
+{"intent":"plan_day"|"add_event"|"find_people"|"add_note"|"search"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>"}
 "plan_day" = a braindump of tasks to schedule, or asking to plan the day.
+"add_event" = ONE specific commitment at a stated time ("lunch with Raj Thursday 1pm", "dentist tomorrow at 9"). A time must be stated or clearly implied.
 "find_people" = who should I talk to / reach out to / intro ideas.
 "add_note" = remember/save a fact about a person in the network.
 "search" = find/look up specific info they saved (a person, message, commitment, task, note).
@@ -61,6 +62,8 @@ Command: """${t.slice(0, 600)}"""`,
     if (/^(note|remember|met|log)\b/i.test(t)) intent = "add_note";
     if (/\b(plan|schedule|braindump)\b/i.test(t) || /\d+\s*(h|hr|hrs|hours|min)/i.test(t)) intent = "plan_day";
     if (/^(find|search|look ?up|show me|when did|what did)\b/i.test(t)) intent = "search";
+    // a single item with an explicit clock time is an event, not a braindump
+    if (/\b(\d{1,2})(:\d{2})?\s*(am|pm)\b/i.test(t) && !/[,;\n]/.test(t)) intent = "add_event";
   }
 
   try {
@@ -73,6 +76,22 @@ Command: """${t.slice(0, 600)}"""`,
         kind: "plan",
         reply: `${(view?.plan as any)?.narration ?? "Plan generated."} — ${n} blocks placed${un ? `, ${un} didn't fit` : ""}. Review it on the Calendar.`,
       };
+    }
+
+    if (intent === "add_event") {
+      const ev = await parseEvent(t, llm);
+      if (!ev) return { kind: "error", reply: "Couldn't read a date and time from that. Try: \"lunch with Raj Thursday 1pm\"." };
+      const startsAt = `${ev.date}T${ev.start}:00`;
+      const endMin = toMin(ev.start) + ev.minutes;
+      const endsAt = `${ev.date}T${String(Math.floor(endMin / 60) % 24).padStart(2, "0")}:${String(endMin % 60).padStart(2, "0")}:00`;
+      // is_locked=1 → the planner treats it as immovable; is_anchor=0 → it still pushes to Google.
+      const plan = db.prepare("SELECT id FROM plan WHERE plan_date = ? ORDER BY generated_at DESC LIMIT 1").get(ev.date) as { id: number } | undefined;
+      db.prepare(
+        `INSERT INTO block (block_type, title, starts_at, ends_at, is_anchor, is_locked, plan_id)
+         VALUES (?, ?, ?, ?, 0, 1, ?)`
+      ).run(ev.blockType, ev.title, startsAt, endsAt, plan?.id ?? null);
+      const pretty = new Date(`${ev.date}T12:00:00`).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+      return { kind: "event", reply: `Added "${ev.title}" — ${pretty} at ${ev.start} (${ev.minutes} min). It's pinned, so the planner will work around it.` };
     }
 
     if (intent === "find_people") {
@@ -159,4 +178,93 @@ Command: """${t.slice(0, 600)}"""`,
   } catch (e) {
     return { kind: "error", reply: (e as Error).message };
   }
+}
+
+
+// ── event parsing for the "add_event" intent ────────────────────────────────
+const toMin = (hhmm: string) => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5));
+const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+
+interface ParsedEvent {
+  title: string;
+  date: string;   // YYYY-MM-DD
+  start: string;  // HH:MM 24h
+  minutes: number;
+  blockType: "meeting" | "personal";
+}
+
+/** LLM first (handles "coffee w/ Raj a week from Tuesday"), deterministic fallback second. */
+async function parseEvent(text: string, llm: LlmClient | null): Promise<ParsedEvent | null> {
+  const todayISO = new Date().toISOString().slice(0, 10);
+  if (llm) {
+    const res = await llm.call(
+      "event_parse", "fast",
+      `Extract ONE calendar event. Today is ${todayISO} (${WEEKDAYS[new Date().getDay()]}).
+Return STRICT JSON only:
+{"title":"<short title, no date/time words>","date":"YYYY-MM-DD","start":"HH:MM" 24-hour,"minutes":<duration, default 60>,"block_type":"meeting"|"personal"}
+"meeting" if another person is involved, else "personal". Resolve relative dates against today. If no year is stated pick the nearest future occurrence.
+TEXT: """${text.slice(0, 300)}"""`,
+      { json: true }
+    );
+    if (res) {
+      try {
+        const p = extractJson(res.text) as Record<string, unknown>;
+        const date = String(p.date ?? "");
+        const start = String(p.start ?? "");
+        if (/^\d{4}-\d{2}-\d{2}$/.test(date) && /^\d{2}:\d{2}$/.test(start)) {
+          return {
+            title: String(p.title || text).slice(0, 120),
+            date,
+            start,
+            minutes: Math.max(15, Math.min(480, Number(p.minutes) || 60)),
+            blockType: p.block_type === "personal" ? "personal" : "meeting",
+          };
+        }
+      } catch { /* fall through */ }
+    }
+  }
+  return deterministicEvent(text);
+}
+
+/** Handles "<title> [today|tomorrow|<weekday>] at H[:MM]am/pm" without an LLM. */
+export function deterministicEvent(text: string, now = new Date()): ParsedEvent | null {
+  const tm = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i) ?? text.match(/\b(\d{1,2}):(\d{2})\b/);
+  if (!tm) return null;
+  let h = Number(tm[1]);
+  const mins = Number(tm[2] ?? 0);
+  const ampm = (tm[3] ?? "").toLowerCase();
+  if (ampm === "pm" && h < 12) h += 12;
+  if (ampm === "am" && h === 12) h = 0;
+  if (h > 23) return null;
+
+  const d = new Date(now);
+  const lower = text.toLowerCase();
+  if (/\btomorrow\b/.test(lower)) d.setDate(d.getDate() + 1);
+  else {
+    const wd = WEEKDAYS.findIndex((w) => new RegExp(`\\b${w}\\b`).test(lower));
+    if (wd >= 0) {
+      let delta = (wd - d.getDay() + 7) % 7;
+      if (delta === 0) delta = 7; // "thursday" on a Thursday means next Thursday
+      d.setDate(d.getDate() + delta);
+    } else if (h * 60 + mins <= now.getHours() * 60 + now.getMinutes()) {
+      d.setDate(d.getDate() + 1); // a time already past today means tomorrow
+    }
+  }
+
+  const title = text
+    .replace(tm[0], "")
+    .replace(/\b(today|tomorrow|at|on|next)\b/gi, "")
+    .replace(new RegExp(`\\b(${WEEKDAYS.join("|")})\\b`, "gi"), "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  const durM = text.match(/\b(\d+)\s*(min|minutes|hour|hours|hr|hrs)\b/i);
+  const minutes = durM ? (/(hour|hr)/i.test(durM[2]) ? Number(durM[1]) * 60 : Number(durM[1])) : 60;
+
+  return {
+    title: title || "Event",
+    date: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`,
+    start: `${String(h).padStart(2, "0")}:${String(mins).padStart(2, "0")}`,
+    minutes: Math.max(15, Math.min(480, minutes)),
+    blockType: /\b(with|w\/|meet|call|lunch|coffee|dinner|1:1)\b/i.test(text) ? "meeting" : "personal",
+  };
 }

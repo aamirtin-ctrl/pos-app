@@ -55,7 +55,16 @@ export interface ExternalAnchor {
   title: string;
   blockType: "meeting" | "personal";
   gcalEventId: string;
+  /**
+   * RFC 5545 UID. Unlike `gcalEventId` this survives cross-system sync, so it is the
+   * join key between "the same event as Google knows it" and "the same event as
+   * Calendar.app knows it". Empty string when Google did not return one.
+   */
+  iCalUID: string;
 }
+
+/** Only ask for what we read — and crucially, ask for iCalUID. */
+const EVENT_FIELDS = "items(id,status,summary,start,end,attendees,iCalUID),nextPageToken";
 
 /**
  * Read anchors for a date from ALL calendars except the POS calendar.
@@ -78,6 +87,7 @@ export async function readAnchors(db: Db, secrets: SecretStore, dateISO: string)
       singleEvents: true,
       orderBy: "startTime",
       maxResults: 100,
+      fields: EVENT_FIELDS,
     });
     for (const e of events.data.items ?? []) {
       if (e.status === "cancelled" || !e.start?.dateTime || !e.end?.dateTime) continue; // skip all-day
@@ -89,10 +99,163 @@ export async function readAnchors(db: Db, secrets: SecretStore, dateISO: string)
         title: e.summary ?? "(busy)",
         blockType: (e.attendees?.length ?? 0) > 0 ? "meeting" : "personal",
         gcalEventId: e.id!,
+        iCalUID: e.iCalUID ?? "",
       });
     }
   }
   return anchors;
+}
+
+// ── cross-calendar identity ──────────────────────────────────────────────────
+//
+// The anchor path and the Apple-mirror path both want "what does Google already
+// know about this day?" within seconds of each other, and the answer costs one
+// events.list per calendar. One warm read serves both.
+const ICAL_UID_TTL_MS = 2 * 60_000;
+const icalUidCache = new Map<string, { at: number; uids: Set<string> }>();
+
+/** Testing/refresh hook — drops the in-process iCalUID cache. */
+export function clearICalUidCache(): void {
+  icalUidCache.clear();
+}
+
+/**
+ * Every iCalUID Google holds for `dateISO`, across ALL calendars — the POS ones
+ * included, deliberately: this set answers "does Google already have this event?",
+ * and an event we mirrored last week is still an event Google has.
+ */
+export async function googleICalUids(db: Db, secrets: SecretStore, dateISO: string): Promise<Set<string>> {
+  if (!isGoogleConnected(secrets)) return new Set();
+  const hit = icalUidCache.get(dateISO);
+  if (hit && Date.now() - hit.at < ICAL_UID_TTL_MS) return hit.uids;
+
+  const cal = calApi(secrets);
+  const dayStart = new Date(`${dateISO}T00:00:00`);
+  const dayEnd = new Date(`${dateISO}T23:59:59`);
+  const list = await cal.calendarList.list({ maxResults: 250 });
+  const uids = new Set<string>();
+  for (const c of list.data.items ?? []) {
+    if (!c.id) continue;
+    const events = await cal.events.list({
+      calendarId: c.id,
+      timeMin: dayStart.toISOString(),
+      timeMax: dayEnd.toISOString(),
+      singleEvents: true,
+      maxResults: 250,
+      fields: "items(iCalUID,status)",
+    });
+    for (const e of events.data.items ?? []) {
+      if (e.status === "cancelled") continue;
+      const uid = (e.iCalUID ?? "").trim();
+      if (uid) uids.add(uid);
+    }
+  }
+  icalUidCache.set(dateISO, { at: Date.now(), uids });
+  return uids;
+}
+
+// ── merging Google + Apple into one anchor set (pure) ────────────────────────
+
+/** Minimal shape of a Google anchor the merge cares about. */
+export interface MergeableGoogleAnchor {
+  startMin: number;
+  endMin: number;
+  title: string;
+  blockType: "meeting" | "personal";
+  iCalUID?: string | null;
+}
+
+/**
+ * Minimal shape of an Apple event the merge cares about. `blockType` is resolved by
+ * the caller (applecal.appleBlockType) so this module stays free of Apple imports.
+ */
+export interface MergeableAppleEvent {
+  uid?: string | null;
+  title: string;
+  startMin: number;
+  endMin: number;
+  blockType?: "meeting" | "personal";
+}
+
+export interface MergedAnchor {
+  startMin: number;
+  endMin: number;
+  title: string;
+  blockType: "meeting" | "personal";
+  source: "google" | "apple";
+  /** iCalUID (Google) or Apple UID; empty when the source gave us none. */
+  uid: string;
+}
+
+export interface SkippedAppleEvent {
+  uid: string;
+  reason: "same-uid" | "same-time-title";
+}
+
+export interface MergeResult {
+  anchors: MergedAnchor[];
+  skipped: SkippedAppleEvent[];
+}
+
+const norm = (s: string | null | undefined) => (s ?? "").trim();
+
+/**
+ * Join Google anchors and Apple events into one anchor set, UID-first.
+ *
+ * An event that lives in both systems (a Google account subscribed inside
+ * Calendar.app, or a POS block synced back down) carries the SAME RFC 5545 UID on
+ * both sides, so matching on it is exact and survives renames and reschedules.
+ * The old (startMin, endMin, title) check is kept only as the fallback for events
+ * where one side has no UID at all.
+ */
+export function mergeCalendarSources(
+  googleAnchors: readonly MergeableGoogleAnchor[],
+  appleEvents: readonly MergeableAppleEvent[]
+): MergeResult {
+  const anchors: MergedAnchor[] = [];
+  const skipped: SkippedAppleEvent[] = [];
+
+  const googleUids = new Set<string>();
+  for (const g of googleAnchors ?? []) {
+    const uid = norm(g.iCalUID);
+    if (uid) googleUids.add(uid);
+    anchors.push({
+      startMin: g.startMin,
+      endMin: g.endMin,
+      title: g.title,
+      blockType: g.blockType,
+      source: "google",
+      uid,
+    });
+  }
+
+  for (const ev of appleEvents ?? []) {
+    const uid = norm(ev.uid);
+    if (uid && googleUids.has(uid)) {
+      skipped.push({ uid, reason: "same-uid" });
+      continue;
+    }
+    // Fallback, reached only when the UIDs could not decide it (no match above, or
+    // one side carries no UID at all): the old exact time+title check. Two entries at
+    // the same minute with the same title are one busy block as far as the day goes.
+    const clash = anchors.some(
+      (a) => a.startMin === ev.startMin && a.endMin === ev.endMin && norm(a.title) === norm(ev.title)
+    );
+    if (clash) {
+      skipped.push({ uid, reason: "same-time-title" });
+      continue;
+    }
+    anchors.push({
+      startMin: ev.startMin,
+      endMin: ev.endMin,
+      title: ev.title,
+      blockType: ev.blockType ?? "personal",
+      source: "apple",
+      uid,
+    });
+  }
+
+  return { anchors, skipped };
 }
 
 /** Explicit push: write every non-anchor block of a plan into the POS calendar. */

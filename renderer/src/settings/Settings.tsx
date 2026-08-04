@@ -496,13 +496,20 @@ function GoogleCard({
  * permission) and mirrors the day into a dedicated "POS — Apple" Google calendar.
  */
 type AppleAvailability = { ok: boolean; error?: string; calendars?: number };
-type MirrorCounts = { created?: number; updated?: number; deleted?: number; events?: number };
+type MirrorCounts = { created?: number; updated?: number; deleted?: number; skipped?: number; events?: number };
+
+const EXCLUDED_KEY = "apple_calendars_excluded";
+const parseExcluded = (raw: unknown): string[] =>
+  typeof raw === "string" ? raw.split(",").map((s) => s.trim()).filter(Boolean) : [];
 
 function AppleCalendarCard({ open, onToggle }: { open: boolean; onToggle: () => void }) {
   const [avail, setAvail] = useState<AppleAvailability | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState(false);
+  const [calendars, setCalendars] = useState<string[] | null>(null);
+  const [excluded, setExcluded] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
 
   const check = useCallback(async (announce: boolean) => {
     if (announce) { setBusy("check"); setMsg(null); setErr(false); }
@@ -525,6 +532,30 @@ function AppleCalendarCard({ open, onToggle }: { open: boolean; onToggle: () => 
 
   useEffect(() => { check(false); }, [check]);
 
+  // The calendar list is only needed once the card is open, and only when Calendar.app
+  // actually answered — no point prompting for names we cannot read.
+  const loadCalendars = useCallback(async () => {
+    const [names, saved] = await Promise.all([
+      window.pos.applecal.calendars(),
+      window.pos.settings.get(EXCLUDED_KEY),
+    ]);
+    if (names.ok) setCalendars((names.data as string[]) ?? []);
+    if (saved.ok) setExcluded(parseExcluded(saved.data));
+  }, []);
+
+  useEffect(() => {
+    if (open && avail?.ok && calendars == null) loadCalendars();
+  }, [open, avail?.ok, calendars, loadCalendars]);
+
+  const toggleCalendar = async (name: string, include: boolean) => {
+    const next = include ? excluded.filter((n) => n !== name) : [...excluded, name];
+    setExcluded(next);
+    setSaving(true);
+    const r = await window.pos.settings.set(EXCLUDED_KEY, next.join(","));
+    if (!r.ok) { setErr(true); setMsg(r.error ?? "could not save calendar selection"); }
+    setSaving(false);
+  };
+
   const mirror = async () => {
     setBusy("mirror");
     setMsg(null);
@@ -534,8 +565,9 @@ function AppleCalendarCard({ open, onToggle }: { open: boolean; onToggle: () => 
     const r = await window.pos.applecal.mirror(dateISO);
     if (r.ok) {
       const d = (r.data ?? {}) as MirrorCounts;
+      const already = d.skipped ? ` ${d.skipped} already in Google, left alone.` : "";
       setMsg(
-        `${d.events ?? 0} Apple event${d.events === 1 ? "" : "s"} today — ${d.created ?? 0} created, ${d.updated ?? 0} updated, ${d.deleted ?? 0} deleted in "POS — Apple".`
+        `${d.events ?? 0} Apple event${d.events === 1 ? "" : "s"} today — ${d.created ?? 0} created, ${d.updated ?? 0} updated, ${d.deleted ?? 0} deleted in "POS — Apple".${already}`
       );
     } else {
       setErr(true);
@@ -577,8 +609,40 @@ function AppleCalendarCard({ open, onToggle }: { open: boolean; onToggle: () => 
           {busy === "mirror" ? "Mirroring…" : "Mirror to Google"}
         </button>
       </div>
+      {avail?.ok && (
+        <div className="mt-3">
+          <div className="text-xs font-medium mb-1" style={{ color: "var(--ink)" }}>
+            Calendars POS reads
+          </div>
+          {calendars == null ? (
+            <p className="text-[11px]" style={{ color: "var(--muted)" }}>Loading calendars…</p>
+          ) : calendars.length === 0 ? (
+            <p className="text-[11px]" style={{ color: "var(--muted)" }}>No calendars found.</p>
+          ) : (
+            <div className="flex flex-col gap-1">
+              {calendars.map((name) => (
+                <label key={name} className="flex items-center gap-2 text-xs no-drag" style={{ color: "var(--ink)" }}>
+                  <input
+                    type="checkbox"
+                    checked={!excluded.includes(name)}
+                    disabled={saving}
+                    onChange={(e) => toggleCalendar(name, e.target.checked)}
+                  />
+                  <span className="truncate">{name}</span>
+                </label>
+              ))}
+            </div>
+          )}
+          <p className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
+            Unchecking Holidays, Birthdays or Siri Suggestions makes the daily scan much faster.
+          </p>
+        </div>
+      )}
       <p className="text-[11px] mt-2" style={{ color: "var(--muted)" }}>
         Reading Calendar.app can take up to a minute the first time each day.
+      </p>
+      <p className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
+        Events that already live in Google are never mirrored twice — POS matches them by their calendar UID.
       </p>
       {msg && (
         <p className="text-xs mt-1" style={{ color: err ? "var(--danger)" : "var(--muted)" }}>

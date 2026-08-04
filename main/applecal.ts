@@ -25,11 +25,22 @@ import { getSetting, setSetting } from "./db/db.ts";
 import type { SecretStore } from "./secrets.ts";
 import { google, type calendar_v3 } from "googleapis";
 import { isGoogleConnected, oauthClient } from "./gcal/auth.ts";
+import { googleICalUids } from "./gcal/sync.ts";
 
 /** Google calendar that receives the mirrored Apple events. Nothing else is written. */
 export const APPLE_MIRROR_CALENDAR_NAME = "POS — Apple";
 /** settings key holding the mirror calendar id (distinct from `pos_calendar_id`). */
 export const APPLE_MIRROR_SETTING_KEY = "apple_mirror_calendar_id";
+
+/**
+ * Every Calendar.app calendar POS itself authored ("POS — Planned", "POS — Apple")
+ * starts with this. Those calendars come back down through the user's Google account
+ * into Calendar.app, so reading them would feed our own output back in as anchors and
+ * re-mirror it. They are never read.
+ */
+export const POS_CALENDAR_PREFIX = "POS — ";
+/** settings key: comma-separated Calendar.app names the user chose not to read. */
+export const APPLE_EXCLUDED_SETTING_KEY = "apple_calendars_excluded";
 
 /** ASCII unit separator — rare enough that no calendar title contains it. */
 export const FIELD_SEP = "\u001f";
@@ -156,6 +167,36 @@ export function parseAppleEvents(stdout: string): AppleEvent[] {
   return out;
 }
 
+// ── calendar filtering (pure) ────────────────────────────────────────────────
+
+/** A calendar POS wrote itself — mirrors of our own output, never an input. */
+export function isPosAuthoredCalendar(name: string): boolean {
+  return (name ?? "").trim().startsWith(POS_CALENDAR_PREFIX);
+}
+
+/** Parse the `apple_calendars_excluded` setting. Empty/absent → nothing excluded. */
+export function parseExcludedCalendars(raw: string | null | undefined): string[] {
+  return (raw ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+const foldName = (s: string) => (s ?? "").trim().toLocaleLowerCase();
+
+/**
+ * Drop rows POS must not read: its own mirror calendars, plus anything the user
+ * excluded in Settings. The AppleScript already skips both (that is where the 30-90s
+ * scan time goes), but the parsed rows are filtered again — a stale cache entry or a
+ * calendar renamed mid-scan must never leak POS's own output back in.
+ */
+export function filterAppleEvents(events: AppleEvent[], excluded: readonly string[] = []): AppleEvent[] {
+  const drop = new Set(excluded.map(foldName).filter(Boolean));
+  return (events ?? []).filter(
+    (e) => !isPosAuthoredCalendar(e.calendar) && !drop.has(foldName(e.calendar))
+  );
+}
+
 const MEETING_TITLE_RE =
   /\b(meeting|meet|call|calling|sync|stand-?up|1:1|1-1|one[- ]on[- ]one|interview|review|catch[- ]?up|demo|huddle|zoom|hangout|teams|webinar|workshop|session|kick[- ]?off|check[- ]?in|retro|standup|conference|briefing|consult|appt|appointment|coffee with|lunch with|dinner with|intro)\b/i;
 
@@ -228,14 +269,32 @@ export function runOsascript(script: string, timeoutMs = OSASCRIPT_TIMEOUT_MS): 
 
 const DATE_ISO_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 
+/** Quote a string for AppleScript source. Backslash and double quote are the only escapes. */
+function asString(s: string): string {
+  return `"${(s ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/** `{"a", "b"}` — an AppleScript list literal, or `{}` when empty. */
+function asList(items: readonly string[]): string {
+  return items.length === 0 ? "{}" : `{${items.map(asString).join(", ")}}`;
+}
+
 /**
  * The day-scan script. `current date` arithmetic builds the range (day is reset to 1
  * BEFORE the month is set, otherwise e.g. Jan 31 → month 2 overflows into March).
+ *
+ * Calendars are filtered before the (expensive) `whose` scan: POS's own mirror
+ * calendars always, plus `excluded`. Skipping Holidays / Birthdays / Siri Suggestions
+ * is what takes a cold scan from 30-90s down to a few seconds.
+ *
+ * The em dash in the POS prefix is built with `character id 8212` rather than written
+ * literally — osascript's source encoding is not guaranteed to be UTF-8.
  */
-export function buildEventsScript(dateISO: string): string {
+export function buildEventsScript(dateISO: string, excluded: readonly string[] = []): string {
   const m = DATE_ISO_RE.exec(dateISO);
   if (!m) throw new AppleCalError("script", `bad date: ${dateISO}`);
   const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const excludedList = asList(excluded.map((s) => s.trim()).filter(Boolean));
   return `
 on pad(n, w)
 	set s to (n as integer) as text
@@ -268,25 +327,37 @@ set time of dayStart to 0
 set dayEnd to dayStart + (1 * days)
 
 set sep to (character id 31)
+set posPrefix to "POS " & (character id 8212) & " "
+set skipNames to ${excludedList}
 set rows to {}
 tell application "Calendar"
 	repeat with c in calendars
 		set cname to my oneLine(name of c)
-		try
-			set evs to (every event of c whose start date is greater than or equal to dayStart and start date is less than dayEnd)
-		on error
-			set evs to {}
-		end try
-		repeat with e in evs
+		if cname starts with posPrefix then
+			set skipThis to true
+		else
+			set skipThis to false
+			repeat with sn in skipNames
+				if cname is (sn as text) then set skipThis to true
+			end repeat
+		end if
+		if skipThis is false then
 			try
-				set t to my oneLine(summary of e)
+				set evs to (every event of c whose start date is greater than or equal to dayStart and start date is less than dayEnd)
 			on error
-				set t to "(busy)"
+				set evs to {}
 			end try
-			try
-				set end of rows to ((uid of e) & sep & t & sep & my isoOf(start date of e) & sep & my isoOf(end date of e) & sep & cname)
-			end try
-		end repeat
+			repeat with e in evs
+				try
+					set t to my oneLine(summary of e)
+				on error
+					set t to "(busy)"
+				end try
+				try
+					set end of rows to ((uid of e) & sep & t & sep & my isoOf(start date of e) & sep & my isoOf(end date of e) & sep & cname)
+				end try
+			end repeat
+		end if
 	end repeat
 end tell
 
@@ -302,20 +373,66 @@ return outText
 // day within seconds of each other. One warm read serves all three.
 const cache = new Map<string, { at: number; events: AppleEvent[] }>();
 
+/** The calendar names the user switched off in Settings. */
+export function excludedCalendarNames(db: Db): string[] {
+  return parseExcludedCalendars(getSetting(db, APPLE_EXCLUDED_SETTING_KEY));
+}
+
 /**
- * All Calendar.app events whose START falls on `dateISO`, across every calendar.
- * Empty array when there are no events. Throws a typed {@link AppleCalError} when
- * automation permission is denied or Calendar cannot be reached.
+ * All Calendar.app events whose START falls on `dateISO`, across every calendar the
+ * user has not excluded and that POS did not author itself. Empty array when there are
+ * no events. Throws a typed {@link AppleCalError} when automation permission is denied
+ * or Calendar cannot be reached.
  */
-export async function readAppleEvents(dateISO: string, opts?: { force?: boolean }): Promise<AppleEvent[]> {
-  const hit = cache.get(dateISO);
+export async function readAppleEvents(
+  dateISO: string,
+  opts?: { force?: boolean; exclude?: readonly string[] }
+): Promise<AppleEvent[]> {
+  const exclude = [...(opts?.exclude ?? [])].map((s) => s.trim()).filter(Boolean);
+  // the exclusion set changes what the scan returns, so it is part of the cache key
+  const key = `${dateISO}|${[...exclude].sort().join(",")}`;
+  const hit = cache.get(key);
   if (!opts?.force && hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.events;
 
-  const res = await runOsascript(buildEventsScript(dateISO));
+  const res = await runOsascript(buildEventsScript(dateISO, exclude));
   if (!res.ok) throw res.error;
-  const events = parseAppleEvents(res.stdout);
-  cache.set(dateISO, { at: Date.now(), events });
+  const events = filterAppleEvents(parseAppleEvents(res.stdout), exclude);
+  cache.set(key, { at: Date.now(), events });
   return events;
+}
+
+/** Split the linefeed-joined name list the calendars script returns. */
+export function parseCalendarNames(stdout: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of (stdout ?? "").split("\n")) {
+    const name = raw.replace(/\r$/, "").trim();
+    if (!name || isPosAuthoredCalendar(name) || seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  return out;
+}
+
+// Names are joined with linefeed rather than read from AppleScript's default
+// comma-space list coercion, because calendar names may themselves contain commas.
+const CALENDAR_NAMES_SCRIPT = `
+set prev to AppleScript's text item delimiters
+tell application "Calendar" to set ns to name of calendars
+set AppleScript's text item delimiters to linefeed
+set outText to ns as text
+set AppleScript's text item delimiters to prev
+return outText
+`.trim();
+
+/**
+ * Every Calendar.app calendar the user could read, for the Settings picker. POS's own
+ * mirror calendars are omitted — they are never readable inputs.
+ */
+export async function listAppleCalendars(): Promise<string[]> {
+  const res = await runOsascript(CALENDAR_NAMES_SCRIPT, 30_000);
+  if (!res.ok) throw res.error;
+  return parseCalendarNames(res.stdout);
 }
 
 /**
@@ -323,13 +440,9 @@ export async function readAppleEvents(dateISO: string, opts?: { force?: boolean 
  * Automation permission prompt, so "Check access" is a real, useful button.
  */
 export async function appleCalendarAvailable(): Promise<{ ok: boolean; error?: string; calendars?: number }> {
-  const res = await runOsascript(`tell application "Calendar" to get name of calendars`, 30_000);
+  const res = await runOsascript(CALENDAR_NAMES_SCRIPT, 30_000);
   if (!res.ok) return { ok: false, error: res.error.message };
-  const names = res.stdout
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  return { ok: true, calendars: names.length };
+  return { ok: true, calendars: parseCalendarNames(res.stdout).length };
 }
 
 // ── mirror into Google ───────────────────────────────────────────────────────
@@ -377,6 +490,8 @@ export interface MirrorResult {
   created: number;
   updated: number;
   deleted: number;
+  /** Apple events Google already had under the same iCalUID — mirroring would duplicate. */
+  skipped: number;
   events: number;
   calendarId: string;
 }
@@ -385,6 +500,11 @@ export interface MirrorResult {
  * Mirror one day of Apple Calendar into the dedicated "POS — Apple" Google calendar.
  * Idempotent: the Apple UID lives in extendedProperties.private.appleUid, so a second
  * run updates instead of duplicating, and events removed in Apple are deleted here.
+ *
+ * Never mirrors an event Google already knows. If the user's Google account is
+ * subscribed inside Calendar.app, every Google event is ALSO an Apple event; copying
+ * it back into Google would create a genuine duplicate there. Apple UIDs are RFC 5545
+ * UIDs and survive that sync unchanged, so they match Google's iCalUID exactly.
  */
 export async function mirrorToGoogle(db: Db, secrets: SecretStore, dateISO: string): Promise<MirrorResult> {
   if (!DATE_ISO_RE.test(dateISO)) throw new AppleCalError("script", `bad date: ${dateISO}`);
@@ -392,7 +512,8 @@ export async function mirrorToGoogle(db: Db, secrets: SecretStore, dateISO: stri
     throw new AppleCalError("unavailable", "Connect Google Calendar first — the mirror needs somewhere to write.");
   }
 
-  const appleEvents = await readAppleEvents(dateISO, { force: true });
+  const appleEvents = await readAppleEvents(dateISO, { force: true, exclude: excludedCalendarNames(db) });
+  const knownToGoogle = await googleICalUids(db, secrets, dateISO);
   const calId = await ensureAppleMirrorCalendar(db, secrets);
 
   // Hard guard: only ever the dedicated mirror calendar. Never primary, never POS — Planned.
@@ -421,9 +542,16 @@ export async function mirrorToGoogle(db: Db, secrets: SecretStore, dateISO: stri
 
   let created = 0;
   let updated = 0;
+  let skipped = 0;
   const seen = new Set<string>();
 
   for (const ev of appleEvents) {
+    // This event came FROM Google (or POS) — Google already has it under this UID.
+    // Mirroring it would be a second copy of the same event in the same account.
+    if (knownToGoogle.has(ev.uid)) {
+      skipped++;
+      continue;
+    }
     seen.add(ev.uid);
     const endMin = ev.endMin > ev.startMin ? ev.endMin : ev.startMin + 15;
     const body: calendar_v3.Schema$Event = {
@@ -443,7 +571,9 @@ export async function mirrorToGoogle(db: Db, secrets: SecretStore, dateISO: stri
     }
   }
 
-  // deletions propagate: anything we previously mirrored that Apple no longer has
+  // Deletions propagate: anything we previously mirrored that the (filtered) Apple set
+  // no longer contains. That covers events deleted in Apple, calendars the user
+  // excluded, and stale duplicates an earlier run mirrored before the UID check existed.
   let deleted = 0;
   for (const [uid, googleId] of byUid) {
     if (seen.has(uid)) continue;
@@ -455,5 +585,5 @@ export async function mirrorToGoogle(db: Db, secrets: SecretStore, dateISO: stri
     }
   }
 
-  return { created, updated, deleted, events: appleEvents.length, calendarId: calId };
+  return { created, updated, deleted, skipped, events: appleEvents.length, calendarId: calId };
 }

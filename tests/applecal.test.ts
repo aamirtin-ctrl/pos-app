@@ -12,6 +12,10 @@ import {
   appleBlockType,
   classifyOsaError,
   buildEventsScript,
+  filterAppleEvents,
+  isPosAuthoredCalendar,
+  parseExcludedCalendars,
+  parseCalendarNames,
   type AppleEvent,
 } from "../main/applecal.ts";
 
@@ -188,5 +192,102 @@ describe("buildEventsScript", () => {
   it("rejects a non-ISO date instead of interpolating it", () => {
     expect(() => buildEventsScript("08/04/2026")).toThrow();
     expect(() => buildEventsScript('2026-08-04" & (do shell script "id")')).toThrow();
+  });
+
+  it("skips POS's own calendars inside the scan, before the expensive whose clause", () => {
+    const s = buildEventsScript("2026-08-04");
+    // em dash by code point: osascript's source encoding is not guaranteed to be UTF-8
+    expect(s).toContain('set posPrefix to "POS " & (character id 8212) & " "');
+    expect(s.indexOf("if cname starts with posPrefix")).toBeLessThan(s.indexOf("every event of c whose"));
+  });
+
+  it("embeds the excluded calendar names as an AppleScript list", () => {
+    const s = buildEventsScript("2026-08-04", ["Holidays", "Siri Suggestions"]);
+    expect(s).toContain('set skipNames to {"Holidays", "Siri Suggestions"}');
+  });
+
+  it("emits an empty list when nothing is excluded, and drops blank names", () => {
+    expect(buildEventsScript("2026-08-04")).toContain("set skipNames to {}");
+    expect(buildEventsScript("2026-08-04", ["  ", ""])).toContain("set skipNames to {}");
+  });
+
+  it("escapes quotes in a calendar name instead of breaking out of the string", () => {
+    const s = buildEventsScript("2026-08-04", ['Bad" & (do shell script "id") & "']);
+    expect(s).toContain('\\"');
+    expect(s).not.toContain('do shell script "id"');
+  });
+});
+
+describe("isPosAuthoredCalendar", () => {
+  it("recognises the calendars POS writes itself", () => {
+    expect(isPosAuthoredCalendar("POS — Planned")).toBe(true);
+    expect(isPosAuthoredCalendar("POS — Apple")).toBe(true);
+    expect(isPosAuthoredCalendar("  POS — Anything  ")).toBe(true);
+  });
+
+  it("does not claim unrelated calendars", () => {
+    expect(isPosAuthoredCalendar("Work")).toBe(false);
+    expect(isPosAuthoredCalendar("POSitive vibes")).toBe(false); // no em dash
+    expect(isPosAuthoredCalendar("POS - Planned")).toBe(false); // hyphen, not em dash
+    expect(isPosAuthoredCalendar("")).toBe(false);
+  });
+});
+
+describe("parseExcludedCalendars", () => {
+  it("splits the comma-separated setting and trims", () => {
+    expect(parseExcludedCalendars("Holidays, Birthdays ,Siri Suggestions")).toEqual([
+      "Holidays",
+      "Birthdays",
+      "Siri Suggestions",
+    ]);
+  });
+
+  it("defaults to nothing excluded", () => {
+    expect(parseExcludedCalendars(null)).toEqual([]);
+    expect(parseExcludedCalendars(undefined)).toEqual([]);
+    expect(parseExcludedCalendars("")).toEqual([]);
+    expect(parseExcludedCalendars(" , , ")).toEqual([]);
+  });
+});
+
+describe("filterAppleEvents", () => {
+  const stdout = [
+    row("A", "Standup", "2026-08-04T09:00:00", "2026-08-04T09:15:00", "Work"),
+    row("B", "Deep work", "2026-08-04T10:00:00", "2026-08-04T12:00:00", "POS — Planned"),
+    row("C", "Dentist", "2026-08-04T15:00:00", "2026-08-04T16:00:00", "POS — Apple"),
+    row("D", "Eid", "2026-08-04T00:00:00", "2026-08-04T23:59:59", "Holidays"),
+  ].join("\n");
+  const events = parseAppleEvents(stdout);
+
+  it("excludes POS's own mirror calendars, so our output never re-enters as input", () => {
+    expect(filterAppleEvents(events).map((e) => e.uid)).toEqual(["A", "D"]);
+  });
+
+  it("also excludes the calendars named in the settings list", () => {
+    expect(filterAppleEvents(events, ["Holidays"]).map((e) => e.uid)).toEqual(["A"]);
+  });
+
+  it("matches excluded names case-insensitively and ignores whitespace", () => {
+    expect(filterAppleEvents(events, [" holidays "]).map((e) => e.uid)).toEqual(["A"]);
+  });
+
+  it("keeps everything when nothing is excluded and no POS calendar is present", () => {
+    const clean = parseAppleEvents(row("A", "Standup", "2026-08-04T09:00:00", "2026-08-04T09:15:00", "Work"));
+    expect(filterAppleEvents(clean, [])).toHaveLength(1);
+    expect(filterAppleEvents([], ["Work"])).toEqual([]);
+  });
+});
+
+describe("parseCalendarNames", () => {
+  it("splits on linefeed so a name containing a comma survives", () => {
+    expect(parseCalendarNames("Work\nHome, Family\nHolidays")).toEqual(["Work", "Home, Family", "Holidays"]);
+  });
+
+  it("hides POS's own calendars and de-dupes, dropping blank lines", () => {
+    expect(parseCalendarNames("Work\r\nPOS — Apple\n\nWork\nPOS — Planned\n")).toEqual(["Work"]);
+  });
+
+  it("returns an empty list for empty output", () => {
+    expect(parseCalendarNames("")).toEqual([]);
   });
 });

@@ -9,9 +9,9 @@ import { parseBraindump } from "./engine/parse.ts";
 import { solve, ENGINE_VERSION, type PlannerTask } from "./engine/solver.ts";
 import type { Anchor } from "./engine/grid.ts";
 import { narrate } from "./engine/narrate.ts";
-import { readAnchors } from "./gcal/sync.ts";
+import { readAnchors, mergeCalendarSources, type MergeableGoogleAnchor, type MergeableAppleEvent } from "./gcal/sync.ts";
 import { isGoogleConnected } from "./gcal/auth.ts";
-import { readAppleEvents, appleBlockType } from "./applecal.ts";
+import { readAppleEvents, appleBlockType, excludedCalendarNames } from "./applecal.ts";
 
 const toIso = (dateISO: string, min: number) =>
   `${dateISO}T${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}:00`;
@@ -60,11 +60,10 @@ export async function generatePlan(
 
   // anchors: external GCal events + locked blocks from prior plans for this date
   const anchors: Anchor[] = [];
+  const googleAnchors: MergeableGoogleAnchor[] = [];
   if (isGoogleConnected(secrets)) {
     try {
-      for (const a of await readAnchors(db, secrets, dateISO)) {
-        anchors.push({ startMin: a.startMin, endMin: a.endMin, blockType: a.blockType, title: a.title });
-      }
+      googleAnchors.push(...(await readAnchors(db, secrets, dateISO)));
     } catch (e) {
       console.warn(`gcal anchors unavailable: ${(e as Error).message}`);
     }
@@ -72,23 +71,28 @@ export async function generatePlan(
 
   // Apple Calendar (Calendar.app) events anchor the day too, so a Mac-only event still
   // blocks time in POS. Best-effort: a missing permission must never break planning.
+  const appleEvents: MergeableAppleEvent[] = [];
   try {
-    for (const ev of await readAppleEvents(dateISO)) {
+    for (const ev of await readAppleEvents(dateISO, { exclude: excludedCalendarNames(db) })) {
       if (ev.allDay) continue; // same rule as the Google path — all-day never blocks
-      // an event synced to both Apple and Google must only block once
-      const dupe = anchors.some(
-        (a) => a.startMin === ev.startMin && a.endMin === ev.endMin && a.title === ev.title
-      );
-      if (dupe) continue;
-      anchors.push({
+      appleEvents.push({
+        uid: ev.uid,
+        title: ev.title,
         startMin: ev.startMin,
         endMin: ev.endMin,
         blockType: appleBlockType(ev.title, ev.calendar),
-        title: ev.title,
       });
     }
   } catch (e) {
     console.warn(`apple calendar anchors unavailable: ${(e as Error).message}`);
+  }
+
+  // One event living in two systems must block the day exactly once. The join is the
+  // RFC 5545 UID, which survives cross-system sync — so a renamed or rescheduled event
+  // is still recognised as the same event.
+  const merged = mergeCalendarSources(googleAnchors, appleEvents);
+  for (const a of merged.anchors) {
+    anchors.push({ startMin: a.startMin, endMin: a.endMin, blockType: a.blockType, title: a.title });
   }
 
   const lockedRows = db

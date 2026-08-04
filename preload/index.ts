@@ -56,6 +56,7 @@ contextBridge.exposeInMainWorld("pos", {
   gcal: { connect: call("gcal.connect"), cancel: call("gcal.cancel"), connected: call("gcal.connected"), reconcile: call("gcal.reconcile"), events: call("gcal.events") },
   applecal: {
     available: call("applecal.available"),
+    calendars: call("applecal.calendars"),
     events: call("applecal.events"),
     mirror: call("applecal.mirror"),
   },
