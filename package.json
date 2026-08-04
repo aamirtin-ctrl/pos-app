@@ -28,6 +28,7 @@
     "js-yaml": "^4.1.0",
     "mailparser": "^3.9.9",
     "node-cron": "^3.0.3",
+    "nodemailer": "^9.0.4",
     "sqlite-vec": "^0.1.6",
     "zod": "^3.24.1"
   },
@@ -37,6 +38,7 @@
     "@types/js-yaml": "^4.0.9",
     "@types/mailparser": "^3.4.6",
     "@types/node": "^22",
+    "@types/nodemailer": "^8.0.1",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^4.3.4",

@@ -23,8 +23,11 @@ contextBridge.exposeInMainWorld("pos", {
   commitments: {
     list: call("commitments.list"),
     schedule: call("commitments.schedule"),
+    updateText: call("commitments.updateText"),
     confirm: call("commitments.confirm"),
     drop: call("commitments.drop"),
+    toTask: call("commitments.toTask"),
+    toEvent: call("commitments.toEvent"),
   },
   tasks: {
     braindump: call("tasks.braindump"),
@@ -73,6 +76,12 @@ contextBridge.exposeInMainWorld("pos", {
   msgplans: { run: call("msgplans.run"), list: call("msgplans.list") },
   assistant: { command: call("assistant.command") },
   stt: { transcribe: call("stt.transcribe") },
+  inbox: {
+    list: call("inbox.list"),
+    sendEmail: call("inbox.sendEmail"),
+    sendIMessage: call("inbox.sendIMessage"),
+    handles: call("inbox.handles"),
+  },
   drafts: { list: call("drafts.list"), generate: call("drafts.generate"), setStatus: call("drafts.setStatus") },
   voice: { synthesize: call("voice.synthesize"), get: call("voice.get") },
   app: { openFullDiskAccess: call("app.openFullDiskAccess"), openLinkedIn: call("app.openLinkedIn") },

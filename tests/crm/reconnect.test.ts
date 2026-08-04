@@ -28,14 +28,16 @@ afterEach(() => {
 
 describe("refreshNextTouch", () => {
   it("sets next_touch_due_at = last_contact_at + tier threshold", () => {
-    expect(TIER_DAYS).toEqual({ 0: 14, 1: 30, 2: 90, 3: Infinity });
+    expect(TIER_DAYS).toEqual({ 0: 90, 1: 90, 2: 120, 3: Infinity });
+    // owner rule: never suggest reconnecting before 3 months
+    for (const [t, d] of Object.entries(TIER_DAYS)) if (t !== "3") expect(d).toBeGreaterThanOrEqual(90);
     const inner = addPerson("Inner", 0, "2026-07-01 00:00:00");
     const network = addPerson("Network", 2, "2026-07-01 00:00:00");
     refreshNextTouch(db);
     const get = (id: number) =>
       (db.prepare("SELECT next_touch_due_at n FROM person WHERE id = ?").get(id) as { n: string | null }).n;
-    expect(get(inner)).toBe("2026-07-15 00:00:00");
-    expect(get(network)).toBe("2026-09-29 00:00:00");
+    expect(get(inner)).toBe("2026-09-29 00:00:00");
+    expect(get(network)).toBe("2026-10-29 00:00:00");
   });
 
   it("tier 3 and never-contacted persons get NULL", () => {
@@ -52,17 +54,17 @@ describe("refreshNextTouch", () => {
 describe("reconnectDue", () => {
   it("lists overdue persons ordered by tier, then most overdue", () => {
     // NOW = 2026-08-03. Overdue: inner (due 07-15), two network people with different lateness.
-    addPerson("Inner Overdue", 0, "2026-07-01 00:00:00"); // due 07-15, 19d overdue
-    addPerson("Network Barely", 2, "2026-05-01 00:00:00"); // due 07-30, 4d overdue
-    addPerson("Network Very", 2, "2026-03-01 00:00:00"); // due 05-30, 65d overdue
+    addPerson("Inner Overdue", 0, "2026-04-01 00:00:00"); // due 06-30, 34d overdue
+    addPerson("Network Barely", 2, "2026-03-30 00:00:00"); // due 07-28, 6d overdue
+    addPerson("Network Very", 2, "2026-01-01 00:00:00"); // due 05-01, 94d overdue
     addPerson("Active Fresh", 1, "2026-07-20 00:00:00"); // due 08-19, not yet
     addPerson("Archive", 3, "2020-01-01 00:00:00"); // tier 3 never surfaces
     refreshNextTouch(db);
 
     const due = reconnectDue(db, NOW);
     expect(due.map((p) => p.display_name)).toEqual(["Inner Overdue", "Network Very", "Network Barely"]);
-    expect(due[0].overdue_days).toBe(19);
-    expect(due[1].overdue_days).toBe(65);
+    expect(due[0].overdue_days).toBe(34);
+    expect(due[1].overdue_days).toBe(94);
   });
 
   it("excludes stale-dismissed persons (indefinite and future snooze), keeps expired snoozes", () => {

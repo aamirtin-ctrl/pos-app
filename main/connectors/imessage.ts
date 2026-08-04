@@ -40,7 +40,7 @@ import {
 // node:sqlite is built into Node 22+; use a minimal local surface so compilation doesn't
 // depend on experimental typings (same approach as the source connector).
 interface SqliteStatement {
-  setReadBigInts(enabled: boolean): void;
+  safeIntegers(enabled: boolean): void;
   all(...params: unknown[]): unknown[];
 }
 interface SqliteDatabase {

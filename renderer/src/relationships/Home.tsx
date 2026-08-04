@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 // Relationships dashboard: query hero → ranked results, plus the two standing
 // panels — Reconnect (cadence debt) and Commitments (extracted obligations).
@@ -175,14 +175,53 @@ function CommitmentList({
   act: (fn: () => Promise<unknown>) => Promise<void>;
 }) {
   const [menu, setMenu] = useState<{ x: number; y: number; id: number } | null>(null);
+  const [swiped, setSwiped] = useState<number | null>(null); // row with Delete revealed
+  const wheelAcc = useRef(0);
+  const [editing, setEditing] = useState<{ id: number; text: string } | null>(null);
+  const [addedIds, setAddedIds] = useState<Set<number>>(new Set());
+  const [notice, setNotice] = useState<string | null>(null);
+  const [eventPicker, setEventPicker] = useState<{ id: number; date: string; time: string } | null>(null);
   useEffect(() => {
     const close = () => setMenu(null);
     window.addEventListener("click", close);
     return () => window.removeEventListener("click", close);
   }, []);
+
+  const markAdded = async (id: number) => {
+    setAddedIds((prev) => new Set(prev).add(id));
+    await new Promise((r) => setTimeout(r, 700)); // let "Added" show before the row refetches away
+    await act(async () => {});
+  };
+
+  const addTask = async (id: number) => {
+    const r = await window.pos.commitments.toTask(id);
+    if (!r.ok) { setNotice(r.error ?? "could not add task"); return; }
+    const d = r.data as { google?: boolean; reason?: string };
+    setNotice(d.google === false ? "Task added locally; connect Google to sync." : null);
+    await markAdded(id);
+  };
+
+  const addEvent = async (id: number, dateISO?: string, hhmm?: string) => {
+    const r = await window.pos.commitments.toEvent(id, dateISO, hhmm);
+    if (!r.ok) { setNotice(r.error ?? "could not add event"); return; }
+    const d = r.data as { needsDate?: boolean };
+    if (d.needsDate) {
+      const t = new Date(Date.now() + 24 * 60 * 60_000);
+      const pad = (n: number) => String(n).padStart(2, "0");
+      setEventPicker({ id, date: `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}`, time: "10:00" });
+      return;
+    }
+    setEventPicker(null);
+    setNotice(null);
+    await markAdded(id);
+  };
+
   if (rows.length === 0) return null;
   return (
     <div className="space-y-1.5">
+      {notice && (
+        <div className="text-[11px] px-0.5" style={{ color: "var(--muted)" }}>{notice}</div>
+      )}
       {menu && (
         <div className="fixed z-50 rounded-lg border bg-white shadow-lg py-1 text-sm"
           style={{ left: menu.x, top: menu.y, borderColor: "var(--line)" }}>
@@ -195,9 +234,41 @@ function CommitmentList({
       {rows.map((c) => {
         const person = c.person_id != null ? peopleById.get(c.person_id) : undefined;
         return (
-          <div key={c.id} className="rounded-md border bg-white px-2.5 py-2" style={{ borderColor: "var(--line)" }}
+          <div key={c.id} className="relative overflow-hidden rounded-md">
+          <button
+            onClick={() => { setSwiped(null); act(() => window.pos.commitments.drop(c.id)); }}
+            className="absolute inset-y-0 right-0 w-20 text-xs font-medium text-white"
+            style={{ background: "var(--danger)" }}
+          >
+            Delete
+          </button>
+          <div className="rounded-md border bg-white px-2.5 py-2 transition-transform duration-150"
+            style={{ borderColor: "var(--line)", transform: swiped === c.id ? "translateX(-80px)" : "translateX(0)" }}
+            onWheel={(e) => {
+              if (Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
+              wheelAcc.current += e.deltaX;
+              if (wheelAcc.current > 60) { setSwiped(c.id); wheelAcc.current = 0; }
+              else if (wheelAcc.current < -60) { setSwiped(null); wheelAcc.current = 0; }
+            }}
+            onClick={() => swiped === c.id && setSwiped(null)}
             onContextMenu={(e) => { e.preventDefault(); setMenu({ x: e.clientX, y: e.clientY, id: c.id }); }}>
-            <div className="text-sm leading-snug">{c.description}</div>
+            {editing?.id === c.id ? (
+              <input
+                autoFocus
+                value={editing.text}
+                onChange={(e) => setEditing({ id: c.id, text: e.target.value })}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") { const t = editing.text; setEditing(null); act(() => window.pos.commitments.updateText(c.id, t)); }
+                  if (e.key === "Escape") setEditing(null);
+                }}
+                onBlur={() => { const t = editing.text; setEditing(null); act(() => window.pos.commitments.updateText(c.id, t)); }}
+                className="w-full text-sm border rounded px-1 py-0.5"
+                style={{ borderColor: "var(--accent-soft)" }}
+              />
+            ) : (
+              <div className="text-sm leading-snug cursor-text" title="Double-click to edit"
+                onDoubleClick={() => setEditing({ id: c.id, text: c.description })}>{c.description}</div>
+            )}
             <div className="flex items-center gap-2 mt-1 text-[11px]" style={{ color: "var(--muted)" }}>
               {person && (
                 <a href={`#/contact/${person.id}`} className="underline decoration-dotted" style={{ color: "var(--muted)" }}>
@@ -207,25 +278,81 @@ function CommitmentList({
               <span>{c.direction === "they_owe_me" ? "they owe me" : "I owe them"}</span>
               {c.due_at && <span>due {c.due_at.slice(0, 10)}</span>}
               <span className="tabular-nums">conf {Math.round(c.confidence * 100)}%</span>
-              {c.confirmed_by_user === 0 && (
-                <span className="ml-auto flex gap-1">
-                  <button
-                    onClick={() => act(() => window.pos.commitments.confirm(c.id))}
-                    className="px-1.5 py-0.5 rounded border hover:bg-white"
-                    style={{ borderColor: "var(--line)", color: "var(--accent)" }}
-                  >
-                    Confirm
-                  </button>
-                  <button
-                    onClick={() => act(() => window.pos.commitments.drop(c.id))}
-                    className="px-1.5 py-0.5 rounded border hover:bg-white"
-                    style={{ borderColor: "var(--line)", color: "var(--danger)" }}
-                  >
-                    Drop
-                  </button>
-                </span>
-              )}
+              <span className="ml-auto flex gap-1">
+                {addedIds.has(c.id) ? (
+                  <span className="px-1.5 py-0.5" style={{ color: "var(--accent)" }}>Added</span>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => addTask(c.id)}
+                      className="px-1.5 py-0.5 rounded border hover:bg-white"
+                      style={{ borderColor: "var(--line)", color: "var(--accent)" }}
+                    >
+                      Add task
+                    </button>
+                    <button
+                      onClick={() => addEvent(c.id)}
+                      className="px-1.5 py-0.5 rounded border hover:bg-white"
+                      style={{ borderColor: "var(--line)", color: "var(--muted)" }}
+                    >
+                      Add event
+                    </button>
+                  </>
+                )}
+                {c.confirmed_by_user === 0 && (
+                  <>
+                    <button
+                      onClick={() => act(() => window.pos.commitments.confirm(c.id))}
+                      className="px-1.5 py-0.5 rounded border hover:bg-white"
+                      style={{ borderColor: "var(--line)", color: "var(--accent)" }}
+                    >
+                      Confirm
+                    </button>
+                    <button
+                      onClick={() => act(() => window.pos.commitments.drop(c.id))}
+                      className="px-1.5 py-0.5 rounded border hover:bg-white"
+                      style={{ borderColor: "var(--line)", color: "var(--danger)" }}
+                    >
+                      Drop
+                    </button>
+                  </>
+                )}
+              </span>
             </div>
+            {eventPicker?.id === c.id && (
+              <div className="flex items-center gap-1.5 mt-1.5 text-[11px]" style={{ color: "var(--muted)" }}>
+                <span>No due date — pick one:</span>
+                <input
+                  type="date"
+                  value={eventPicker.date}
+                  onChange={(e) => setEventPicker({ ...eventPicker, date: e.target.value })}
+                  className="px-1 py-0.5 rounded border bg-white"
+                  style={{ borderColor: "var(--line)", color: "var(--ink)" }}
+                />
+                <input
+                  type="time"
+                  value={eventPicker.time}
+                  onChange={(e) => setEventPicker({ ...eventPicker, time: e.target.value })}
+                  className="px-1 py-0.5 rounded border bg-white"
+                  style={{ borderColor: "var(--line)", color: "var(--ink)" }}
+                />
+                <button
+                  onClick={() => addEvent(c.id, eventPicker.date, eventPicker.time)}
+                  className="px-1.5 py-0.5 rounded border hover:bg-white"
+                  style={{ borderColor: "var(--line)", color: "var(--accent)" }}
+                >
+                  Create
+                </button>
+                <button
+                  onClick={() => setEventPicker(null)}
+                  className="px-1.5 py-0.5 rounded border hover:bg-white"
+                  style={{ borderColor: "var(--line)", color: "var(--muted)" }}
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+          </div>
           </div>
         );
       })}

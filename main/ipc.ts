@@ -16,6 +16,7 @@ import * as planner from "./planner.ts";
 import { handleCommand } from "./assistant.ts";
 import { transcribe } from "./stt.ts";
 import { generateDrafts, listDrafts, setDraftStatus, synthesizeVoices, getVoices } from "./crm/drafts.ts";
+import { listInbox, sendEmail, sendIMessage, personHandles, type SendEmailArgs, type SendIMessageArgs } from "./messaging.ts";
 import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learning.ts";
 import { runSync, syncStatus } from "./workers.ts";
 import { listMsgPlans } from "./msgplans.ts";
@@ -91,6 +92,12 @@ export function registerIpc(deps: IpcDeps) {
   h("commitments.list", (status?: string) => listCommitments(db, status));
   h("commitments.confirm", (id: number) => confirmCommitment(db, id));
   h("commitments.drop", (id: number) => dropCommitment(db, id));
+  h("commitments.updateText", (id: number, description: string) => {
+    if (!description?.trim()) throw new Error("empty description");
+    // editing the text is confirmation — the user touched it, so it's real
+    db.prepare("UPDATE commitment SET description = ?, confirmed_by_user = 1 WHERE id = ?").run(description.trim(), id);
+    return { saved: true };
+  });
   // right-click → schedule: commitment becomes a task on today's plan date
   h("commitments.schedule", (id: number) => {
     const c = db.prepare("SELECT id, description, due_at FROM commitment WHERE id = ?").get(id) as
@@ -104,6 +111,51 @@ export function registerIpc(deps: IpcDeps) {
     ).run(c.description.slice(0, 120), c.id, today, c.due_at);
     db.prepare("UPDATE commitment SET status = 'scheduled' WHERE id = ?").run(id);
     return { scheduled: true };
+  });
+  // "Add task" button: confirm if needed, create the local task, then push to Google Tasks now.
+  h("commitments.toTask", async (id: number) => {
+    const c = db.prepare("SELECT id, description, due_at, confirmed_by_user FROM commitment WHERE id = ?").get(id) as
+      | { id: number; description: string; due_at: string | null; confirmed_by_user: number } | undefined;
+    if (!c) throw new Error("commitment not found");
+    if (c.confirmed_by_user === 0) confirmCommitment(db, id);
+    const today = new Date().toISOString().slice(0, 10);
+    const due = c.due_at ? c.due_at.slice(0, 10) : null;
+    const planDate = due && due > today ? due : today;
+    db.prepare(
+      `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
+        commitment_id, status, plan_date, hard_deadline_at, estimate_source)
+       VALUES (?, 'admin', 2, 30, 30, ?, 'inbox', ?, ?, 'inferred')`
+    ).run(c.description.slice(0, 120), c.id, planDate, c.due_at);
+    db.prepare("UPDATE commitment SET status = 'scheduled' WHERE id = ?").run(id);
+    if (!isGoogleConnected(secrets)) return { task: true, google: false, reason: "Google not connected" };
+    try {
+      const res = await pushTasks(db, secrets);
+      return { task: true, google: true, ...res };
+    } catch (err) {
+      return { task: true, google: false, reason: (err as Error).message };
+    }
+  });
+  // "Add event" button: pin a 60-min personal block on the due date at 10:00.
+  // Without a due date the renderer supplies dateISO ("YYYY-MM-DD") + hhmm ("HH:MM").
+  h("commitments.toEvent", (id: number, dateISO?: string, hhmm?: string) => {
+    const c = db.prepare("SELECT id, description, due_at FROM commitment WHERE id = ?").get(id) as
+      | { id: number; description: string; due_at: string | null } | undefined;
+    if (!c) throw new Error("commitment not found");
+    const date = dateISO || (c.due_at ? c.due_at.slice(0, 10) : null);
+    if (!date) return { needsDate: true };
+    const time = hhmm && /^\d{2}:\d{2}$/.test(hhmm) ? hhmm : "10:00";
+    const startsAt = `${date}T${time}:00`;
+    const start = new Date(startsAt);
+    if (Number.isNaN(start.getTime())) throw new Error("invalid date/time");
+    const end = new Date(start.getTime() + 60 * 60_000);
+    const pad2 = (n: number) => String(n).padStart(2, "0");
+    const endsAt = `${end.getFullYear()}-${pad2(end.getMonth() + 1)}-${pad2(end.getDate())}T${pad2(end.getHours())}:${pad2(end.getMinutes())}:00`;
+    db.prepare(
+      `INSERT INTO block (task_id, block_type, title, starts_at, ends_at, is_anchor, is_locked, plan_id)
+       VALUES (NULL, 'personal', ?, ?, ?, 0, 1, NULL)`
+    ).run(c.description.slice(0, 120), startsAt, endsAt);
+    db.prepare("UPDATE commitment SET status = 'scheduled' WHERE id = ?").run(id);
+    return { event: true, starts_at: startsAt };
   });
 
   // ── planner ──
@@ -185,6 +237,13 @@ export function registerIpc(deps: IpcDeps) {
   // Manual trigger; the same connector also runs on the 15-min cron.
   h("msgplans.run", () => runSync(db, secrets, deps.llm(), "msgplans"));
   h("msgplans.list", () => listMsgPlans(db));
+
+  // ── unified inbox ──
+  h("inbox.list", (opts?: { limit?: number }) => listInbox(db, opts ?? {}));
+  // Both send paths are user-initiated only (explicit Send click in the renderer).
+  h("inbox.sendEmail", (args: SendEmailArgs) => sendEmail(db, secrets, args));
+  h("inbox.sendIMessage", (args: SendIMessageArgs) => sendIMessage(db, args));
+  h("inbox.handles", (personId: number) => personHandles(db, personId));
 
   // ── messaging drafts + voices ──
   h("drafts.list", () => listDrafts(db));

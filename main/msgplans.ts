@@ -60,7 +60,7 @@ import { deleteMessagesEvent, upsertMessagesEvent } from "./gcal/sync.ts";
 // node:sqlite minimal surface (same approach as the imessage connector / capture.ts —
 // no dependency on experimental typings).
 interface SqliteStatement {
-  setReadBigInts(enabled: boolean): void;
+  safeIntegers(enabled: boolean): void;
   all(...params: unknown[]): unknown[];
 }
 interface SqliteDatabase {

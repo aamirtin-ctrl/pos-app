@@ -1,10 +1,10 @@
 // Reconnect cadence. Tier thresholds decide how long a relationship can go quiet before it
-// surfaces: 0=inner 14d, 1=active 30d, 2=network 90d, 3=archive never. Dismissals (kind
+// surfaces — owner rule 2026-08-04: never nag before 3 months, any tier. Dismissals (kind
 // 'stale') suppress a person indefinitely (snooze_until NULL) or until the snooze expires.
 
 import type { Db } from "../db/db.ts";
 
-export const TIER_DAYS: Record<number, number> = { 0: 14, 1: 30, 2: 90, 3: Infinity };
+export const TIER_DAYS: Record<number, number> = { 0: 90, 1: 90, 2: 120, 3: Infinity };
 
 export interface ReconnectRow {
   id: number;

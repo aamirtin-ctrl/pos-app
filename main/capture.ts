@@ -36,7 +36,7 @@ const req: ReturnType<typeof createRequire> =
 
 // node:sqlite minimal surface (same approach as the imessage connector — no experimental typings).
 interface SqliteStatement {
-  setReadBigInts(enabled: boolean): void;
+  safeIntegers(enabled: boolean): void;
   all(...params: unknown[]): unknown[];
 }
 interface SqliteDatabase {
