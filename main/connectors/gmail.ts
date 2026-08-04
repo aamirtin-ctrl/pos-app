@@ -33,7 +33,7 @@ const FIRST_RUN_MONTHS = 12;
 
 // ── account store ────────────────────────────────────────────────────────────
 
-export type MailProvider = "gmail" | "outlook" | "imap";
+export type MailProvider = "gmail" | "outlook" | "icloud" | "imap";
 
 export interface MailAccount {
   id: string;
@@ -50,6 +50,7 @@ const MAIL_ACCOUNTS_SECRET = "MAIL_ACCOUNTS";
 const PROVIDER_PRESETS: Record<MailProvider, { host: string; port: number; sentFolder: string }> = {
   gmail: { host: "imap.gmail.com", port: 993, sentFolder: "[Gmail]/Sent Mail" },
   outlook: { host: "outlook.office365.com", port: 993, sentFolder: "Sent" },
+  icloud: { host: "imap.mail.me.com", port: 993, sentFolder: "Sent Messages" },
   imap: { host: "", port: 993, sentFolder: "Sent" },
 };
 
@@ -66,7 +67,7 @@ function readStoredAccounts(secrets: SecretsLike): MailAccount[] {
       (a): a is MailAccount =>
         !!a && typeof a === "object" &&
         typeof a.id === "string" &&
-        (a.provider === "gmail" || a.provider === "outlook" || a.provider === "imap") &&
+        (a.provider === "gmail" || a.provider === "outlook" || a.provider === "icloud" || a.provider === "imap") &&
         typeof a.user === "string" &&
         typeof a.password === "string" &&
         typeof a.host === "string" &&

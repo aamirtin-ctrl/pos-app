@@ -569,7 +569,7 @@ function EmailAccountsCard({
         "Visit myaccount.google.com/apppasswords.",
         'Create an app password named "POS".',
         "Enter your Gmail address and that 16-character password below.",
-        "Outlook: enable 2FA at account.microsoft.com/security, then create an app password.",
+        "Outlook: enable 2FA at account.microsoft.com/security, then create an app password. iCloud: create an app-specific password at account.apple.com under Sign-In and Security.",
       ]}
     >
       {accounts == null ? (
@@ -611,6 +611,7 @@ function EmailAccountsCard({
           >
             <option value="gmail">Gmail</option>
             <option value="outlook">Outlook</option>
+              <option value="icloud">iCloud</option>
             <option value="imap">Custom IMAP</option>
           </select>
           <input
