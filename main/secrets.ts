@@ -86,5 +86,6 @@ export const SECRET_NAMES = [
   "GOOGLE_OAUTH_CLIENT_ID",
   "GOOGLE_OAUTH_CLIENT_SECRET",
   "GOOGLE_OAUTH_TOKENS",
+  "NOTION_TOKEN",
 ] as const;
 export type SecretName = (typeof SECRET_NAMES)[number];

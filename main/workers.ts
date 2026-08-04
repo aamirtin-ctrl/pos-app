@@ -19,6 +19,7 @@ import { syncLinkedinEmail } from "./connectors/linkedin-email.ts";
 import { syncMailfile } from "./connectors/mailfile.ts";
 import { runCapture } from "./capture.ts";
 import { runMsgPlans } from "./msgplans.ts";
+import { syncNotion, notionConfigured } from "./notion.ts";
 import { getSetting } from "./db/db.ts";
 
 // node-cron ships no type declarations — minimal local surface via createRequire.
@@ -38,7 +39,8 @@ export type SyncSource =
   | "linkedin-email"
   | "mailfile"
   | "capture"
-  | "msgplans";
+  | "msgplans"
+  | "notion";
 
 /** `extra` = LinkedIn export folder / mailfile path (unused by gmail/imessage). */
 export type ConnectorFn = (deps: ConnectorDeps, extra?: string) => Promise<SyncReport>;
@@ -64,6 +66,13 @@ const CONNECTORS: Record<SyncSource, ConnectorFn> = {
   // Plans from messages: scheduling talk in iMessage threads → one event per conversation
   // on the dedicated "POS — From Messages" Google calendar. Never writes anywhere else.
   msgplans: (deps) => runMsgPlans(deps),
+  // Notion: push open tasks/commitments + today's plan up, pull phone-typed inbox
+  // tasks down. `ingested` counts only NEW local tasks pulled, so the 15-min cron
+  // stays quiet on push-only runs.
+  notion: async (deps) => {
+    const c = await syncNotion(deps.db, deps.secrets);
+    return { source: "notion", ingested: c.pulled, skipped: 0, created: 0 };
+  },
 };
 
 /**
@@ -175,6 +184,11 @@ export function startWorkers(
       notify?.(`Plans from messages: ${r.ingested} calendar change${r.ingested === 1 ? "" : "s"}`);
       return;
     }
+    if (r.source === "notion") {
+      // notion counts tasks pulled from the POS Tasks database, not interactions.
+      notify?.(`Notion: pulled ${r.ingested} new task${r.ingested === 1 ? "" : "s"}`);
+      return;
+    }
     const people = r.created > 0 ? `, ${r.created} new ${r.created === 1 ? "person" : "people"}` : "";
     notify?.(`Synced ${r.source}: ${r.ingested} new interaction${r.ingested === 1 ? "" : "s"}${people}`);
   };
@@ -201,6 +215,11 @@ export function startWorkers(
         // Plans from messages. Same precheck (unreadable chat.db / missing FDA is skipped
         // silently); the connector itself reports 'full_disk_access' if it's revoked mid-run.
         announce(await runSync(db, secrets, llm, "msgplans"));
+      }
+      // Notion — gated on token + parent page so an unconfigured integration never
+      // writes error rows to sync_run.
+      if (notionConfigured(db, secrets)) {
+        announce(await runSync(db, secrets, llm, "notion"));
       }
     } catch (e) {
       console.warn(`workers: scheduled sync failed: ${(e as Error).message}`);
@@ -233,7 +252,7 @@ export function syncStatus(db: Db): SourceStatus[] {
   );
   const state = db.prepare("SELECT cursor, last_sync_at FROM sync_state WHERE source = ?");
 
-  return (["gmail", "imessage", "linkedin", "linkedin-email", "mailfile", "msgplans"] as SyncSource[]).map((source) => {
+  return (["gmail", "imessage", "linkedin", "linkedin-email", "mailfile", "msgplans", "notion"] as SyncSource[]).map((source) => {
     const run = lastRun.get(source) as SourceStatus["last_run"] | undefined;
     const st = state.get(source) as { cursor: string | null; last_sync_at: string | null } | undefined;
     return {

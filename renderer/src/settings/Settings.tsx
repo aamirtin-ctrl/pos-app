@@ -223,6 +223,14 @@ function Integrations() {
           open={openCard === "applecal"}
           onToggle={() => toggle("applecal")}
         />
+        <NotionCard
+          present={present}
+          row={syncRow("notion")}
+          open={openCard === "notion"}
+          onToggle={() => toggle("notion")}
+          onKeySaved={refetchKeys}
+          refetchSync={refetchSync}
+        />
         <EmailAccountsCard
           row={syncRow("gmail")}
           open={openCard === "gmail"}
@@ -650,6 +658,175 @@ function AppleCalendarCard({ open, onToggle }: { open: boolean; onToggle: () => 
       <p className="text-[11px] mt-1" style={{ color: "var(--muted)" }}>
         Events that already live in Google are never mirrored twice — POS matches them by their calendar UID.
       </p>
+      {msg && (
+        <p className="text-xs mt-1" style={{ color: err ? "var(--danger)" : "var(--muted)" }}>
+          {msg}
+        </p>
+      )}
+    </IntegrationCard>
+  );
+}
+
+// ── Notion ───────────────────────────────────────────────────────────────────
+
+type NotionTarget = { id: string; title: string; type: "page" | "database" };
+type NotionCounts = { tasks?: number; commitments?: number; journal?: number; pulled?: number };
+
+const NOTION_PARENT_KEY = "notion_parent_page_id";
+
+/**
+ * Notion: three POS databases under one user-picked page, synced both ways every
+ * 15 minutes. Connected = token saved AND a parent page chosen.
+ */
+function NotionCard({
+  present,
+  row,
+  open,
+  onToggle,
+  onKeySaved,
+  refetchSync,
+}: {
+  present: Record<string, boolean>;
+  row: SyncRow;
+  open: boolean;
+  onToggle: () => void;
+  onKeySaved: () => void;
+  refetchSync: () => void;
+}) {
+  const [targets, setTargets] = useState<NotionTarget[] | null>(null);
+  const [parent, setParent] = useState("");
+  const [loadingTargets, setLoadingTargets] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState(false);
+
+  const hasToken = present.NOTION_TOKEN ?? false;
+
+  useEffect(() => {
+    (async () => {
+      const r = await window.pos.settings.get(NOTION_PARENT_KEY);
+      if (r.ok && typeof r.data === "string") setParent(r.data);
+    })();
+  }, []);
+
+  const loadTargets = useCallback(async () => {
+    setLoadingTargets(true);
+    setMsg(null);
+    setErr(false);
+    const r = await window.pos.notion.targets();
+    if (r.ok && Array.isArray(r.data)) setTargets(r.data as NotionTarget[]);
+    else {
+      setErr(true);
+      setMsg(r.error ?? "could not load pages");
+    }
+    setLoadingTargets(false);
+  }, []);
+
+  // Load the picker once the card opens and a token exists.
+  useEffect(() => {
+    if (open && hasToken && targets == null && !loadingTargets) loadTargets();
+  }, [open, hasToken, targets, loadingTargets, loadTargets]);
+
+  const pickParent = async (id: string) => {
+    setParent(id);
+    if (!id) return;
+    const r = await window.pos.notion.setParent(id);
+    if (!r.ok) {
+      setErr(true);
+      setMsg(r.error ?? "could not save the page choice");
+    }
+  };
+
+  const syncNow = async () => {
+    setBusy(true);
+    setMsg(null);
+    setErr(false);
+    const r = await window.pos.notion.sync();
+    if (r.ok) {
+      const d = (r.data ?? {}) as NotionCounts;
+      setMsg(
+        `Pushed ${d.tasks ?? 0} task${d.tasks === 1 ? "" : "s"}, ${d.commitments ?? 0} commitment${d.commitments === 1 ? "" : "s"}, ${d.journal ?? 0} journal — pulled ${d.pulled ?? 0} new task${d.pulled === 1 ? "" : "s"}.`
+      );
+    } else {
+      setErr(true);
+      setMsg(r.error ?? "sync failed");
+    }
+    setBusy(false);
+    refetchSync();
+  };
+
+  const status: IntegrationStatus =
+    hasToken && parent ? "connected" : hasToken ? "ready" : "needs-setup";
+
+  return (
+    <IntegrationCard
+      name="Notion"
+      description="Tasks, commitments, and your daily plan mirror into Notion databases."
+      status={status}
+      open={open}
+      onToggle={onToggle}
+      steps={[
+        "Go to notion.so/my-integrations → New integration (Internal), copy the Secret.",
+        "Paste it below.",
+        "In Notion, open the page that should hold POS's databases → ••• menu → Connections → add your integration.",
+        'Pick that page below — POS creates "POS Tasks", "POS Journal", "POS Commitments" databases inside it and syncs every 15 minutes.',
+      ]}
+    >
+      <div className="mb-3">
+        <KeyRowView
+          row={{ name: "NOTION_TOKEN", present: hasToken }}
+          onSaved={() => {
+            onKeySaved();
+            setTargets(null); // a new token can see different pages — reload the picker
+          }}
+        />
+      </div>
+      {hasToken && (
+        <>
+          <div className="text-xs font-medium mb-1" style={{ color: "var(--ink)" }}>
+            Target page
+          </div>
+          <div className="flex gap-2 mb-2">
+            <select
+              value={parent}
+              onChange={(e) => pickParent(e.target.value)}
+              disabled={loadingTargets}
+              className="flex-1 min-w-0 border rounded-md px-2 py-1 text-sm bg-white"
+              style={{ borderColor: "var(--line)" }}
+            >
+              <option value="">
+                {loadingTargets ? "Loading pages…" : "Choose a page…"}
+              </option>
+              {(targets ?? []).map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.title}
+                  {t.type === "database" ? " (database)" : ""}
+                </option>
+              ))}
+              {parent && targets != null && !targets.some((t) => t.id === parent) && (
+                <option value={parent}>Current page (not visible to this token)</option>
+              )}
+            </select>
+            <button
+              onClick={loadTargets}
+              disabled={loadingTargets}
+              className="px-3 py-1 rounded-md text-sm border bg-white disabled:opacity-40 shrink-0"
+              style={{ borderColor: "var(--line)" }}
+            >
+              Refresh
+            </button>
+          </div>
+          <button
+            onClick={syncNow}
+            disabled={busy || !parent}
+            className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-40"
+            style={{ borderColor: "var(--line)" }}
+          >
+            {busy ? "Syncing…" : "Sync now"}
+          </button>
+          <LastRunLine row={row} />
+        </>
+      )}
       {msg && (
         <p className="text-xs mt-1" style={{ color: err ? "var(--danger)" : "var(--muted)" }}>
           {msg}

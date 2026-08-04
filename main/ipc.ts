@@ -24,6 +24,7 @@ import { listMailAccounts, addMailAccount, removeMailAccount, type MailProvider 
 import { saveDoctrine } from "./engine/doctrine.ts";
 import { runLoopbackAuth, cancelLoopbackAuth, isGoogleConnected, hasGoogleCreds } from "./gcal/auth.ts";
 import { pushPlan, pushTasks, reconcileMovedEvents, readAnchors } from "./gcal/sync.ts";
+import { notionAvailable, searchTargets, syncNotion, PARENT_PAGE_KEY } from "./notion.ts";
 import {
   appleCalendarAvailable,
   readAppleEvents,
@@ -224,6 +225,16 @@ export function registerIpc(deps: IpcDeps) {
   h("gcal.connected", () => ({ connected: isGoogleConnected(secrets), hasCreds: hasGoogleCreds(secrets) }));
   h("gcal.reconcile", () => reconcileMovedEvents(db, secrets));
   h("gcal.events", (dateISO: string) => readAnchors(db, secrets, dateISO));
+
+  // ── notion ──
+  h("notion.available", () => notionAvailable(secrets));
+  h("notion.targets", () => searchTargets(secrets));
+  h("notion.setParent", (pageId: string) => {
+    if (!pageId?.trim()) throw new Error("empty page id");
+    setSetting(db, PARENT_PAGE_KEY, pageId.trim());
+    return { saved: true };
+  });
+  h("notion.sync", () => syncNotion(db, secrets));
 
   // ── apple calendar (Calendar.app) ──
   // available() is also what triggers macOS's Automation permission prompt.
