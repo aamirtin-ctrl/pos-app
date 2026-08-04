@@ -21,6 +21,7 @@ import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { ImapFlow } from "imapflow";
+import { imapTlsOptions } from "./connectors/tls-ca.ts";
 import { simpleParser } from "mailparser";
 import type { Db } from "./db/db.ts";
 import { getSetting } from "./db/db.ts";
@@ -147,6 +148,7 @@ async function captureFromAccount(db: Db, account: MailAccount, batch: CaptureBa
     secure: true,
     auth: { user, pass: account.password },
     logger: false,
+    tls: imapTlsOptions(),
   });
 
   const collected: { text: string; timeMs: number }[] = [];

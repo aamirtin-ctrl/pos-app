@@ -15,6 +15,7 @@
 
 import crypto from "node:crypto";
 import { ImapFlow } from "imapflow";
+import { imapTlsOptions } from "./tls-ca.ts";
 import { simpleParser, type AddressObject, type EmailAddress } from "mailparser";
 import type { SecretStore } from "../secrets.ts";
 import { resolveHandle } from "../crm/identity.ts";
@@ -191,6 +192,7 @@ export async function syncMailAccount(
     secure: true,
     auth: { user, pass: account.password },
     logger: false,
+    tls: imapTlsOptions(),
   });
 
   let matched = 0;

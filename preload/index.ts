@@ -54,6 +54,11 @@ contextBridge.exposeInMainWorld("pos", {
     remove: call("mail.accounts.remove"),
   },
   gcal: { connect: call("gcal.connect"), cancel: call("gcal.cancel"), connected: call("gcal.connected"), reconcile: call("gcal.reconcile"), events: call("gcal.events") },
+  applecal: {
+    available: call("applecal.available"),
+    events: call("applecal.events"),
+    mirror: call("applecal.mirror"),
+  },
   settings: {
     keys: call("settings.keys"),
     setKey: call("settings.setKey"),

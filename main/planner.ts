@@ -11,6 +11,7 @@ import type { Anchor } from "./engine/grid.ts";
 import { narrate } from "./engine/narrate.ts";
 import { readAnchors } from "./gcal/sync.ts";
 import { isGoogleConnected } from "./gcal/auth.ts";
+import { readAppleEvents, appleBlockType } from "./applecal.ts";
 
 const toIso = (dateISO: string, min: number) =>
   `${dateISO}T${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}:00`;
@@ -68,6 +69,28 @@ export async function generatePlan(
       console.warn(`gcal anchors unavailable: ${(e as Error).message}`);
     }
   }
+
+  // Apple Calendar (Calendar.app) events anchor the day too, so a Mac-only event still
+  // blocks time in POS. Best-effort: a missing permission must never break planning.
+  try {
+    for (const ev of await readAppleEvents(dateISO)) {
+      if (ev.allDay) continue; // same rule as the Google path — all-day never blocks
+      // an event synced to both Apple and Google must only block once
+      const dupe = anchors.some(
+        (a) => a.startMin === ev.startMin && a.endMin === ev.endMin && a.title === ev.title
+      );
+      if (dupe) continue;
+      anchors.push({
+        startMin: ev.startMin,
+        endMin: ev.endMin,
+        blockType: appleBlockType(ev.title, ev.calendar),
+        title: ev.title,
+      });
+    }
+  } catch (e) {
+    console.warn(`apple calendar anchors unavailable: ${(e as Error).message}`);
+  }
+
   const lockedRows = db
     .prepare("SELECT block_type, title, starts_at, ends_at FROM block WHERE is_locked = 1 AND date(starts_at) = ?")
     .all(dateISO) as { block_type: string; title: string; starts_at: string; ends_at: string }[];

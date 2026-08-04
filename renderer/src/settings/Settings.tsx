@@ -219,6 +219,10 @@ function Integrations() {
           onToggle={() => toggle("google")}
           onCredsSaved={() => { refetchKeys(); refetchGcal(); }}
         />
+        <AppleCalendarCard
+          open={openCard === "applecal"}
+          onToggle={() => toggle("applecal")}
+        />
         <EmailAccountsCard
           row={syncRow("gmail")}
           open={openCard === "gmail"}
@@ -483,6 +487,104 @@ function GoogleCard({
         </>
       )}
       {msg && <p className="text-xs mt-2" style={{ color: "var(--muted)" }}>{msg}</p>}
+    </IntegrationCard>
+  );
+}
+
+/**
+ * Apple Calendar: reads Calendar.app over AppleScript (needs the macOS Automation
+ * permission) and mirrors the day into a dedicated "POS — Apple" Google calendar.
+ */
+type AppleAvailability = { ok: boolean; error?: string; calendars?: number };
+type MirrorCounts = { created?: number; updated?: number; deleted?: number; events?: number };
+
+function AppleCalendarCard({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+  const [avail, setAvail] = useState<AppleAvailability | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState(false);
+
+  const check = useCallback(async (announce: boolean) => {
+    if (announce) { setBusy("check"); setMsg(null); setErr(false); }
+    // the first call is what makes macOS show the Automation prompt — it can take a moment
+    const r = await window.pos.applecal.available();
+    const a: AppleAvailability = r.ok
+      ? (r.data as AppleAvailability)
+      : { ok: false, error: r.error ?? "could not reach Calendar" };
+    setAvail(a);
+    if (announce) {
+      setErr(!a.ok);
+      setMsg(
+        a.ok
+          ? `Connected — ${a.calendars ?? 0} calendar${a.calendars === 1 ? "" : "s"} visible.`
+          : (a.error ?? "could not reach Calendar")
+      );
+      setBusy(null);
+    }
+  }, []);
+
+  useEffect(() => { check(false); }, [check]);
+
+  const mirror = async () => {
+    setBusy("mirror");
+    setMsg(null);
+    setErr(false);
+    const today = new Date();
+    const dateISO = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    const r = await window.pos.applecal.mirror(dateISO);
+    if (r.ok) {
+      const d = (r.data ?? {}) as MirrorCounts;
+      setMsg(
+        `${d.events ?? 0} Apple event${d.events === 1 ? "" : "s"} today — ${d.created ?? 0} created, ${d.updated ?? 0} updated, ${d.deleted ?? 0} deleted in "POS — Apple".`
+      );
+    } else {
+      setErr(true);
+      setMsg(r.error ?? "mirror failed");
+    }
+    setBusy(null);
+  };
+
+  const status: IntegrationStatus = avail == null ? "ready" : avail.ok ? "connected" : "needs-setup";
+
+  return (
+    <IntegrationCard
+      name="Apple Calendar"
+      description="Your Mac's calendars appear in POS and mirror into Google"
+      status={status}
+      open={open}
+      onToggle={onToggle}
+      steps={[
+        "Click Check access below — macOS will ask permission for POS to control Calendar.",
+        "Approve it (System Settings → Privacy & Security → Automation if you miss the prompt).",
+        'Use Mirror to Google to copy today’s Apple events into a dedicated "POS — Apple" Google calendar.',
+      ]}
+    >
+      <div className="flex items-center gap-2 flex-wrap">
+        <button
+          onClick={() => check(true)}
+          disabled={busy != null}
+          className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-40"
+          style={{ borderColor: "var(--line)" }}
+        >
+          {busy === "check" ? "Checking…" : "Check access"}
+        </button>
+        <button
+          onClick={mirror}
+          disabled={busy != null}
+          className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-40"
+          style={{ borderColor: "var(--line)" }}
+        >
+          {busy === "mirror" ? "Mirroring…" : "Mirror to Google"}
+        </button>
+      </div>
+      <p className="text-[11px] mt-2" style={{ color: "var(--muted)" }}>
+        Reading Calendar.app can take up to a minute the first time each day.
+      </p>
+      {msg && (
+        <p className="text-xs mt-1" style={{ color: err ? "var(--danger)" : "var(--muted)" }}>
+          {msg}
+        </p>
+      )}
     </IntegrationCard>
   );
 }

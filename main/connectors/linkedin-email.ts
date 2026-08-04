@@ -9,6 +9,7 @@
 // (pure functions, unit-tested); incremental via sync_state source `linkedin-email:<user>`.
 
 import { ImapFlow } from "imapflow";
+import { imapTlsOptions } from "./tls-ca.ts";
 import { simpleParser } from "mailparser";
 import { normalizeLinkedin } from "../crm/normalize.ts";
 import { resolveHandle } from "../crm/identity.ts";
@@ -286,6 +287,7 @@ async function scanAccount(db: ConnectorDeps["db"], account: MailAccount, t: Tal
     secure: true,
     auth: { user, pass: account.password },
     logger: false,
+    tls: imapTlsOptions(),
   });
 
   let maxDate = since.getTime();

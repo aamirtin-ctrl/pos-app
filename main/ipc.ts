@@ -22,6 +22,7 @@ import { listMailAccounts, addMailAccount, removeMailAccount, type MailProvider 
 import { saveDoctrine } from "./engine/doctrine.ts";
 import { runLoopbackAuth, cancelLoopbackAuth, isGoogleConnected, hasGoogleCreds } from "./gcal/auth.ts";
 import { pushPlan, pushTasks, reconcileMovedEvents, readAnchors } from "./gcal/sync.ts";
+import { appleCalendarAvailable, readAppleEvents, mirrorToGoogle } from "./applecal.ts";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -164,6 +165,12 @@ export function registerIpc(deps: IpcDeps) {
   h("gcal.connected", () => ({ connected: isGoogleConnected(secrets), hasCreds: hasGoogleCreds(secrets) }));
   h("gcal.reconcile", () => reconcileMovedEvents(db, secrets));
   h("gcal.events", (dateISO: string) => readAnchors(db, secrets, dateISO));
+
+  // ── apple calendar (Calendar.app) ──
+  // available() is also what triggers macOS's Automation permission prompt.
+  h("applecal.available", () => appleCalendarAvailable());
+  h("applecal.events", (dateISO: string) => readAppleEvents(dateISO));
+  h("applecal.mirror", (dateISO: string) => mirrorToGoogle(db, secrets, dateISO));
 
   // ── messaging drafts + voices ──
   h("drafts.list", () => listDrafts(db));
