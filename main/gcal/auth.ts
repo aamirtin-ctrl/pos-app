@@ -49,11 +49,20 @@ export function oauthClient(secrets: SecretStore, redirectUri?: string) {
  * consent URL in the default browser (via the callback), waits for the redirect,
  * exchanges the code, stores tokens. Resolves true on success.
  */
+let cancelActive: (() => void) | null = null;
+
+/** Cancel any in-flight loopback auth (used by Cancel/Relaunch in the UI). */
+export function cancelLoopbackAuth(): void {
+  cancelActive?.();
+  cancelActive = null;
+}
+
 export function runLoopbackAuth(
   secrets: SecretStore,
   openUrl: (url: string) => void,
   timeoutMs = 5 * 60 * 1000
 ): Promise<boolean> {
+  cancelLoopbackAuth(); // relaunch semantics: a new attempt supersedes a stale one
   return new Promise((resolve) => {
     if (!hasGoogleCreds(secrets)) return resolve(false);
     const state = crypto.randomBytes(16).toString("hex");
@@ -72,6 +81,11 @@ export function runLoopbackAuth(
         server.close();
         resolve(false);
       }, timeoutMs);
+      cancelActive = () => {
+        clearTimeout(timer);
+        server.close();
+        resolve(false);
+      };
       server.on("request", async (req, res) => {
         try {
           const u = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);

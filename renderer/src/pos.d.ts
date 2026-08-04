@@ -21,7 +21,7 @@ declare global {
       outcomes: { needed: Call; capture: Call; adherence: Call };
       sync: { run: Call; status: Call; embed: Call; pickAndRun: Call };
       mail: { list: Call; add: Call; remove: Call };
-      gcal: { connect: Call; connected: Call; reconcile: Call; events: Call };
+      gcal: { connect: Call; cancel: Call; connected: Call; reconcile: Call; events: Call };
       settings: {
         keys: Call; setKey: Call; doctrineGet: Call; doctrineSet: Call;
         spend: Call; setCeiling: Call; get: Call; set: Call;

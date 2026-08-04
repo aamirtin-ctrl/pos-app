@@ -53,7 +53,7 @@ contextBridge.exposeInMainWorld("pos", {
     add: call("mail.accounts.add"),
     remove: call("mail.accounts.remove"),
   },
-  gcal: { connect: call("gcal.connect"), connected: call("gcal.connected"), reconcile: call("gcal.reconcile"), events: call("gcal.events") },
+  gcal: { connect: call("gcal.connect"), cancel: call("gcal.cancel"), connected: call("gcal.connected"), reconcile: call("gcal.reconcile"), events: call("gcal.events") },
   settings: {
     keys: call("settings.keys"),
     setKey: call("settings.setKey"),

@@ -446,14 +446,27 @@ function GoogleCard({
           />
         </div>
       ) : !gcal.connected ? (
-        <button
-          onClick={connect}
-          disabled={busy === "connect"}
-          className="px-3 py-1.5 rounded-md text-sm text-white disabled:opacity-50"
-          style={{ background: "var(--accent)" }}
-        >
-          {busy === "connect" ? "Waiting for browser…" : "Connect Google"}
-        </button>
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            onClick={connect}
+            className="px-3 py-1.5 rounded-md text-sm text-white"
+            style={{ background: "var(--accent)" }}
+          >
+            {busy === "connect" ? "Relaunch browser" : "Connect Google"}
+          </button>
+          {busy === "connect" && (
+            <>
+              <span className="text-xs" style={{ color: "var(--muted)" }}>Waiting for browser…</span>
+              <button
+                onClick={async () => { await window.pos.gcal.cancel(); setBusy(null); setMsg("Canceled."); }}
+                className="px-2.5 py-1.5 rounded-md text-xs border bg-white"
+                style={{ borderColor: "var(--line)", color: "var(--muted)" }}
+              >
+                Cancel
+              </button>
+            </>
+          )}
+        </div>
       ) : (
         <>
           <p className="text-sm mb-2">
