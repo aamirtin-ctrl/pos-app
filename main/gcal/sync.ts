@@ -192,26 +192,102 @@ export interface ExternalAnchor {
 /** Only ask for what we read — and crucially, ask for iCalUID. */
 const EVENT_FIELDS = "items(id,status,summary,start,end,attendees,iCalUID),nextPageToken";
 
+// ── persisted last-known day caches (setting table) ──────────────────────────
+//
+// The in-process caches below die with the process, so the FIRST calendar open
+// after an app relaunch used to pay the full network wait (calendarList + one
+// events.list per calendar; the ICS path has the same problem with a ~1s feed
+// parse). Persisting each successful read as per-date JSON in the `setting`
+// table lets a cold read serve last-known data instantly while a live refresh
+// runs in the background. Only the ~DAY_CACHE_KEEP newest dates are kept.
+
+export const ANCHORS_CACHE_PREFIX = "anchors_cache:";
+export const DAY_CACHE_KEEP = 14;
+
+/**
+ * Pure: given every setting key under one prefix (`<prefix><YYYY-MM-DD>`),
+ * return the keys to DELETE so only the `keep` newest dates remain. ISO dates
+ * sort lexicographically, so plain string sort is date order.
+ */
+export function pruneDayCacheKeys(keys: readonly string[], keep = DAY_CACHE_KEEP): string[] {
+  return [...keys].sort().reverse().slice(keep);
+}
+
+/** Persist one date's JSON under `<prefix><dateISO>` and prune old dates. */
+export function persistDayCache(db: Db, prefix: string, dateISO: string, json: string): void {
+  setSetting(db, `${prefix}${dateISO}`, json);
+  const rows = db.prepare("SELECT key FROM setting WHERE key LIKE ?").all(`${prefix}%`) as { key: string }[];
+  const doomed = pruneDayCacheKeys(rows.map((r) => r.key));
+  if (doomed.length) {
+    const del = db.prepare("DELETE FROM setting WHERE key = ?");
+    for (const k of doomed) del.run(k);
+  }
+}
+
+/** Read one date's persisted JSON back; null when absent or unparseable. */
+export function readDayCache<T>(db: Db, prefix: string, dateISO: string): T | null {
+  const raw = getSetting(db, `${prefix}${dateISO}`);
+  if (raw == null) return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+/** Last successfully read anchors for a date, from the setting table (may be stale). */
+export function cachedAnchors(db: Db, dateISO: string): ExternalAnchor[] | null {
+  const parsed = readDayCache<unknown>(db, ANCHORS_CACHE_PREFIX, dateISO);
+  return Array.isArray(parsed) ? (parsed as ExternalAnchor[]) : null;
+}
+
 // Day-flipping in the planner calls readAnchors once per flip; without a cache every
 // flip is a live round-trip to Google (calendarList + one events.list per calendar).
 // Mirrors the googleICalUids cache below: per-date, in-process, short TTL.
 const ANCHORS_TTL_MS = 60_000;
 const anchorsCache = new Map<string, { at: number; anchors: ExternalAnchor[] }>();
+// Dates with a background live refresh already in flight (persisted-data fast path).
+const anchorsRefreshing = new Set<string>();
+// After a write (pushPlan/reconcile) the persisted snapshots are suspect too — reads
+// inside this window must be live, not served from the setting table.
+let anchorsLiveOnlyUntil = 0;
 
 /** Drop the in-process anchors cache — called after any write (pushPlan/reconcile) so reads stay fresh. */
 export function clearAnchorsCache(): void {
   anchorsCache.clear();
+  anchorsLiveOnlyUntil = Date.now() + ANCHORS_TTL_MS;
 }
 
 /**
  * Read anchors for a date from ALL calendars except the POS calendar.
  * External events are immovable by definition. Cached per-date for 60s;
  * pushPlan/reconcileMovedEvents clear the cache so pushes read back fresh.
+ *
+ * COLD in-process cache + persisted snapshot present → the snapshot is returned
+ * immediately and a live refresh runs fire-and-forget (updating both caches), so
+ * an app relaunch never pays the network wait on the first calendar open.
  */
 export async function readAnchors(db: Db, secrets: SecretStore, dateISO: string): Promise<ExternalAnchor[]> {
   if (!isGoogleConnected(secrets)) return [];
   const hit = anchorsCache.get(dateISO);
   if (hit && Date.now() - hit.at < ANCHORS_TTL_MS) return hit.anchors;
+  if (Date.now() >= anchorsLiveOnlyUntil) {
+    const persisted = cachedAnchors(db, dateISO);
+    if (persisted) {
+      if (!anchorsRefreshing.has(dateISO)) {
+        anchorsRefreshing.add(dateISO);
+        void readAnchorsLive(db, secrets, dateISO)
+          .catch((e) => console.warn(`gcal: background anchors refresh failed: ${(e as Error).message}`))
+          .finally(() => anchorsRefreshing.delete(dateISO));
+      }
+      return persisted;
+    }
+  }
+  return readAnchorsLive(db, secrets, dateISO);
+}
+
+/** The actual Google round-trip; updates the in-process cache AND the persisted snapshot. */
+async function readAnchorsLive(db: Db, secrets: SecretStore, dateISO: string): Promise<ExternalAnchor[]> {
   const cal = calApi(secrets);
   const posId = getSetting(db, "pos_calendar_id");
   const dayStart = new Date(`${dateISO}T00:00:00`);
@@ -244,6 +320,11 @@ export async function readAnchors(db: Db, secrets: SecretStore, dateISO: string)
     }
   }
   anchorsCache.set(dateISO, { at: Date.now(), anchors });
+  try {
+    persistDayCache(db, ANCHORS_CACHE_PREFIX, dateISO, JSON.stringify(anchors));
+  } catch (e) {
+    console.warn(`gcal: persisting anchors snapshot failed: ${(e as Error).message}`);
+  }
   return anchors;
 }
 

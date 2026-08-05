@@ -1056,8 +1056,9 @@ function NotionCard({
   );
 }
 
-type MailAccountRow = { id: string; provider: string; user: string; host: string };
-type MailProvider = "gmail" | "outlook" | "imap";
+type MailAccountRow = { id: string; provider: string; user: string; host: string; auth?: string };
+// "gmail-oauth" is UI-only: it selects the Google sign-in path instead of a password add.
+type MailProvider = "gmail" | "gmail-oauth" | "outlook" | "icloud" | "imap";
 
 function EmailAccountsCard({
   row,
@@ -1087,6 +1088,7 @@ function EmailAccountsCard({
   useEffect(() => { refetchAccounts(); }, [refetchAccounts]);
 
   const addAccount = async () => {
+    if (provider === "gmail-oauth") return; // oauth path uses connectGoogle instead
     if (!email || !password || adding) return;
     if (provider === "imap" && !host) { setMsg("Host is required for custom IMAP."); return; }
     setAdding(true);
@@ -1107,6 +1109,31 @@ function EmailAccountsCard({
     setMsg(null);
     const r = await window.pos.mail.remove(id);
     if (!r.ok) setMsg(r.error ?? "could not remove account");
+    refetchAccounts();
+  };
+
+  // OAuth path (work Gmail without app passwords): opens Google consent in the
+  // browser; the account address comes back from the Gmail profile.
+  const connectGoogle = async () => {
+    if (adding) return;
+    setAdding(true);
+    setMsg(null);
+    const r = await window.pos.mail.connectOAuth();
+    const data = r.data as { connected?: boolean; user?: string; error?: string } | undefined;
+    if (!r.ok) {
+      setMsg(r.error ?? "could not connect to Google");
+    } else if (!data?.connected) {
+      if (data?.error === "admin_blocked") {
+        setMsg("Your Google admin has blocked this app. Ask them to allow it, or use forwarding instead.");
+      } else if (data?.error === "timeout") {
+        setMsg("Google sign-in timed out — try again.");
+      } else if (data?.error === "canceled") {
+        setMsg("Google sign-in was canceled.");
+      } else {
+        setMsg(`Google sign-in failed${data?.error ? `: ${data.error}` : ""}.`);
+      }
+    }
+    setAdding(false);
     refetchAccounts();
   };
 
@@ -1139,6 +1166,7 @@ function EmailAccountsCard({
         'Create an app password named "POS".',
         "Enter your Gmail address and that 16-character password below.",
         "Outlook: enable 2FA at account.microsoft.com/security, then create an app password. iCloud: create an app-specific password at account.apple.com under Sign-In and Security.",
+        "Work accounts: your Google admin must allow the app — if consent shows 'admin has blocked', use forwarding instead.",
       ]}
     >
       {accounts == null ? (
@@ -1155,7 +1183,16 @@ function EmailAccountsCard({
             >
               <span className="text-sm flex-1 truncate" style={{ color: "var(--ink)" }}>
                 {a.user}
-                <span style={{ color: "var(--muted)" }}> — {a.provider}</span>
+                {a.auth === "oauth" ? (
+                  <span
+                    className="ml-2 text-[10px] px-1.5 py-0.5 rounded border align-middle"
+                    style={{ borderColor: "var(--line)", color: "var(--muted)" }}
+                  >
+                    OAuth
+                  </span>
+                ) : (
+                  <span style={{ color: "var(--muted)" }}> — {a.provider}</span>
+                )}
               </span>
               <button
                 onClick={() => removeAccount(a.id)}
@@ -1179,26 +1216,31 @@ function EmailAccountsCard({
             style={inputStyle}
           >
             <option value="gmail">Gmail</option>
+            <option value="gmail-oauth">Gmail — sign in with Google (work/no app password)</option>
             <option value="outlook">Outlook</option>
               <option value="icloud">iCloud</option>
             <option value="imap">Custom IMAP</option>
           </select>
-          <input
-            type="text"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            placeholder="email address"
-            className={`flex-1 min-w-[140px] ${inputCls}`}
-            style={inputStyle}
-          />
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="app password"
-            className={`flex-1 min-w-[140px] ${inputCls}`}
-            style={inputStyle}
-          />
+          {provider !== "gmail-oauth" && (
+            <>
+              <input
+                type="text"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="email address"
+                className={`flex-1 min-w-[140px] ${inputCls}`}
+                style={inputStyle}
+              />
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="app password"
+                className={`flex-1 min-w-[140px] ${inputCls}`}
+                style={inputStyle}
+              />
+            </>
+          )}
         </div>
         {provider === "imap" && (
           <div className="flex gap-2">
@@ -1220,14 +1262,30 @@ function EmailAccountsCard({
             />
           </div>
         )}
-        <button
-          onClick={addAccount}
-          disabled={adding || !email || !password || (provider === "imap" && !host)}
-          className="px-3 py-1 rounded-md text-sm border bg-white disabled:opacity-40"
-          style={inputStyle}
-        >
-          {adding ? "Adding…" : "Add"}
-        </button>
+        {provider === "gmail-oauth" ? (
+          <>
+            <p className="text-xs" style={{ color: "var(--muted)" }}>
+              Opens Google in your browser — sign in with the work account and approve access. No password is stored.
+            </p>
+            <button
+              onClick={connectGoogle}
+              disabled={adding}
+              className="px-3 py-1 rounded-md text-sm border bg-white disabled:opacity-40"
+              style={inputStyle}
+            >
+              {adding ? "Waiting for Google…" : "Connect with Google"}
+            </button>
+          </>
+        ) : (
+          <button
+            onClick={addAccount}
+            disabled={adding || !email || !password || (provider === "imap" && !host)}
+            className="px-3 py-1 rounded-md text-sm border bg-white disabled:opacity-40"
+            style={inputStyle}
+          >
+            {adding ? "Adding…" : "Add"}
+          </button>
+        )}
       </div>
 
       <button

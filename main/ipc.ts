@@ -33,9 +33,18 @@ import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learnin
 import { runSync, syncStatus } from "./workers.ts";
 import { composeDigest, sendMorningDigest } from "./digest.ts";
 import { listMsgPlans } from "./msgplans.ts";
-import { listMailAccounts, addMailAccount, removeMailAccount, type MailProvider } from "./connectors/gmail.ts";
+import { listMailAccounts, addMailAccount, removeMailAccount, addOAuthMailAccount, mailOAuthKey, type MailProvider } from "./connectors/gmail.ts";
 import { saveDoctrine } from "./engine/doctrine.ts";
-import { runLoopbackAuth, cancelLoopbackAuth, isGoogleConnected, hasGoogleCreds } from "./gcal/auth.ts";
+import {
+  runLoopbackAuth,
+  runLoopbackAuthFor,
+  oauthClientFor,
+  googleTokenSecret,
+  cancelLoopbackAuth,
+  isGoogleConnected,
+  hasGoogleCreds,
+} from "./gcal/auth.ts";
+import { google } from "googleapis";
 import { pushPlan, pushTasks, reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent, dropCommitmentCascade } from "./gcal/sync.ts";
 import { listSubscriptions, addSubscription, removeSubscription, eventsForDate as icsEventsForDate, icsBlockType } from "./icscal.ts";
 import { notionAvailable, searchTargets, syncNotion, PARENT_PAGE_KEY } from "./notion.ts";
@@ -212,7 +221,7 @@ export function registerIpc(deps: IpcDeps) {
   h("sync.status", () => syncStatus(db));
   // Mail accounts (multi-account IMAP). list NEVER returns passwords.
   h("mail.accounts.list", () =>
-    listMailAccounts(secrets).map(({ id, provider, user, host }) => ({ id, provider, user, host }))
+    listMailAccounts(secrets).map(({ id, provider, user, host, auth }) => ({ id, provider, user, host, auth: auth ?? "password" }))
   );
   h("mail.accounts.add", (acct: { provider: MailProvider; user: string; password: string; host?: string; port?: number }) => {
     const a = addMailAccount(secrets, acct);
@@ -221,6 +230,38 @@ export function registerIpc(deps: IpcDeps) {
   h("mail.accounts.remove", (id: string) => {
     removeMailAccount(secrets, id);
     return { removed: true };
+  });
+  // Gmail via Google OAuth (XOAUTH2) — for Workspace accounts whose admin has
+  // disabled app passwords. Tokens land under a pending key first (the address is
+  // only known after consent), then get re-keyed to mail:<email>.
+  h("mail.connectOAuth", async () => {
+    const PENDING_KEY = "mail:pending";
+    const res = await runLoopbackAuthFor(secrets, PENDING_KEY, (url) => shell.openExternal(url));
+    if (!res.connected) {
+      const reason = (res.error ?? "").toLowerCase();
+      // Workspace admin refusals: Google reports access_denied / admin_policy_enforced
+      // / org_internal-style errors when the client isn't allowed for the org.
+      if (/admin|policy|access_denied|org_internal/.test(reason)) {
+        return { connected: false, error: "admin_blocked" };
+      }
+      return { connected: false, error: res.error === "timeout" ? "timeout" : "canceled" };
+    }
+    try {
+      // The consent screen doesn't tell us which account was picked — ask Gmail.
+      const gmail = google.gmail({ version: "v1", auth: oauthClientFor(secrets, PENDING_KEY) });
+      const profile = await gmail.users.getProfile({ userId: "me" });
+      const email = profile.data.emailAddress;
+      if (!email) return { connected: false, error: "no_email" };
+      // Re-key the token secret from the pending slot to the real address.
+      const raw = secrets.get(googleTokenSecret(PENDING_KEY));
+      if (raw) secrets.set(googleTokenSecret(mailOAuthKey(email)), raw);
+      addOAuthMailAccount(secrets, email);
+      return { connected: true, user: email };
+    } catch (e) {
+      return { connected: false, error: `profile_failed: ${(e as Error).message}` };
+    } finally {
+      secrets.delete(googleTokenSecret(PENDING_KEY));
+    }
   });
   h("sync.embed", () => embedProfiles(db, secrets));
 

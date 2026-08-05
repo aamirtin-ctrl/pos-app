@@ -10,9 +10,12 @@ import { SecretStore } from "../../main/secrets.ts";
 import {
   listMailAccounts,
   addMailAccount,
+  addOAuthMailAccount,
   removeMailAccount,
   gmailConfigured,
+  mailOAuthKey,
 } from "../../main/connectors/gmail.ts";
+import { googleTokenSecret } from "../../main/gcal/auth.ts";
 
 let dir: string;
 let secrets: SecretStore;
@@ -106,12 +109,78 @@ describe("listMailAccounts", () => {
   });
 });
 
+describe("addOAuthMailAccount", () => {
+  it("applies the gmail preset, sets the oauth flag, and stores NO password", () => {
+    const a = addOAuthMailAccount(secrets, " Work@Corp.com ");
+    expect(a).toMatchObject({
+      provider: "gmail",
+      user: "Work@Corp.com",
+      host: "imap.gmail.com",
+      port: 993,
+      auth: "oauth",
+    });
+    expect(a.password).toBeUndefined();
+    expect(a.id).toMatch(/^[0-9a-f]{8}$/);
+    // nothing password-shaped in the persisted secret either
+    expect(secrets.get("MAIL_ACCOUNTS")).not.toContain("password");
+  });
+
+  it("round-trips through a fresh store (auth flag survives, still no password)", () => {
+    addOAuthMailAccount(secrets, "work@corp.com");
+    const list = listMailAccounts(new SecretStore(dir));
+    expect(list).toHaveLength(1);
+    expect(list[0].auth).toBe("oauth");
+    expect(list[0].password).toBeUndefined();
+    expect(list[0].host).toBe("imap.gmail.com");
+    expect(gmailConfigured({ secrets: new SecretStore(dir) })).toBe(true);
+  });
+
+  it("re-connecting the same address updates in place instead of duplicating", () => {
+    const a = addOAuthMailAccount(secrets, "work@corp.com");
+    const b = addOAuthMailAccount(secrets, "WORK@corp.com");
+    expect(b.id).toBe(a.id);
+    expect(listMailAccounts(secrets)).toHaveLength(1);
+  });
+
+  it("coexists with password accounts", () => {
+    addMailAccount(secrets, { provider: "gmail", user: "personal@gmail.com", password: "pw" });
+    addOAuthMailAccount(secrets, "work@corp.com");
+    const list = listMailAccounts(secrets);
+    expect(list.map((a) => [a.user, a.auth ?? "password"])).toEqual([
+      ["personal@gmail.com", "password"],
+      ["work@corp.com", "oauth"],
+    ]);
+  });
+});
+
+describe("token-key naming", () => {
+  it("mailOAuthKey normalizes (trim + lowercase) so sync and connect agree", () => {
+    expect(mailOAuthKey(" Work@Corp.com ")).toBe("mail:work@corp.com");
+  });
+
+  it("googleTokenSecret keys per identity and keeps the legacy default name", () => {
+    expect(googleTokenSecret()).toBe("GOOGLE_OAUTH_TOKENS");
+    expect(googleTokenSecret(mailOAuthKey("work@corp.com"))).toBe(
+      "GOOGLE_OAUTH_TOKENS:mail:work@corp.com"
+    );
+  });
+});
+
 describe("removeMailAccount", () => {
   it("removes a stored account by id and leaves the others", () => {
     const a = addMailAccount(secrets, { provider: "gmail", user: "a@gmail.com", password: "pw" });
     const b = addMailAccount(secrets, { provider: "outlook", user: "b@outlook.com", password: "pw" });
     removeMailAccount(secrets, a.id);
     expect(listMailAccounts(secrets).map((x) => x.id)).toEqual([b.id]);
+  });
+
+  it("removing an oauth account also drops its Google token secret", () => {
+    const a = addOAuthMailAccount(secrets, "work@corp.com");
+    const tokenSecret = googleTokenSecret(mailOAuthKey("work@corp.com"));
+    secrets.set(tokenSecret, JSON.stringify({ refresh_token: "r" }));
+    removeMailAccount(secrets, a.id);
+    expect(listMailAccounts(secrets)).toEqual([]);
+    expect(secrets.get(tokenSecret)).toBeNull();
   });
 
   it('removing "legacy" deletes the legacy secrets so it never reappears', () => {

@@ -55,6 +55,7 @@ contextBridge.exposeInMainWorld("pos", {
     list: call("mail.accounts.list"),
     add: call("mail.accounts.add"),
     remove: call("mail.accounts.remove"),
+    connectOAuth: call("mail.connectOAuth"),
   },
   gcal: { connect: call("gcal.connect"), cancel: call("gcal.cancel"), connected: call("gcal.connected"), reconcile: call("gcal.reconcile"), events: call("gcal.events") },
   ics: { list: call("ics.list"), add: call("ics.add"), remove: call("ics.remove") },

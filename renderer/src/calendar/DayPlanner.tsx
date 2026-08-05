@@ -65,7 +65,8 @@ const LockGlyph = () => (
   </svg>
 );
 
-const FLIP_FETCH_DEBOUNCE_MS = 250; // settle time before hitting IPC after day flips
+const FLIP_FETCH_DEBOUNCE_MS = 250; // settle time before external-events IPC after day flips
+const PREFETCH_TTL_MS = 60_000; // a neighbor prefetched this recently is not refetched
 
 // Carousel geometry: |offset| → column width / opacity, tapering to the edges.
 const PREVIEW_WIDTH: Record<number, number> = { 1: 90, 2: 56, 3: 36 };
@@ -115,9 +116,15 @@ export default function DayPlanner() {
   // Warm the carousel: fetch plan + gcal for ±3 days around the center, fully in
   // the background (fire-and-forget, after the center day has loaded). Outcomes
   // are center-only; keep whatever a full refresh cached for that date.
+  // A neighbor prefetched in the last PREFETCH_TTL_MS is skipped — main keeps its
+  // own short TTLs, so re-forcing all 6 on every settled flip was pure waste.
+  const prefetchedAt = React.useRef(new Map<string, number>());
   const prefetchNeighbors = useCallback((centerIso: string) => {
     for (const off of [-1, 1, -2, 2, -3, 3]) {
       const iso = addDaysISO(centerIso, off);
+      const last = prefetchedAt.current.get(iso);
+      if (last && Date.now() - last < PREFETCH_TTL_MS) continue;
+      prefetchedAt.current.set(iso, Date.now()); // set before the fetch — no duplicate in-flight
       void (async () => {
         try {
           const [r, g] = await Promise.all([window.pos.plan.get(iso), window.pos.gcal.events(iso)]);
@@ -129,39 +136,65 @@ export default function DayPlanner() {
           });
           setCacheTick((t) => t + 1);
         } catch {
-          /* previews are best-effort; the center day is unaffected */
+          prefetchedAt.current.delete(iso); // failed — allow the next flip to retry
         }
       })();
     }
   }, []);
 
-  const refresh = useCallback(async () => {
-    const forDate = date;
-    const yday = new Date(new Date(forDate).getTime() - 86400000).toISOString().slice(0, 10);
-    const [r, g, o] = await Promise.all([
-      window.pos.plan.get(forDate),
-      window.pos.gcal.events(forDate),
-      window.pos.outcomes.needed(yday),
-    ]);
+  // Fast path: plan + outcomes are DB-only IPC and answer in milliseconds. They
+  // paint the timeline immediately; externals from a previous fetch are kept so
+  // the day never blanks while Google/ICS revalidate.
+  const refreshLocal = useCallback(async (forDate: string) => {
+    const yday = addDaysISO(forDate, -1);
+    const [r, o] = await Promise.all([window.pos.plan.get(forDate), window.pos.outcomes.needed(yday)]);
     const data: DayData = {
       plan: r.ok ? (r.data as PlanView | null) : null,
-      external: g.ok && Array.isArray(g.data) ? (g.data as ExternalEvent[]) : [],
+      external: dayCache.current.get(forDate)?.external ?? [], // read at completion — merge-safe
       outcomes: o.ok ? (o.data as any[]) : [],
     };
     dayCache.current.set(forDate, data);
     if (dateRef.current === forDate) applyDay(data); // ignore stale responses after more flips
+  }, []);
+
+  // Slow path: external events (Google network + ICS feeds). NEVER blocks the
+  // timeline — results merge into the cached day whenever they arrive.
+  const refreshExternal = useCallback(async (forDate: string) => {
+    const g = await window.pos.gcal.events(forDate);
+    if (!g.ok || !Array.isArray(g.data)) return;
+    const prev = dayCache.current.get(forDate);
+    const data: DayData = {
+      plan: prev?.plan ?? null,
+      external: g.data as ExternalEvent[],
+      outcomes: prev?.outcomes ?? [],
+    };
+    dayCache.current.set(forDate, data);
+    if (dateRef.current === forDate) applyDay(data); // stale-response guard
+    else setCacheTick((t) => t + 1); // no longer centered — still repaint its preview
+  }, []);
+
+  const refresh = useCallback(async () => {
+    const forDate = date;
+    await refreshLocal(forDate);
+    void refreshExternal(forDate); // never awaited — merges in when it lands
     prefetchNeighbors(forDate); // never awaited — previews fill in silently
-  }, [date, prefetchNeighbors]);
+  }, [date, refreshLocal, refreshExternal, prefetchNeighbors]);
 
   useEffect(() => {
     // Optimistic flip: paint the cached day immediately (or clear to a blank day),
-    // then fetch only after the flipping settles — rapid flips cost zero IPC.
+    // then refresh the cheap DB-only data right away — first paint never waits on
+    // Google/ICS. The external fetch + neighbor prefetch still debounce so rapid
+    // flips don't fan out network IPC.
     const cached = dayCache.current.get(date);
     if (cached) applyDay(cached);
     else { setPlan(null); setExternal([]); setOutcomes([]); }
-    const t = setTimeout(() => { refresh(); }, FLIP_FETCH_DEBOUNCE_MS);
+    void refreshLocal(date);
+    const t = setTimeout(() => {
+      void refreshExternal(date);
+      prefetchNeighbors(date);
+    }, FLIP_FETCH_DEBOUNCE_MS);
     return () => clearTimeout(t);
-  }, [date, refresh]);
+  }, [date, refreshLocal, refreshExternal, prefetchNeighbors]);
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 60000);
     return () => clearInterval(t);

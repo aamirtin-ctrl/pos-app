@@ -11,7 +11,8 @@ import type { SecretStore } from "./secrets.ts";
 import type { LlmClient } from "./llm/provider.ts";
 import { extractCommitmentsLlm, passesCommitmentGate, isExpiredSameDay } from "./crm/commitments.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
-import { commitmentToTask, closeGoogleTask } from "./gcal/sync.ts";
+import { commitmentToTask, closeGoogleTask, readAnchors } from "./gcal/sync.ts";
+import { eventsForDate as icsEventsForDate } from "./icscal.ts";
 import { distillWeek, distillWeekKey } from "./worklog.ts";
 import type { ConnectorDeps, SyncReport } from "./connectors/common.ts";
 import { syncAllMail, gmailConfigured } from "./connectors/gmail.ts";
@@ -372,6 +373,24 @@ export function startWorkers(
 ): WorkersHandle {
   const cron = req("node-cron") as CronModule;
   let running = false;
+
+  // Warm today's calendar caches at startup, fire-and-forget: readAnchors serves any
+  // persisted snapshot instantly and refreshes live in the background; eventsForDate
+  // does the same for subscribed feeds. Either way the in-process caches are hot
+  // before the user first clicks Calendar, so the tab opens without a network wait.
+  void (async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    try {
+      await readAnchors(db, secrets, today);
+    } catch (e) {
+      console.warn(`workers: anchors warm-up failed: ${(e as Error).message}`);
+    }
+    try {
+      await icsEventsForDate(db, today);
+    } catch (e) {
+      console.warn(`workers: ics warm-up failed: ${(e as Error).message}`);
+    }
+  })();
 
   const announce = (r: SyncReport) => {
     if (r.error || r.ingested === 0) return; // quiet unless something new landed

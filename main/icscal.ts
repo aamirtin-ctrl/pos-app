@@ -20,6 +20,7 @@ import { randomUUID } from "node:crypto";
 import type { Db } from "./db/db.ts";
 import { getSetting, setSetting } from "./db/db.ts";
 import { appleBlockType } from "./applecal.ts";
+import { persistDayCache, readDayCache } from "./gcal/sync.ts";
 
 /** settings key holding the JSON subscription list. */
 export const ICS_SUBSCRIPTIONS_KEY = "ics_subscriptions";
@@ -245,18 +246,63 @@ async function fetchFeed(url: string): Promise<CalendarResponse> {
   }
 }
 
+/** settings key prefix for persisted per-date event snapshots (see gcal/sync.ts helpers). */
+export const ICS_CACHE_PREFIX = "ics_cache:";
+
+/** True when every subscribed feed is warm in the in-process cache (no network needed). */
+function feedsWarm(db: Db): boolean {
+  const now = Date.now();
+  return listSubscriptions(db).every((s) => {
+    const hit = feedCache.get(s.url);
+    return !!hit && now - hit.at < FEED_TTL_MS;
+  });
+}
+
+// Dates with a background feed refresh already in flight (persisted-data fast path).
+const icsRefreshing = new Set<string>();
+
 /**
  * Every timed event on `dateISO` across ALL subscribed feeds. Per-feed
  * failures are skipped with a warning — one dead feed never hides the others,
  * and never breaks planning.
+ *
+ * COLD feed cache + persisted snapshot present → the snapshot is returned
+ * immediately and the feeds refresh fire-and-forget (updating the feed cache and
+ * the snapshot), so an app relaunch never pays the ~1s parse on first open.
  */
 export async function eventsForDate(db: Db, dateISO: string): Promise<IcsEvent[]> {
+  if (feedsWarm(db)) return eventsForDateLive(db, dateISO);
+  const persisted = readDayCache<unknown>(db, ICS_CACHE_PREFIX, dateISO);
+  if (Array.isArray(persisted)) {
+    if (!icsRefreshing.has(dateISO)) {
+      icsRefreshing.add(dateISO);
+      void eventsForDateLive(db, dateISO)
+        .catch((err) => console.warn(`ics: background feed refresh failed: ${(err as Error).message}`))
+        .finally(() => icsRefreshing.delete(dateISO));
+    }
+    return persisted as IcsEvent[];
+  }
+  return eventsForDateLive(db, dateISO);
+}
+
+/** The actual fetch+expand; persists the snapshot only when every feed answered. */
+async function eventsForDateLive(db: Db, dateISO: string): Promise<IcsEvent[]> {
   const out: IcsEvent[] = [];
+  let degraded = false;
   for (const sub of listSubscriptions(db)) {
     try {
       out.push(...eventsFromParsed(await fetchFeed(sub.url), dateISO));
     } catch (err) {
+      degraded = true;
       console.warn(`ics feed "${sub.name}" unavailable: ${(err as Error).message}`);
+    }
+  }
+  // A partial day (dead feed) must not overwrite a complete last-known snapshot.
+  if (!degraded) {
+    try {
+      persistDayCache(db, ICS_CACHE_PREFIX, dateISO, JSON.stringify(out));
+    } catch (err) {
+      console.warn(`ics: persisting events snapshot failed: ${(err as Error).message}`);
     }
   }
   return out;

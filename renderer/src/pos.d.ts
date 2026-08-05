@@ -20,7 +20,7 @@ declare global {
       plan: { generate: Call; get: Call; accept: Call; push: Call };
       outcomes: { needed: Call; capture: Call; adherence: Call };
       sync: { run: Call; status: Call; embed: Call; pickAndRun: Call };
-      mail: { list: Call; add: Call; remove: Call };
+      mail: { list: Call; add: Call; remove: Call; connectOAuth: Call };
       gcal: { connect: Call; cancel: Call; connected: Call; reconcile: Call; events: Call };
       ics: { list: Call; add: Call; remove: Call };
       notion: { available: Call; targets: Call; setParent: Call; sync: Call };

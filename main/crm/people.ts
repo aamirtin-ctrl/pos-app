@@ -183,3 +183,14 @@ export function mergePeople(db: Db, ids: number[]): number | null {
   run();
   return keep;
 }
+
+/**
+ * Hard delete a person and everything that hangs off them. Aliases, interactions
+ * (and their drafts), tags, and group rows cascade via the schema; commitments and
+ * tasks keep their rows with person refs nulled (SET NULL) — history of obligations
+ * survives even if the contact goes. Used by the Messaging/Contacts quick-delete.
+ */
+export function deletePerson(db: Db, id: number): boolean {
+  const res = db.prepare("DELETE FROM person WHERE id = ?").run(id);
+  return res.changes > 0;
+}

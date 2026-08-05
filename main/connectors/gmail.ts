@@ -16,6 +16,7 @@
 import crypto from "node:crypto";
 import { ImapFlow } from "imapflow";
 import { imapTlsOptions } from "./tls-ca.ts";
+import { freshAccessToken, googleTokenSecret } from "../gcal/auth.ts";
 import { simpleParser, type AddressObject, type EmailAddress } from "mailparser";
 import type { SecretStore } from "../secrets.ts";
 import { resolveHandle } from "../crm/identity.ts";
@@ -40,12 +41,23 @@ export interface MailAccount {
   id: string;
   provider: MailProvider;
   user: string;
-  password: string;
+  /** Empty/absent for auth "oauth" — those accounts never persist a password. */
+  password?: string;
   host: string;
   port: number;
+  /** How to authenticate with the IMAP server. Absent → "password" (back-compat). */
+  auth?: "password" | "oauth";
 }
 
 const MAIL_ACCOUNTS_SECRET = "MAIL_ACCOUNTS";
+
+/**
+ * Secret-store key (under GOOGLE_OAUTH_TOKENS:<key>, see gcal/auth.ts
+ * googleTokenSecret) for a mail account's Google OAuth tokens.
+ */
+export function mailOAuthKey(user: string): string {
+  return `mail:${user.trim().toLowerCase()}`;
+}
 
 /** Host/port + sent-folder defaults per provider ("imap" host/port come from the user). */
 const PROVIDER_PRESETS: Record<MailProvider, { host: string; port: number; sentFolder: string }> = {
@@ -70,7 +82,8 @@ function readStoredAccounts(secrets: SecretsLike): MailAccount[] {
         typeof a.id === "string" &&
         (a.provider === "gmail" || a.provider === "outlook" || a.provider === "icloud" || a.provider === "imap") &&
         typeof a.user === "string" &&
-        typeof a.password === "string" &&
+        // oauth accounts carry no password; everything else must have one
+        (a.auth === "oauth" || typeof a.password === "string") &&
         typeof a.host === "string" &&
         typeof a.port === "number"
     );
@@ -131,6 +144,33 @@ export function addMailAccount(
   return account;
 }
 
+/**
+ * Add a Gmail account authenticated via Google OAuth (XOAUTH2) — for Workspace
+ * accounts where the admin has disabled app passwords. Called AFTER a successful
+ * consent flow persisted tokens under googleTokenSecret(mailOAuthKey(user)).
+ * No password is stored. Re-connecting the same address updates in place.
+ */
+export function addOAuthMailAccount(secrets: SecretsLike, user: string): MailAccount {
+  const trimmed = user.trim();
+  if (!trimmed) throw new Error("email is required");
+  const preset = PROVIDER_PRESETS.gmail;
+  const existing = readStoredAccounts(secrets);
+  const prior = existing.find((a) => a.user.trim().toLowerCase() === trimmed.toLowerCase());
+  const account: MailAccount = {
+    id: prior?.id ?? crypto.randomBytes(4).toString("hex"),
+    provider: "gmail",
+    user: trimmed,
+    host: preset.host,
+    port: preset.port,
+    auth: "oauth",
+  };
+  writeStoredAccounts(secrets, [
+    ...existing.filter((a) => a.id !== account.id),
+    account,
+  ]);
+  return account;
+}
+
 /** Remove by id. Removing the synthesized "legacy" account deletes the legacy secrets. */
 export function removeMailAccount(secrets: SecretsLike, id: string): void {
   if (id === "legacy") {
@@ -138,7 +178,11 @@ export function removeMailAccount(secrets: SecretsLike, id: string): void {
     secrets.delete("GMAIL_APP_PASSWORD");
     return;
   }
-  writeStoredAccounts(secrets, readStoredAccounts(secrets).filter((a) => a.id !== id));
+  const accounts = readStoredAccounts(secrets);
+  const removed = accounts.find((a) => a.id === id);
+  // oauth accounts also drop their Google token secret — no orphaned grants
+  if (removed?.auth === "oauth") secrets.delete(googleTokenSecret(mailOAuthKey(removed.user)));
+  writeStoredAccounts(secrets, accounts.filter((a) => a.id !== id));
 }
 
 /** True when at least one mail account exists — the scheduler's "should I even try" check. */
@@ -159,14 +203,27 @@ function firstAddr(field: AddressObject | AddressObject[] | undefined): EmailAdd
  * migrates on first run (copied when the per-account cursor is missing).
  */
 export async function syncMailAccount(
-  deps: Pick<ConnectorDeps, "db">,
+  deps: Pick<ConnectorDeps, "db" | "secrets">,
   account: MailAccount
 ): Promise<SyncReport> {
   const { db } = deps;
   const report: SyncReport = { source: "gmail", ingested: 0, skipped: 0, created: 0 };
 
   const user = account.user.trim();
-  if (!user || !account.password) return { ...report, error: "not-configured" };
+  const isOAuth = account.auth === "oauth";
+  if (!user || (!isOAuth && !account.password)) return { ...report, error: "not-configured" };
+
+  // XOAUTH2 (Workspace accounts without app passwords): a fresh access token per
+  // sync, refreshed via the stored grant. Missing/failed refresh → typed error so
+  // the UI can prompt a re-connect.
+  let imapAuth: { user: string; pass?: string; accessToken?: string };
+  if (isOAuth) {
+    const accessToken = await freshAccessToken(deps.secrets, mailOAuthKey(user));
+    if (!accessToken) return { ...report, error: "oauth_expired" };
+    imapAuth = { user, accessToken };
+  } else {
+    imapAuth = { user, pass: account.password };
+  }
   // Your own address — used to classify direction and never treat yourself as counterpart.
   const selfSet = new Set([user.toLowerCase()]);
 
@@ -190,7 +247,7 @@ export async function syncMailAccount(
     host: account.host,
     port: account.port,
     secure: true,
-    auth: { user, pass: account.password },
+    auth: imapAuth,
     logger: false,
     tls: imapTlsOptions(),
   });
