@@ -13,6 +13,7 @@ import { openDb, getSetting, type Db } from "../main/db/db.ts";
 import {
   extractCommitmentsLlm,
   passesCommitmentGate,
+  isExpiredSameDay,
   listCommitments,
   FALLBACK_CONFIDENCE,
 } from "../main/crm/commitments.ts";
@@ -20,9 +21,11 @@ import {
   autoTentativeTasks,
   cleanupTentativeTasks,
   cleanupTentativeTasksV2,
+  cleanupTentativeTasksV3,
   AUTO_CONVERT_CONFIDENCE,
   CLEANUP_TENTATIVE_KEY,
   CLEANUP_TENTATIVE_V2_KEY,
+  CLEANUP_TENTATIVE_V3_KEY,
 } from "../main/workers.ts";
 import type { SecretStore } from "../main/secrets.ts";
 
@@ -100,6 +103,51 @@ describe("passesCommitmentGate (pure)", () => {
   });
 });
 
+describe("isExpiredSameDay (pure)", () => {
+  // Pinned clock: Wednesday 2026-08-05, 15:00 UTC.
+  const now = new Date("2026-08-05T15:00:00Z");
+
+  it("expires the owner's exact phrase when sent yesterday", () => {
+    // Only temporal reference is "at 5:30" → scoped to the sent day (2026-08-04);
+    // even the PM reading of that day has passed → expired, drop.
+    expect(isExpiredSameDay("be back here at 5:30 latest", new Date("2026-08-04T13:00:00Z"), now)).toBe(true);
+  });
+
+  it("keeps the same phrase sent today with 5:30 (PM) still ahead", () => {
+    expect(isExpiredSameDay("be back here at 5:30 latest", new Date("2026-08-05T09:00:00Z"), now)).toBe(false);
+  });
+
+  it("'tonight' sent 3 days ago is expired (marker-only → end of sent day)", () => {
+    expect(isExpiredSameDay("let's watch the game tonight", new Date("2026-08-02T18:00:00Z"), now)).toBe(true);
+  });
+
+  it("'tonight' sent today is still ahead", () => {
+    expect(isExpiredSameDay("let's watch the game tonight", new Date("2026-08-05T09:00:00Z"), now)).toBe(false);
+  });
+
+  it("an explicit future weekday is NOT same-day scoped, even with a clock time", () => {
+    // Sent Monday 2026-08-03; "Friday" resolves to 2026-08-07 — an explicit date, so
+    // the item is untouched regardless of the 5:30.
+    expect(isExpiredSameDay("meet Friday at 5:30", new Date("2026-08-03T10:00:00Z"), now)).toBe(false);
+  });
+
+  it("explicit other-day references (tomorrow / month / ISO) are untouched", () => {
+    expect(isExpiredSameDay("call at 9am tomorrow", new Date("2026-08-02T10:00:00Z"), now)).toBe(false);
+    expect(isExpiredSameDay("meetup at 5:30 on Sep 12", new Date("2026-08-01T10:00:00Z"), now)).toBe(false);
+    expect(isExpiredSameDay("be there by 5pm on 2026-09-01", new Date("2026-08-01T10:00:00Z"), now)).toBe(false);
+  });
+
+  it("no temporal reference at all → never expired", () => {
+    expect(isExpiredSameDay("Send Sarah the pitch deck", new Date("2026-08-01T10:00:00Z"), now)).toBe(false);
+    expect(isExpiredSameDay("", new Date("2026-08-01T10:00:00Z"), now)).toBe(false);
+  });
+
+  it("'by noon' sent yesterday expired; 'in an hour' sent 2 days ago expired", () => {
+    expect(isExpiredSameDay("drop the keys off by noon", new Date("2026-08-04T08:00:00Z"), now)).toBe(true);
+    expect(isExpiredSameDay("I'll swing by in an hour", new Date("2026-08-03T12:00:00Z"), now)).toBe(true);
+  });
+});
+
 // ── DB-backed layers ─────────────────────────────────────────────────────────
 
 let dir: string;
@@ -117,25 +165,25 @@ afterEach(() => {
 
 const yesterday = new Date(Date.now() - 86_400_000).toISOString();
 
-function addInteraction(body: string): number {
+function addInteraction(body: string, occurredAt: string = yesterday): number {
   const r = db
     .prepare(
       "INSERT INTO interaction (person_id, channel, direction, occurred_at, subject, body_summary, external_id) VALUES (1, 'imessage', 'inbound', ?, NULL, ?, ?)"
     )
-    .run(yesterday, body, `ext-${Math.random()}`);
+    .run(occurredAt, body, `ext-${Math.random()}`);
   return Number(r.lastInsertRowid);
 }
 
 function addCommitment(
   description: string,
   confidence: number,
-  opts: { status?: string; confirmed?: number; dueAt?: string | null } = {}
+  opts: { status?: string; confirmed?: number; dueAt?: string | null; sourceId?: number | null } = {}
 ): number {
   const r = db
     .prepare(
-      "INSERT INTO commitment (person_id, direction, description, due_at, status, confidence, confirmed_by_user) VALUES (1, 'i_owe_them', ?, ?, ?, ?, ?)"
+      "INSERT INTO commitment (person_id, direction, description, due_at, status, source_interaction_id, confidence, confirmed_by_user) VALUES (1, 'i_owe_them', ?, ?, ?, ?, ?, ?)"
     )
-    .run(description, opts.dueAt ?? null, opts.status ?? "open", confidence, opts.confirmed ?? 0);
+    .run(description, opts.dueAt ?? null, opts.status ?? "open", opts.sourceId ?? null, confidence, opts.confirmed ?? 0);
   return Number(r.lastInsertRowid);
 }
 
@@ -156,6 +204,19 @@ describe("deterministic path (llm = null) confidence cap + gate", () => {
     const rows = listCommitments(db, "open");
     expect(rows[0].confidence).toBe(FALLBACK_CONFIDENCE);
     expect(rows[0].confidence).toBeLessThan(AUTO_CONVERT_CONFIDENCE); // can never auto-convert
+  });
+
+  it("expired same-day fallback proposals never insert; explicitly dated ones do", async () => {
+    // "at 5:30" with no other date, sent yesterday → scoped to yesterday, expired → dropped.
+    const expired = addInteraction("let's meet at 5:30!");
+    // Same phrase anchored to an explicit future weekday → not same-day scoped → inserted.
+    const dated = addInteraction("let's meet next Friday at 5:30!");
+    const res = await extractCommitmentsLlm(db, null, [expired, dated]);
+    expect(res.processed).toBe(2);
+    expect(res.inserted).toBe(1);
+    const rows = listCommitments(db, "open");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].description).toContain("next Friday");
   });
 
   it("gate-failing fallback proposals never insert", async () => {
@@ -322,5 +383,53 @@ describe("cleanupTentativeTasksV2 (full reset onto the fixed pipeline)", () => {
     const res = await cleanupTentativeTasksV2(db, noGoogle);
     expect(res.deletedTasks).toBe(1);
     expect(db.prepare("SELECT id FROM task WHERE id = ?").get(t)).toBeUndefined();
+  });
+});
+
+describe("cleanupTentativeTasksV3 (expired same-day review sweep)", () => {
+  const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString();
+  const statusOf = (id: number) =>
+    db.prepare("SELECT status, resolved_at FROM commitment WHERE id = ?").get(id) as {
+      status: string;
+      resolved_at: string | null;
+    };
+
+  it("round-trip: drops expired same-day items; keeps dated / recent / non-temporal / non-review rows; one-shot", () => {
+    // The owner's case: "at 5:30" texted 3 days ago, surviving undated in review → dropped.
+    const i1 = addInteraction("I wanna be back here at 5:30 latest", daysAgo(3));
+    const expired = addCommitment("Be back at the house by 5:30", 0.5, { sourceId: i1 });
+    // Marker-only "tonight" from 3 days ago → dropped.
+    const i2 = addInteraction("let's catch up tonight!", daysAgo(3));
+    const tonight = addCommitment("Catch up with Cory tonight", 0.5, { sourceId: i2 });
+    // Explicit future weekday + clock time → not same-day scoped → kept.
+    const i3 = addInteraction("let's meet next Friday at 5:30", daysAgo(3));
+    const dated = addCommitment("Meet Cory next Friday at 5:30", 0.5, { sourceId: i3 });
+    // Same-day text but only 1 day old → inside the 2-day guard → kept for now.
+    const i4 = addInteraction("be back here at 5:30 latest", daysAgo(1));
+    const recent = addCommitment("Be back home by 5:30", 0.5, { sourceId: i4 });
+    // No temporal reference → kept (undated is correct for it).
+    const i5 = addInteraction("can you send the deck over?", daysAgo(5));
+    const plain = addCommitment("Send Sarah the pitch deck", 0.5, { sourceId: i5 });
+    // Expired text but confirmed/scheduled — NOT the review queue → untouched.
+    const i6 = addInteraction("see you tonight", daysAgo(4));
+    const scheduled = addCommitment("Meet Omar tonight", 0.9, { status: "scheduled", confirmed: 1, sourceId: i6 });
+
+    const res = cleanupTentativeTasksV3(db);
+    expect(res.dropped).toBe(2);
+
+    for (const id of [expired, tonight]) {
+      const c = statusOf(id);
+      expect(c.status).toBe("dropped");
+      expect(c.resolved_at).toBeTruthy(); // audit-kept, like dropCommitment
+    }
+    for (const id of [dated, recent, plain]) expect(statusOf(id).status).toBe("open");
+    expect(statusOf(scheduled).status).toBe("scheduled");
+
+    // Flag set → one-shot; a rerun touches nothing, even a fresh expired item.
+    expect(getSetting(db, CLEANUP_TENTATIVE_V3_KEY)).toBeTruthy();
+    const i7 = addInteraction("back by 5:30 for sure", daysAgo(3));
+    const late = addCommitment("Be back by 5:30", 0.5, { sourceId: i7 });
+    expect(cleanupTentativeTasksV3(db)).toEqual({ dropped: 0 });
+    expect(statusOf(late).status).toBe("open");
   });
 });

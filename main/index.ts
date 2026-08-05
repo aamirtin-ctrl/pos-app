@@ -6,7 +6,7 @@ import { openDb, type Db } from "./db/db.ts";
 import { SecretStore } from "./secrets.ts";
 import { LlmClient } from "./llm/provider.ts";
 import { registerIpc } from "./ipc.ts";
-import { startWorkers, cleanupTentativeTasksV2 } from "./workers.ts";
+import { startWorkers, cleanupTentativeTasksV2, cleanupTentativeTasksV3 } from "./workers.ts";
 import { loadDoctrine } from "./engine/doctrine.ts";
 
 let db: Db | null = null;
@@ -65,9 +65,21 @@ app.whenReady().then(() => {
   // close their Google counterparts best-effort, and return the underlying
   // commitments to the review queue for the fixed pipeline. Async and non-blocking;
   // never fails startup.
-  void cleanupTentativeTasksV2(db, secrets).catch((e: Error) =>
-    console.warn(`cleanup_tentative_v2 failed (will retry next launch): ${e.message}`)
-  );
+  void cleanupTentativeTasksV2(db, secrets)
+    .catch((e: Error) =>
+      console.warn(`cleanup_tentative_v2 failed (will retry next launch): ${e.message}`)
+    )
+    .then(() => {
+      // One-time expired same-day sweep (keyed on cleanup_tentative_v3): drop review-
+      // queue commitments whose only temporal reference ("at 5:30", "tonight") was
+      // scoped to a sent day that has since passed. Runs AFTER v2 so commitments v2
+      // just returned to review are swept in the same launch.
+      try {
+        cleanupTentativeTasksV3(db!);
+      } catch (e) {
+        console.warn(`cleanup_tentative_v3 failed (will retry next launch): ${(e as Error).message}`);
+      }
+    });
 
   const isMac = process.platform === "darwin";
   Menu.setApplicationMenu(

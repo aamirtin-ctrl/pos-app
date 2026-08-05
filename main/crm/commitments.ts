@@ -18,7 +18,13 @@
 //      URLs/addresses, first-person narration, and contentless verb+pronoun stubs
 //      ("find something") never reach the table no matter what the model says.
 //   3. parseWhen (crm/when.ts) runs as a deterministic cross-check: when the LLM gave
-//      no due date but the message states a future one, it is attached.
+//      no due date but the message states a future one, it is attached. And
+//      isExpiredSameDay() backstops the same-day rule (owner report 2026-08-05 #2:
+//      "be back here at 5:30 latest" texted on a previous day survived as an undated
+//      task): a commitment whose ONLY temporal reference is a time-of-day or same-day
+//      marker ("at 5:30", "by noon", "tonight", "this afternoon", "in an hour") is
+//      scoped to its message's SENT date — once that moment has passed, the item is
+//      dropped entirely on BOTH the LLM and fallback paths, never kept undated.
 //   4. Deterministic-fallback rows are capped at confidence 0.5 (they are raw message
 //      fragments, not rewrites), so they can never clear the autonomy threshold in
 //      workers.autoTentativeTasks — they land in the review queue instead.
@@ -101,6 +107,70 @@ export function passesCommitmentGate(description: string): boolean {
   if (/\b(to|for|with|from)\s+(the\s+)?contact\b/i.test(d)) return false; // anonymous placeholder
   if (/\byou\b|\byour\b/i.test(d)) return false; // second-person = unrewritten message quote
   return true;
+}
+
+// ── same-day expiry backstop ─────────────────────────────────────────────────
+
+const DAY_MS = 86_400_000;
+
+// Same-day markers: temporal words that scope an instruction to its message's sent day
+// without naming a date ("tonight", "this afternoon", "in an hour", "by noon", "eod").
+const SAME_DAY_MARKER =
+  /\b(?:tonight|today|this\s+(?:morning|afternoon|evening)|later\s+today|end\s+of\s+(?:the\s+)?day|eod|in\s+(?:an?|a\s+few|a\s+couple(?:\s+of)?|\d{1,2})\s+(?:hour|hours|hr|hrs|min|mins|minute|minutes)|(?:at|by|before|until|till|around)\s+(?:noon|midnight))\b/i;
+
+/**
+ * Clock time mentioned in `text`, or null. PM-biased when am/pm is omitted — an
+ * ambiguous "5:30" only counts as expired once even the 5:30 PM reading has passed
+ * (conservative: never drop something that might still be ahead).
+ */
+function timeOfDayIn(text: string): { h: number; m: number } | null {
+  // "5:30", "5:30pm" — lookarounds keep "09:00:00"-style timestamp fragments out.
+  const hm = text.match(/(?<![\d:.])\b([01]?\d|2[0-3]):([0-5]\d)\s*(a\.?m\.?|p\.?m\.?)?(?![\d:])/i);
+  if (hm) {
+    let h = +hm[1];
+    const m = +hm[2];
+    const suffix = (hm[3] ?? "").toLowerCase();
+    if (suffix.startsWith("p") && h < 12) h += 12;
+    else if (suffix.startsWith("a") && h === 12) h = 0;
+    else if (!suffix && h >= 1 && h <= 11) h += 12; // ambiguous → the later (PM) reading
+    return { h, m };
+  }
+  const hOnly = text.match(/\b(1[0-2]|0?[1-9])\s*(a\.?m\.?|p\.?m\.?)\b/i); // "5pm", "11 am"
+  if (hOnly) {
+    let h = +hOnly[1];
+    if (/^p/i.test(hOnly[2]) && h < 12) h += 12;
+    else if (/^a/i.test(hOnly[2]) && h === 12) h = 0;
+    return { h, m: 0 };
+  }
+  if (/\b(?:at|by|before|until|till|around)\s+noon\b/i.test(text)) return { h: 12, m: 0 };
+  return null;
+}
+
+/**
+ * The same-day rule (owner report 2026-08-05 #2): a commitment whose ONLY temporal
+ * reference is a time-of-day or same-day marker ("at 5:30", "by noon", "tonight",
+ * "this afternoon", "in an hour") is scoped to its message's SENT date. Returns true
+ * when that moment has already passed at `now` — such an item must be DROPPED
+ * entirely, never kept as an undated task.
+ *
+ * Resolution: an explicit other-day reference in the text (a weekday, "tomorrow", a
+ * month, an ISO date — anything parseWhen resolves past the sent day) means the item
+ * is NOT same-day-scoped and is left untouched. Otherwise the deadline is the stated
+ * clock time on the sent day (PM-biased when ambiguous), or the sent day's end of day
+ * for marker-only text ("tonight"); the item is expired when that deadline < now.
+ */
+export function isExpiredSameDay(text: string, sentDate: Date, now: Date = new Date()): boolean {
+  const t = (text ?? "").replace(/\s+/g, " ").trim();
+  if (!t) return false;
+  const sent = sentDate instanceof Date ? sentDate : new Date(sentDate);
+  if (Number.isNaN(sent.getTime())) return false;
+  const time = timeOfDayIn(t);
+  if (!time && !SAME_DAY_MARKER.test(t)) return false; // no same-day temporal reference
+  const sentDay = Date.UTC(sent.getUTCFullYear(), sent.getUTCMonth(), sent.getUTCDate());
+  const when = parseWhen(t, sent);
+  if (when && when.getTime() > sentDay) return false; // explicit future/other-day date — untouched
+  const deadline = time ? sentDay + (time.h * 60 + time.m) * 60_000 : sentDay + DAY_MS;
+  return deadline < now.getTime();
 }
 
 export type CommitmentDirection = "i_owe_them" | "they_owe_me";
@@ -224,6 +294,7 @@ RESOLVE DATES — use the DATE REFERENCE table below; never invent:
 - The table is precomputed from each message's SENT date — take dates from it EXACTLY; never do weekday or month math yourself.
 - A stated timeframe becomes due_at: "in <month>" → that month's mid anchor (the 15th); "early <month>" → the 05 anchor; "late <month>" → the 25 anchor; "next week" / a weekday → the exact date from the table.
 - If the message states or implies NO timeframe, due_at MUST be null. NEVER default to the sent date or to today — a null due_at is correct and common.
+- SAME-DAY SCOPE: a time-of-day or same-day marker with NO other date ("at 5:30", "by noon", "tonight", "this afternoon", "in an hour") refers to the message's SENT date, not to today. If that moment has already passed by now, the item is EXPIRED — output nothing for it. NEVER keep it as an undated task.
 
 REWRITE — never quote:
 - "description" MUST be a rewritten imperative task phrase, NOT a copied message fragment.
@@ -240,6 +311,7 @@ REAL FAILURES — these exact snippets were wrongly turned into tasks before. Th
 - "looking at 345 Westwood Court on Google Maps" (a link/screenshot being discussed)
 - "for our school it's a little different because for girls to come to our helco they have to have one of us take them…" (explanatory chatter)
 - "I wanna be back here at 5:30 latest" (old logistics fragment)
+- "be back here at 5:30 latest (sent yesterday)" (expired same-day instruction — not a commitment)
 
 POSITIVE EXAMPLES (message → rewritten task):
 - Sarah: "can you send me the deck by fri?" — user: "yep will do" → { "description": "Send Sarah the pitch deck", "direction": "i_owe_them", "due_at": "<that Friday from the table>" }
@@ -348,6 +420,17 @@ export async function extractCommitmentsLlm(
                 const anchor = new Date(src.occurred_at);
                 const when = text && !Number.isNaN(anchor.getTime()) ? parseWhen(text, anchor) : null;
                 if (when && when.getTime() > Date.now()) dueAt = when.toISOString().slice(0, 10);
+                // Same-day backstop: an item still undated here whose only temporal
+                // reference is a time-of-day / same-day marker was scoped to its
+                // message's SENT date — if that moment has passed, drop it entirely.
+                // Items the model dated (explicit future date) never reach this check.
+                if (
+                  !dueAt &&
+                  !Number.isNaN(anchor.getTime()) &&
+                  isExpiredSameDay([description, text].filter(Boolean).join(" — "), anchor)
+                ) {
+                  continue;
+                }
               }
               ins.run(src.person_id, direction, description, dueAt, src.id, confidence);
               inserted++;
@@ -370,6 +453,11 @@ export async function extractCommitmentsLlm(
         ]);
         for (const p of proposals) {
           if (!passesCommitmentGate(p.description)) continue; // same gate as the LLM path
+          // Same-day backstop, same as the LLM path: an expired "at 5:30"/"tonight"
+          // fragment never reaches the review queue. (A text with an explicit
+          // other-day date makes isExpiredSameDay return false, so dated proposals
+          // are untouched.)
+          if (isExpiredSameDay([p.description, text].join(" — "), new Date(r.occurred_at))) continue;
           // Fallback proposals are raw message fragments, so their confidence is capped
           // below the autonomy threshold — they queue for review, never auto-convert.
           ins.run(r.person_id, "i_owe_them", p.description, p.dueAt, r.id, FALLBACK_CONFIDENCE);

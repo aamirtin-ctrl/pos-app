@@ -9,7 +9,7 @@ import { createRequire } from "node:module";
 import type { Db } from "./db/db.ts";
 import type { SecretStore } from "./secrets.ts";
 import type { LlmClient } from "./llm/provider.ts";
-import { extractCommitmentsLlm, passesCommitmentGate } from "./crm/commitments.ts";
+import { extractCommitmentsLlm, passesCommitmentGate, isExpiredSameDay } from "./crm/commitments.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { commitmentToTask, closeGoogleTask } from "./gcal/sync.ts";
 import { distillWeek, distillWeekKey } from "./worklog.ts";
@@ -297,6 +297,61 @@ export async function cleanupTentativeTasksV2(
     `workers: ${CLEANUP_TENTATIVE_V2_KEY} reset ${deletedTasks} auto-created task(s), returned ${reopened.size} commitment(s) to review`
   );
   return { deletedTasks, reopenedCommitments: reopened.size };
+}
+
+/** One-shot flag: the 2026-08-05 expired same-day sweep over the review queue. */
+export const CLEANUP_TENTATIVE_V3_KEY = "cleanup_tentative_v3";
+
+/**
+ * Third-pass sweep (owner report 2026-08-05 #2): "be back here at 5:30 latest" texted
+ * on a PREVIOUS day survived as an undated review item. A commitment whose only
+ * temporal reference is a time-of-day / same-day marker is scoped to its message's
+ * sent date — once that moment passed it should have been dropped, never kept undated
+ * (extraction now enforces this via isExpiredSameDay; this repairs what already
+ * landed). Over every open+unconfirmed commitment (the review queue) whose source
+ * interaction occurred more than 2 days ago, drop (status 'dropped', resolved_at set,
+ * kept for audit like dropCommitment) any where isExpiredSameDay over the description
+ * plus the source message's subject/body holds. Review-queue rows have no tasks and
+ * never reached Google, so the sweep is purely local. Keyed on setting
+ * CLEANUP_TENTATIVE_V3_KEY, set only after the pass completes.
+ */
+export function cleanupTentativeTasksV3(db: Db): { dropped: number } {
+  if (getSetting(db, CLEANUP_TENTATIVE_V3_KEY)) return { dropped: 0 };
+
+  const now = new Date();
+  const cutoff = now.getTime() - 2 * 86_400_000; // only messages more than 2 days old
+  const rows = db
+    .prepare(
+      `SELECT c.id, c.description, i.occurred_at, i.subject, i.body_summary
+       FROM commitment c JOIN interaction i ON i.id = c.source_interaction_id
+       WHERE c.status = 'open' AND c.confirmed_by_user = 0 AND i.occurred_at IS NOT NULL`
+    )
+    .all() as {
+    id: number;
+    description: string;
+    occurred_at: string;
+    subject: string | null;
+    body_summary: string | null;
+  }[];
+
+  const drop = db.prepare(
+    "UPDATE commitment SET status = 'dropped', resolved_at = datetime('now') WHERE id = ?"
+  );
+  let dropped = 0;
+  for (const r of rows) {
+    const sent = new Date(r.occurred_at);
+    if (Number.isNaN(sent.getTime()) || sent.getTime() > cutoff) continue; // recent — leave alone
+    const text = [r.description, r.subject, r.body_summary].filter(Boolean).join(" — ");
+    if (!isExpiredSameDay(text, sent, now)) continue;
+    drop.run(r.id);
+    dropped++;
+  }
+
+  setSetting(db, CLEANUP_TENTATIVE_V3_KEY, new Date().toISOString());
+  console.log(
+    `workers: ${CLEANUP_TENTATIVE_V3_KEY} dropped ${dropped} expired same-day commitment(s) from review (${rows.length} candidate(s) examined)`
+  );
+  return { dropped };
 }
 
 export interface WorkersHandle {
