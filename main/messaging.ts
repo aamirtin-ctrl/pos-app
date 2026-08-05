@@ -61,6 +61,13 @@ export interface InboxItem {
 
 const THREAD_LIMIT = 12;
 
+/**
+ * Channels whose interactions are email. The mail connector writes every provider's
+ * messages under channel 'gmail'; the others exist for the file/OAuth importers and
+ * for outbound rows recorded by sendEmail (channel = the account's provider).
+ */
+export const EMAIL_CHANNELS = ["gmail", "outlook", "icloud", "mailfile"] as const;
+
 type InboxRow = Omit<
   InboxItem,
   "unanswered" | "thread" | "thread_key" | "is_group" | "group_name"
@@ -134,11 +141,16 @@ export function listInbox(db: Db, opts: { limit?: number } = {}): InboxItem[] {
      WHERE i.thread_external_id = ?
      ORDER BY i.occurred_at DESC LIMIT ${THREAD_LIMIT}`
   );
+  // 1:1 threads exclude multi-party chat rows (iMessage chat guids, LinkedIn
+  // conversation ids). Email rows are the exception: sendEmail stores the reply's
+  // Message-ID chain in thread_external_id, so those rows must stay in the person's
+  // 1:1 thread — mail conversations are never rendered as group chats.
   const personThreadStmt = db.prepare(
     `SELECT i.id, i.channel, i.direction, i.subject, i.body_summary, i.occurred_at,
             p.display_name AS sender_name
      FROM interaction i JOIN person p ON p.id = i.person_id
-     WHERE i.person_id = ? AND i.thread_external_id IS NULL
+     WHERE i.person_id = ?
+       AND (i.thread_external_id IS NULL OR i.channel IN (${EMAIL_CHANNELS.map(() => "?").join(",")}))
      ORDER BY i.occurred_at DESC LIMIT ${THREAD_LIMIT}`
   );
 
@@ -148,7 +160,7 @@ export function listInbox(db: Db, opts: { limit?: number } = {}): InboxItem[] {
     const thread = (
       isGroup
         ? (chatThreadStmt.all(r.thread_external_id) as ThreadMessage[])
-        : (personThreadStmt.all(r.person_id) as ThreadMessage[])
+        : (personThreadStmt.all(r.person_id, ...EMAIL_CHANNELS) as ThreadMessage[])
     ).reverse(); // oldest → newest
     const groupName = isGroup
       ? ((groupNameStmt.get(r.thread_external_id) as { subject: string } | undefined)?.subject ??
@@ -236,6 +248,75 @@ function markLatestDraftSent(db: Db, personId: number): void {
   ).run(personId, personId);
 }
 
+// ── reply threading ──────────────────────────────────────────────────────────
+
+/**
+ * Normalize an RFC 5322 Message-ID to angle-bracket form, or null when the value
+ * clearly isn't one (our own `sent:<ts>` ids, iMessage chat guids, IMAP uid
+ * fallbacks like `gmail:INBOX:42`). A Message-ID is `<local@domain>`: no
+ * whitespace, exactly one '@', a dot-bearing domain.
+ */
+export function normalizeMessageId(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const inner = raw.trim().replace(/^<+/, "").replace(/>+$/, "").trim();
+  if (!inner || /\s/.test(inner)) return null;
+  const at = inner.indexOf("@");
+  if (at <= 0 || at !== inner.lastIndexOf("@")) return null;
+  if (!inner.slice(at + 1).includes(".")) return null;
+  return `<${inner}>`;
+}
+
+/** The inbound message a reply should thread onto. */
+export interface ReplyTarget {
+  /** Original Message-ID, angle-bracketed → the In-Reply-To header. */
+  messageId: string;
+  /** Space-separated References chain (thread root first, original last). */
+  references: string;
+  /** Value to store on the outbound row so POS itself threads the conversation. */
+  threadExternalId: string;
+}
+
+/**
+ * Derive the reply target from the person's most recent INBOUND email interaction.
+ * Returns null when there's no prior inbound, or when its external_id isn't a
+ * Message-ID — a reply with no In-Reply-To is better than a bogus one.
+ */
+export function findReplyTarget(db: Db, personId: number): ReplyTarget | null {
+  const row = db
+    .prepare(
+      `SELECT external_id, thread_external_id FROM interaction
+       WHERE person_id = ? AND direction = 'inbound'
+         AND channel IN (${EMAIL_CHANNELS.map(() => "?").join(",")})
+       ORDER BY occurred_at DESC, id DESC LIMIT 1`
+    )
+    .get(personId, ...EMAIL_CHANNELS) as
+    | { external_id: string | null; thread_external_id: string | null }
+    | undefined;
+  if (!row) return null;
+  const messageId = normalizeMessageId(row.external_id);
+  if (!messageId) return null;
+  const root = normalizeMessageId(row.thread_external_id);
+  return buildReplyTarget({ messageId, references: root && root !== messageId ? root : undefined });
+}
+
+/** Normalize a caller-supplied reply reference into a full ReplyTarget. */
+export function buildReplyTarget(
+  replyTo: { messageId: string; references?: string } | null | undefined
+): ReplyTarget | null {
+  const messageId = normalizeMessageId(replyTo?.messageId);
+  if (!messageId) return null;
+  // References may already be a chain — keep every id, normalize each, drop dupes.
+  const chain: string[] = [];
+  for (const part of (replyTo?.references ?? "").split(/\s+/)) {
+    const id = normalizeMessageId(part);
+    if (id && !chain.includes(id)) chain.push(id);
+  }
+  if (!chain.includes(messageId)) chain.push(messageId);
+  return { messageId, references: chain.join(" "), threadExternalId: chain[0] };
+}
+
+// ── send ─────────────────────────────────────────────────────────────────────
+
 export interface SendEmailArgs {
   personId: number;
   to: string;
@@ -243,17 +324,42 @@ export interface SendEmailArgs {
   body: string;
   /** Match a specific mail account by address; defaults to the first account. */
   accountUser?: string;
+  /**
+   * Thread this send onto an existing message. Omit and sendEmail derives it from
+   * the person's most recent inbound email; pass `null` to force a fresh thread.
+   */
+  replyTo?: { messageId: string; references?: string } | null;
+}
+
+/** Minimal nodemailer surface sendEmail needs — injectable so tests never hit SMTP. */
+export interface MailTransport {
+  sendMail(opts: Record<string, unknown>): Promise<{ messageId?: string }>;
+}
+
+export interface SendEmailDeps {
+  createTransport?: (opts: Record<string, unknown>) => MailTransport;
 }
 
 /**
  * Send an email over SMTP with the stored mail-account credentials, then record
  * an outbound interaction and mark the matching draft sent. User-initiated only.
+ *
+ * Replies thread: In-Reply-To / References carry the original Message-ID so
+ * Gmail, Outlook and Apple Mail collapse the reply into the existing conversation,
+ * and the outbound row's thread_external_id does the same inside POS.
  */
 export async function sendEmail(
   db: Db,
   secrets: SecretsLike,
-  args: SendEmailArgs
-): Promise<{ sent: true; messageId: string; channel: string; account: string }> {
+  args: SendEmailArgs,
+  deps: SendEmailDeps = {}
+): Promise<{
+  sent: true;
+  messageId: string;
+  channel: string;
+  account: string;
+  inReplyTo: string | null;
+}> {
   if (!args.to?.trim()) throw new Error("no_recipient");
   const accounts = listMailAccounts(secrets);
   if (accounts.length === 0) throw new Error("no_email_account");
@@ -268,7 +374,20 @@ export async function sendEmail(
   }
   const cfg = smtpConfigFor(account.provider); // throws smtp_unsupported_provider for 'imap'
 
-  const transporter = nodemailer.createTransport({
+  // Explicit replyTo wins; `null` forces a fresh thread; undefined derives from history.
+  const reply =
+    args.replyTo === null
+      ? null
+      : args.replyTo
+        ? buildReplyTarget(args.replyTo)
+        : findReplyTarget(db, args.personId);
+
+  const createTransport =
+    deps.createTransport ??
+    ((opts: Record<string, unknown>) =>
+      nodemailer.createTransport(opts as Parameters<typeof nodemailer.createTransport>[0]) as unknown as MailTransport);
+
+  const transporter = createTransport({
     host: cfg.host,
     port: cfg.port,
     secure: cfg.secure,
@@ -282,6 +401,8 @@ export async function sendEmail(
     to: args.to,
     subject: args.subject,
     text: args.body,
+    // Threading headers — omitted entirely when this isn't a reply.
+    ...(reply ? { inReplyTo: reply.messageId, references: reply.references } : {}),
   });
 
   const channel = account.provider; // gmail | outlook | icloud (imap can't reach here)
@@ -293,9 +414,16 @@ export async function sendEmail(
     subject: args.subject || null,
     bodySummary: snippet(args.body),
     externalId: info.messageId || `sent:${Date.now()}`,
+    threadExternalId: reply?.threadExternalId ?? null,
   });
   markLatestDraftSent(db, args.personId);
-  return { sent: true, messageId: info.messageId ?? "", channel, account: account.user };
+  return {
+    sent: true,
+    messageId: info.messageId ?? "",
+    channel,
+    account: account.user,
+    inReplyTo: reply?.messageId ?? null,
+  };
 }
 
 // ── iMessage send (osascript) ────────────────────────────────────────────────

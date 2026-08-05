@@ -19,6 +19,7 @@ import {
   dedupeKeyFor,
 } from "./crm/commitments.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
+import { runEnrichment } from "./crm/enrich.ts";
 import { commitmentToTask, closeGoogleTask, readAnchors } from "./gcal/sync.ts";
 import { eventsForDate as icsEventsForDate } from "./icscal.ts";
 import { distillWeek, distillWeekKey } from "./worklog.ts";
@@ -639,6 +640,11 @@ export async function cleanupDuplicateCommitments(
   return { groups: dupGroups, dropped, tasksClosed };
 }
 
+/** Settings key marking the day's enrichment pass as done (one pass per calendar day). */
+export function enrichDayKey(now: Date = new Date()): string {
+  return `enrich_day:${now.toISOString().slice(0, 10)}`;
+}
+
 export interface WorkersHandle {
   stop(): void;
 }
@@ -756,6 +762,22 @@ export function startWorkers(
       if ((dow === 5 || dow === 6 || dow === 0) && !getSetting(db, distillWeekKey())) {
         const d = await distillWeek(db, llm);
         if (d.inserted > 0) notify?.(`Worklog: distilled ${d.inserted} entr${d.inserted === 1 ? "y" : "ies"} for the week`);
+      }
+      // Profile synthesis + bio-mining: once per day. The daily LLM budget lives in
+      // enrich.ts (enrichment_attempt ledger); the setting key just keeps the pass
+      // from re-running on every 15-minute tick. Skipped silently without an LLM.
+      try {
+        if (llm && !getSetting(db, enrichDayKey())) {
+          const e = await runEnrichment(db, llm);
+          setSetting(db, enrichDayKey(), new Date().toISOString());
+          if (e.synthesized > 0 || e.mined > 0) {
+            notify?.(
+              `Profiles: ${e.synthesized} synthesized, ${e.mined} bio${e.mined === 1 ? "" : "s"} enriched`
+            );
+          }
+        }
+      } catch (e) {
+        console.warn(`workers: enrichment failed: ${(e as Error).message}`);
       }
     } catch (e) {
       console.warn(`workers: scheduled sync failed: ${(e as Error).message}`);

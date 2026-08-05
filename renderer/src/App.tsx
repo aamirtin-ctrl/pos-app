@@ -4,6 +4,7 @@ import Relationships from "./relationships/Relationships.tsx";
 import ContactDetail from "./relationships/ContactDetail.tsx";
 import Inbox from "./inbox/Stub.tsx";
 import Settings from "./settings/Settings.tsx";
+import ReviewModal from "./relationships/ReviewModal.tsx";
 
 // Hash router: #/calendar · #/relationships[/contacts] · #/contact/:id · #/messaging · #/settings
 export function useRoute(): string {
@@ -228,6 +229,107 @@ function CommandBar() {
   );
 }
 
+// "You" chip (GAP_REPORT #18) — the old app's ProfileBadge, reduced to its cosmetic core.
+// Name/email live in the plain `setting` table (profile_name / profile_email) via the
+// existing settings IPC; clicking opens a tiny inline editor. No photo, no stats.
+function initials(name: string): string {
+  const parts = name.trim().split(/\s+/).slice(0, 2);
+  return parts.map((p) => p[0]?.toUpperCase() ?? "").join("") || "Y";
+}
+
+function ProfileBadge() {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [draft, setDraft] = useState({ name: "", email: "" });
+  const [saving, setSaving] = useState(false);
+
+  const load = async () => {
+    const [n, e] = await Promise.all([
+      window.pos.settings.get("profile_name"),
+      window.pos.settings.get("profile_email"),
+    ]);
+    setName(n.ok ? ((n.data as string | null) ?? "") : "");
+    setEmail(e.ok ? ((e.data as string | null) ?? "") : "");
+  };
+  useEffect(() => { load(); }, []);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await window.pos.settings.set("profile_name", draft.name.trim());
+      await window.pos.settings.set("profile_email", draft.email.trim());
+      setName(draft.name.trim());
+      setEmail(draft.email.trim());
+      setOpen(false);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <>
+      <button
+        onClick={() => { setDraft({ name, email }); setOpen((o) => !o); }}
+        title={name ? `${name}${email ? ` · ${email}` : ""}` : "Set your name and email"}
+        className="no-drag fixed bottom-4 left-16 z-20 flex items-center justify-center w-9 h-9 rounded-full border shadow-sm text-[12px] font-medium transition-transform duration-[120ms] hover:scale-110 active:scale-95"
+        style={{
+          borderColor: "var(--line)",
+          color: "white",
+          background: "radial-gradient(circle at 32% 28%, var(--pink-2) 8%, var(--pink-3) 62%, var(--accent) 100%)",
+        }}
+      >
+        {initials(name || "You")}
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-20" onClick={() => setOpen(false)} />
+          <div
+            className="no-drag fixed bottom-16 left-4 z-30 w-60 rounded-2xl border bg-white shadow-xl p-3 view-enter"
+            style={{ borderColor: "var(--line)" }}
+          >
+            <div className="text-[11px] mb-1.5" style={{ color: "var(--muted)" }}>You</div>
+            <input
+              autoFocus
+              value={draft.name}
+              onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+              onKeyDown={(e) => e.key === "Enter" && save()}
+              placeholder="Your name"
+              className="w-full border rounded-lg px-2 py-1 text-sm"
+              style={{ borderColor: "var(--line)" }}
+            />
+            <input
+              value={draft.email}
+              onChange={(e) => setDraft({ ...draft, email: e.target.value })}
+              onKeyDown={(e) => e.key === "Enter" && save()}
+              placeholder="you@email.com"
+              className="w-full mt-1.5 border rounded-lg px-2 py-1 text-[12px]"
+              style={{ borderColor: "var(--line)" }}
+            />
+            <div className="flex gap-1.5 mt-2">
+              <button
+                onClick={save}
+                disabled={saving}
+                className="px-2.5 py-1 rounded-lg text-[12px] text-white disabled:opacity-50 active:scale-95"
+                style={{ background: "var(--accent)" }}
+              >
+                {saving ? "Saving…" : "Save"}
+              </button>
+              <button
+                onClick={() => setOpen(false)}
+                className="px-2.5 py-1 rounded-lg border text-[12px] bg-white active:scale-95"
+                style={{ borderColor: "var(--line)", color: "var(--muted)" }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
 export default function App() {
   const route = useRoute();
   const view = route.split("/")[1] ?? "calendar";
@@ -280,6 +382,8 @@ export default function App() {
       <div className="drag-region absolute top-0 left-0 right-0 h-9 z-10" />
       <Branch blooms={blooms} />
       <CommandBar />
+      {/* Review queue (#7/#8/#9): mounted app-wide, opened only by the Relationships badge. */}
+      <ReviewModal />
 
       {/* keyed by view: switching sections re-enters with a gentle fade+rise */}
       <main key={view} className="h-full overflow-auto pb-28 view-enter">
@@ -313,6 +417,9 @@ export default function App() {
       >
         {ICONS.settings}
       </a>
+
+      {/* "you" chip — bottom left, right of the gear (#18) */}
+      <ProfileBadge />
 
       {/* three free-floating icons on a gentle arc — pink ombre, per the sketch */}
       <nav className="no-drag fixed bottom-5 left-1/2 -translate-x-1/2 z-20 flex items-end gap-7">

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { openReview, useReviewCount, REVIEW_CHANGED_EVENT } from "./ReviewModal.tsx";
 
 // Relationships dashboard: query hero → ranked results, plus the two standing
 // panels — Reconnect (cadence debt) and Commitments (extracted obligations).
@@ -162,6 +163,16 @@ export default function Home() {
     );
   }, []);
   useEffect(() => { refetch(); }, [refetch]);
+  // Triage in the Review modal can keep/discard/merge people — pull the panels back
+  // into sync when it reports a change.
+  useEffect(() => {
+    window.addEventListener(REVIEW_CHANGED_EVENT, refetch);
+    return () => window.removeEventListener(REVIEW_CHANGED_EVENT, refetch);
+  }, [refetch]);
+
+  // Review queue badge (#7/#8/#9): a quiet count next to the title. The modal itself is
+  // mounted app-wide in App.tsx and never opens on its own.
+  const reviewCount = useReviewCount();
 
   const runQuery = async () => {
     const q = inquiry.trim();
@@ -224,7 +235,19 @@ export default function Home() {
   return (
     <div className="p-6 max-w-4xl mx-auto">
       <div className="drag-region h-4" />
-      <h1 className="font-display text-2xl font-semibold mb-1 no-drag">Relationships</h1>
+      <div className="flex items-center gap-2 mb-1 no-drag">
+        <h1 className="font-display text-2xl font-semibold">Relationships</h1>
+        {reviewCount > 0 && (
+          <button
+            onClick={openReview}
+            title="New contacts, possible duplicates and ambiguous handles waiting on you"
+            className="px-2 py-0.5 rounded-full border text-[11.5px] tabular-nums hover:shadow-sm transition-[box-shadow,transform] duration-[120ms] active:scale-95"
+            style={{ background: "var(--accent-soft)", borderColor: "var(--accent-soft)", color: "var(--ink)" }}
+          >
+            {reviewCount} to review
+          </button>
+        )}
+      </div>
       <p className="text-xs mb-4" style={{ color: "var(--muted)" }}>
         Ask anything — "who should I talk to about X", "note about Sarah: …" — from the sparkle button, top right.
       </p>

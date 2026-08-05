@@ -1,5 +1,6 @@
 // Unified-inbox tests — pure/DB only. No network, no osascript: SMTP mapping and
-// AppleScript escaping are tested as exported helpers.
+// AppleScript escaping are tested as exported helpers, and sendEmail runs against
+// an injected transport.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
@@ -13,6 +14,10 @@ import {
   iMessageScript,
   iMessageChatScript,
   smtpConfigFor,
+  sendEmail,
+  findReplyTarget,
+  normalizeMessageId,
+  type MailTransport,
 } from "../main/messaging.ts";
 import { deletePerson } from "../main/crm/people.ts";
 
@@ -370,5 +375,167 @@ describe("smtpConfigFor", () => {
   });
   it("throws the typed error for custom imap providers", () => {
     expect(() => smtpConfigFor("imap")).toThrow(/^smtp_unsupported_provider$/);
+  });
+});
+
+describe("normalizeMessageId", () => {
+  it("adds angle brackets and trims, idempotently", () => {
+    expect(normalizeMessageId("abc123@mail.gmail.com")).toBe("<abc123@mail.gmail.com>");
+    expect(normalizeMessageId("<abc123@mail.gmail.com>")).toBe("<abc123@mail.gmail.com>");
+    expect(normalizeMessageId("  <<abc123@mail.gmail.com>>  ")).toBe("<abc123@mail.gmail.com>");
+  });
+
+  it("rejects values that are not Message-IDs", () => {
+    for (const bad of [null, undefined, "", "   ", "sent:1754390000000", "gmail:INBOX:42",
+      "iMessage;+;chat123", "no-at-sign", "two@ats@x.com", "user@localhost", "has space@x.com"]) {
+      expect(normalizeMessageId(bad)).toBeNull();
+    }
+  });
+});
+
+describe("sendEmail reply threading", () => {
+  const secrets = {
+    get: (k: string) =>
+      k === "MAIL_ACCOUNTS"
+        ? JSON.stringify([
+            { id: "a1", provider: "gmail", user: "me@gmail.com", password: "app-pw", host: "imap.gmail.com", port: 993 },
+          ])
+        : null,
+    set: () => {},
+    delete: () => {},
+  };
+
+  /** Capture the options handed to nodemailer instead of connecting to SMTP. */
+  function captureTransport() {
+    const sent: Record<string, unknown>[] = [];
+    const deps = {
+      createTransport: (): MailTransport => ({
+        sendMail: async (opts: Record<string, unknown>) => {
+          sent.push(opts);
+          return { messageId: "<outbound-1@mail.gmail.com>" };
+        },
+      }),
+    };
+    return { sent, deps };
+  }
+
+  function addInbound(
+    personId: number,
+    externalId: string | null,
+    o: { channel?: string; occurredAt?: string; threadExternalId?: string | null } = {}
+  ): void {
+    db.prepare(
+      `INSERT INTO interaction (person_id, channel, direction, occurred_at, subject, body_summary, external_id, thread_external_id)
+       VALUES (?, ?, 'inbound', ?, 'Coffee?', 'free thursday?', ?, ?)`
+    ).run(
+      personId,
+      o.channel ?? "gmail",
+      o.occurredAt ?? "2026-08-01T10:00:00Z",
+      externalId,
+      o.threadExternalId ?? null
+    );
+  }
+
+  const send = (personId: number, deps: { createTransport: () => MailTransport }, extra: Record<string, unknown> = {}) =>
+    sendEmail(db, secrets, { personId, to: "ada@x.com", subject: "Re: Coffee?", body: "Thursday works", ...extra }, deps);
+
+  it("derives inReplyTo/references from the person's most recent inbound message", async () => {
+    const p = addPerson("Ada");
+    addInbound(p, "<older@mail.gmail.com>", { occurredAt: "2026-07-01T10:00:00Z" });
+    addInbound(p, "<newest@mail.gmail.com>", { occurredAt: "2026-08-01T10:00:00Z" });
+    const { sent, deps } = captureTransport();
+
+    const res = await send(p, deps);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].inReplyTo).toBe("<newest@mail.gmail.com>");
+    expect(sent[0].references).toBe("<newest@mail.gmail.com>");
+    expect(res.inReplyTo).toBe("<newest@mail.gmail.com>");
+
+    // POS threads the conversation itself via the outbound row.
+    const out = db
+      .prepare("SELECT thread_external_id FROM interaction WHERE direction = 'outbound'")
+      .get() as { thread_external_id: string | null };
+    expect(out.thread_external_id).toBe("<newest@mail.gmail.com>");
+  });
+
+  it("normalizes a bare Message-ID on the inbound row to angle brackets", async () => {
+    const p = addPerson("Ada");
+    addInbound(p, "bare-id@mail.gmail.com");
+    const { sent, deps } = captureTransport();
+    await send(p, deps);
+    expect(sent[0].inReplyTo).toBe("<bare-id@mail.gmail.com>");
+    expect(sent[0].references).toBe("<bare-id@mail.gmail.com>");
+  });
+
+  it("puts the thread root first in References and uses it as thread_external_id", async () => {
+    const p = addPerson("Ada");
+    addInbound(p, "<reply-3@mail.gmail.com>", { threadExternalId: "<root-1@mail.gmail.com>" });
+    const { sent, deps } = captureTransport();
+    await send(p, deps);
+    expect(sent[0].references).toBe("<root-1@mail.gmail.com> <reply-3@mail.gmail.com>");
+    expect(sent[0].inReplyTo).toBe("<reply-3@mail.gmail.com>");
+    const out = db
+      .prepare("SELECT thread_external_id FROM interaction WHERE direction = 'outbound'")
+      .get() as { thread_external_id: string | null };
+    expect(out.thread_external_id).toBe("<root-1@mail.gmail.com>");
+  });
+
+  it("sends no threading headers when there is no prior inbound message", async () => {
+    const p = addPerson("Nobody");
+    const { sent, deps } = captureTransport();
+    const res = await send(p, deps);
+    expect(sent[0]).not.toHaveProperty("inReplyTo");
+    expect(sent[0]).not.toHaveProperty("references");
+    expect(res.inReplyTo).toBeNull();
+    const out = db
+      .prepare("SELECT thread_external_id FROM interaction WHERE direction = 'outbound'")
+      .get() as { thread_external_id: string | null };
+    expect(out.thread_external_id).toBeNull();
+  });
+
+  it("sends no threading headers when the inbound external_id is not a Message-ID", async () => {
+    const p = addPerson("Ada");
+    addInbound(p, "gmail:INBOX:42");
+    const { sent, deps } = captureTransport();
+    await send(p, deps);
+    expect(sent[0]).not.toHaveProperty("inReplyTo");
+  });
+
+  it("ignores inbound messages on non-email channels", async () => {
+    const p = addPerson("Ada");
+    addInbound(p, "<im@mail.gmail.com>", { channel: "imessage" });
+    expect(findReplyTarget(db, p)).toBeNull();
+    const { sent, deps } = captureTransport();
+    await send(p, deps);
+    expect(sent[0]).not.toHaveProperty("inReplyTo");
+  });
+
+  it("prefers an explicit replyTo argument and normalizes its references chain", async () => {
+    const p = addPerson("Ada");
+    addInbound(p, "<derived@mail.gmail.com>");
+    const { sent, deps } = captureTransport();
+    await send(p, deps, {
+      replyTo: { messageId: "explicit@mail.gmail.com", references: "<root@mail.gmail.com> mid@mail.gmail.com" },
+    });
+    expect(sent[0].inReplyTo).toBe("<explicit@mail.gmail.com>");
+    expect(sent[0].references).toBe("<root@mail.gmail.com> <mid@mail.gmail.com> <explicit@mail.gmail.com>");
+  });
+
+  it("replyTo: null forces a fresh thread even when a prior inbound exists", async () => {
+    const p = addPerson("Ada");
+    addInbound(p, "<derived@mail.gmail.com>");
+    const { sent, deps } = captureTransport();
+    await send(p, deps, { replyTo: null });
+    expect(sent[0]).not.toHaveProperty("inReplyTo");
+  });
+
+  it("keeps the threaded reply visible in the person's 1:1 inbox thread", async () => {
+    const p = addPerson("Ada");
+    addInbound(p, "<newest@mail.gmail.com>");
+    const { deps } = captureTransport();
+    await send(p, deps);
+    const [item] = listInbox(db);
+    expect(item.thread.map((m) => m.direction)).toEqual(["inbound", "outbound"]);
+    expect(item.answered).toBe(1);
   });
 });

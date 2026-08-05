@@ -28,6 +28,16 @@ import {
   removeFromGroup,
   hiddenPersonIds,
 } from "./crm/groups.ts";
+import {
+  reviewQueue,
+  keepContacts,
+  discardContacts,
+  groupContacts,
+  mergeCluster,
+  dismissDuplicates,
+  resolveAmbiguous,
+  dismissAmbiguous,
+} from "./crm/review.ts";
 import { exportContactsCsv, defaultCsvFilename } from "./crm/export.ts";
 import { rank } from "./crm/ranking.ts";
 import {
@@ -169,6 +179,20 @@ export function registerIpc(deps: IpcDeps) {
   h("groups.hide", (name: string, hidden: boolean) => ({ ok: setHidden(db, name, hidden) }));
   h("groups.hideContacts", (name: string, on: boolean) => ({ ok: setHideContacts(db, name, on) }));
   h("groups.suppressFollowUps", (name: string, on: boolean) => ({ ok: setSuppressFollowUps(db, name, on) }));
+
+  // ── review queue (#7 ambiguous · #8 new-contact triage · #9 duplicates) ──
+  // Bodies live in crm/review.ts so they are testable without electron. One read
+  // channel feeds the whole modal (contacts + duplicates + ambiguous + counts).
+  h("review.pending", () => reviewQueue(db));
+  h("review.keep", (ids: number[]) => ({ kept: keepContacts(db, ids ?? []) }));
+  h("review.discard", (ids: number[]) => ({ discarded: discardContacts(db, ids ?? []) }));
+  h("review.group", (ids: number[], name: string) => groupContacts(db, ids ?? [], name));
+  // Same merge the Contacts merge-bar uses (crm/people.ts mergePeople): richest survivor,
+  // field backfill, sidecars moved — plus clearing the survivor's 'unverified' tag.
+  h("review.mergeCluster", (ids: number[]) => ({ kept: mergeCluster(db, ids ?? []) }));
+  h("review.dismissDuplicates", (key: string) => ({ dismissed: dismissDuplicates(db, key) }));
+  h("review.resolveAmbiguous", (key: string, personId: number) => resolveAmbiguous(db, key, personId));
+  h("review.dismissAmbiguous", (key: string) => ({ dismissed: dismissAmbiguous(db, key) }));
 
   // ── CSV export (#20) ──
   // Body is pure (crm/export.ts); the dialog + write live here.

@@ -18,6 +18,16 @@ contextBridge.exposeInMainWorld("pos", {
     exportCsv: call("people.exportCsv"),
   },
   query: { rank: call("query.rank") },
+  review: {
+    pending: call("review.pending"),
+    keep: call("review.keep"),
+    discard: call("review.discard"),
+    group: call("review.group"),
+    mergeCluster: call("review.mergeCluster"),
+    dismissDuplicates: call("review.dismissDuplicates"),
+    resolveAmbiguous: call("review.resolveAmbiguous"),
+    dismissAmbiguous: call("review.dismissAmbiguous"),
+  },
   groups: {
     list: call("groups.list"),
     create: call("groups.create"),

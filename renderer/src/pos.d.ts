@@ -17,6 +17,11 @@ declare global {
         reconnect: Call; dismissReconnect: Call; undismissReconnect: Call; exportCsv: Call;
       };
       query: { rank: Call };
+      review: {
+        pending: Call; keep: Call; discard: Call; group: Call;
+        mergeCluster: Call; dismissDuplicates: Call;
+        resolveAmbiguous: Call; dismissAmbiguous: Call;
+      };
       groups: {
         list: Call; create: Call; rename: Call; delete: Call;
         assign: Call; assignMany: Call; remove: Call;

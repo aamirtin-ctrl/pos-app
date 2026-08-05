@@ -24,6 +24,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { normalizeEmail, normalizePhone } from "../crm/normalize.ts";
 import { resolveHandle } from "../crm/identity.ts";
+import { recordAmbiguous } from "../crm/review.ts";
 import { buildNameIndex } from "./addressbook.ts";
 import {
   type ConnectorDeps,
@@ -313,7 +314,15 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
             personId = res.personId;
             matched++;
           } else if (res.status === "ambiguous") {
-            personId = null; // never auto-pick
+            // Never auto-pick — surface it in the review queue instead of dropping it.
+            recordAmbiguous(db, {
+              handleKind: email ? "email" : "imessage_handle",
+              handleValue: key,
+              name: null,
+              candidateIds: res.candidateIds ?? [],
+              sampleText: (row.text ?? "").slice(0, 140) || null,
+            });
+            personId = null;
           } else {
             // Saved in macOS Contacts → full contact with their real name.
             const hit = canCreate ? ab.index.get(key) : undefined;

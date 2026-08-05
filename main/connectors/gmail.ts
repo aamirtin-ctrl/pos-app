@@ -20,6 +20,7 @@ import { freshAccessToken, googleTokenSecret } from "../gcal/auth.ts";
 import { simpleParser, type AddressObject, type EmailAddress } from "mailparser";
 import type { SecretStore } from "../secrets.ts";
 import { resolveHandle } from "../crm/identity.ts";
+import { recordAmbiguous } from "../crm/review.ts";
 import {
   type ConnectorDeps,
   type SyncReport,
@@ -330,7 +331,15 @@ export async function syncMailAccount(
               personId = res.personId;
               matched++;
             } else if (res.status === "ambiguous") {
-              report.skipped++; // never auto-pick between candidates
+              // Never auto-pick — send it to the review queue rather than dropping it.
+              recordAmbiguous(db, {
+                handleKind: "email",
+                handleValue: cpEmail.trim().toLowerCase(),
+                name: cpName ?? null,
+                candidateIds: res.candidateIds ?? [],
+                sampleText: (subject ?? "").slice(0, 140) || null,
+              });
+              report.skipped++;
               continue;
             } else {
               // Unknown REAL sender (automated already filtered above) → unverified
