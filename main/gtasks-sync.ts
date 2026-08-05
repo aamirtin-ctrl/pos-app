@@ -1,0 +1,346 @@
+// Google Tasks ⇄ POS reconciliation — the PULL half of the phone sync.
+//
+// gcal/sync.ts only ever PUSHED (local task/commitment → the "POS" Google Tasks list),
+// so anything the owner did on the phone was invisible here: "I deleted some tasks from
+// Google Tasks but they still show in the app. It should work vice versa as well."
+// This module adds the missing direction and then runs the existing push, in that order.
+//
+// Ordering matters: pull FIRST, push second. A task the owner deleted in Google must be
+// closed locally before pushTasks runs, otherwise the same run would re-create it and the
+// deletion would look like it never happened.
+//
+// Reconciliation matrix (Google is the most recent statement of intent; local rows are
+// never hard-deleted — POS keeps history and the planner/worklog read it):
+//
+//   Google state                          Local task                       Commitment
+//   ────────────────────────────────────  ───────────────────────────────  ─────────────────
+//   deleted:true, or id gone from list    status='deferred', gtasks_id=NULL  back to 'open'
+//   status='completed'                    status='done', completed_at        'done' + resolved_at
+//   title / due changed                   title / hard_deadline_at updated   —
+//   exists, no local counterpart          INSERT status='inbox'              —
+//   commitment marker task, completed     —                                  'done' + resolved_at
+//   commitment marker task, deleted       —                                  'dropped' + resolved_at
+//
+// The two marker rows exist because pushTasks writes confirmed commitments straight to
+// Google with a `pos:commitment:<id>` note and no local task row. Without them a
+// commitment ticked off (or binned) on the phone stays 'open' here and the very next
+// pushTasks re-creates it — the owner's complaint, in its second form.
+//
+// No migration: every write below uses columns that already exist.
+
+import { google, type tasks_v1 } from "googleapis";
+import type { Db } from "./db/db.ts";
+import type { SecretStore } from "./secrets.ts";
+import { isGoogleConnected, oauthClient } from "./gcal/auth.ts";
+import { ensurePosTasklist, pushTasks } from "./gcal/sync.ts";
+
+/** Whole reconciliation is time-boxed — it runs on a cron and must never wedge. */
+export const RECONCILE_TIMEOUT_MS = 60_000;
+
+/** Local statuses that are still "live" and therefore worth reconciling against Google. */
+const LIVE_STATUSES = ["inbox", "planned", "in_progress"] as const;
+
+/** The note pushTasks stamps on a commitment it pushed with no local task row. */
+export const COMMITMENT_MARKER_PREFIX = "pos:commitment:";
+
+/** Only the Google Task fields this module reads (keeps the fake API in tests honest). */
+export interface GoogleTaskLite {
+  id?: string | null;
+  title?: string | null;
+  notes?: string | null;
+  /** "needsAction" | "completed" */
+  status?: string | null;
+  /** RFC 3339; Google stores date-only semantics at UTC midnight. */
+  due?: string | null;
+  completed?: string | null;
+  deleted?: boolean | null;
+  hidden?: boolean | null;
+}
+
+export interface GoogleTasksPage {
+  items: GoogleTaskLite[];
+  nextPageToken?: string | null;
+}
+
+/**
+ * Injectable Google surface. Every member defaults to the real googleapis call
+ * (see realGoogleTasksDeps); tests pass fakes so nothing touches the network.
+ *
+ * `patchTask` / `insertTask` are the WRITE seam. The pull pass deliberately performs no
+ * Google writes — the push pass owns that — so tests assert these are never called.
+ */
+export interface GoogleTasksDeps {
+  isConnected(secrets: SecretStore): boolean;
+  ensureTasklist(): Promise<string>;
+  listTasks(args: { tasklist: string; pageToken?: string }): Promise<GoogleTasksPage>;
+  patchTask(args: { tasklist: string; task: string; body: Partial<GoogleTaskLite> }): Promise<void>;
+  insertTask(args: { tasklist: string; body: Partial<GoogleTaskLite> }): Promise<GoogleTaskLite>;
+  /** Local → Google. Defaults to gcal/sync.pushTasks; never reimplemented here. */
+  pushTasks(): Promise<{ pushed: number; completed: number }>;
+  now(): Date;
+  timeoutMs: number;
+}
+
+export interface ReconcileResult {
+  /** Google-side edits and Google-only tasks adopted into POS. */
+  pulled: number;
+  /** Local tasks/commitments closed because Google says they are done. */
+  completedLocally: number;
+  /** Local tasks/commitments retired because Google says they are gone. */
+  deletedLocally: number;
+  /** From the push pass (gcal/sync.pushTasks). */
+  pushed: number;
+  /** Set instead of throwing: "not_connected", a timeout, or a Google/DB failure. */
+  error?: string;
+}
+
+function tasksApi(secrets: SecretStore): tasks_v1.Tasks {
+  return google.tasks({ version: "v1", auth: oauthClient(secrets) });
+}
+
+/** The production Google surface. */
+export function realGoogleTasksDeps(db: Db, secrets: SecretStore): GoogleTasksDeps {
+  return {
+    isConnected: isGoogleConnected,
+    ensureTasklist: () => ensurePosTasklist(db, secrets),
+    async listTasks({ tasklist, pageToken }) {
+      const res = await tasksApi(secrets).tasks.list({
+        tasklist,
+        maxResults: 100,
+        pageToken,
+        // The whole point: a task the owner deleted or completed on the phone must come
+        // back in this listing, otherwise the pull direction cannot see it happen.
+        showCompleted: true,
+        showDeleted: true,
+        showHidden: true,
+      });
+      return { items: (res.data.items ?? []) as GoogleTaskLite[], nextPageToken: res.data.nextPageToken };
+    },
+    async patchTask({ tasklist, task, body }) {
+      await tasksApi(secrets).tasks.patch({ tasklist, task, requestBody: body });
+    },
+    async insertTask({ tasklist, body }) {
+      const res = await tasksApi(secrets).tasks.insert({ tasklist, requestBody: body });
+      return res.data as GoogleTaskLite;
+    },
+    pushTasks: () => pushTasks(db, secrets),
+    now: () => new Date(),
+    timeoutMs: RECONCILE_TIMEOUT_MS,
+  };
+}
+
+// ── small pure helpers ───────────────────────────────────────────────────────
+
+/**
+ * Google's `due` is RFC 3339 at UTC midnight but means a DATE. Comparing or storing the
+ * timestamp would drift a day either side of the owner's timezone, so both sides of every
+ * comparison are reduced to "YYYY-MM-DD".
+ */
+export function dueDateOf(value: string | null | undefined): string | null {
+  const v = (value ?? "").trim();
+  if (!v) return null;
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(v);
+  return m ? m[1] : null;
+}
+
+/**
+ * The due date Google would be holding for a local deadline, i.e. exactly what pushTasks
+ * sent (`new Date(hard_deadline_at).toISOString()`). East of UTC a local midnight lands on
+ * the previous UTC day, so without this the pull pass would read our own push as "the
+ * owner moved the due date" and walk the deadline backwards one day per run.
+ */
+export function pushedDueDateOf(hardDeadlineAt: string | null | undefined): string | null {
+  if (!hardDeadlineAt) return null;
+  const d = new Date(hardDeadlineAt);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+}
+
+/** SQLite datetime('now') shape ("YYYY-MM-DD HH:MM:SS", UTC) so worklog/notion queries work. */
+export function sqliteUtc(value: string | null | undefined, fallback: Date): string {
+  const d = value ? new Date(value) : fallback;
+  const ok = Number.isNaN(d.getTime()) ? fallback : d;
+  return ok.toISOString().slice(0, 19).replace("T", " ");
+}
+
+/** Commitment id carried by a pushed marker task, or null for a normal task. */
+export function commitmentIdFromNotes(notes: string | null | undefined): number | null {
+  const m = new RegExp(`${COMMITMENT_MARKER_PREFIX}(\\d+)`).exec(notes ?? "");
+  return m ? Number(m[1]) : null;
+}
+
+/** Reject-after-timeout. Does not cancel `p`; the partial result object is already valid. */
+function withDeadline<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(message)), ms);
+    (t as unknown as { unref?: () => void }).unref?.();
+    p.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); }
+    );
+  });
+}
+
+// ── the reconciliation ───────────────────────────────────────────────────────
+
+interface LocalTaskRow {
+  id: number;
+  title: string;
+  hard_deadline_at: string | null;
+  commitment_id: number | null;
+  gtasks_id: string;
+}
+
+/**
+ * Bidirectional Google Tasks sync: pull Google's state into POS, then push POS's state
+ * back up. Single entry point — safe to call from a cron.
+ *
+ * Never throws: a timeout, a Google failure or a half-finished pass is reported in
+ * `error` alongside whatever counts were already committed to the DB.
+ */
+export async function reconcileGoogleTasks(
+  db: Db,
+  secrets: SecretStore,
+  overrides: Partial<GoogleTasksDeps> = {}
+): Promise<ReconcileResult> {
+  const deps: GoogleTasksDeps = { ...realGoogleTasksDeps(db, secrets), ...overrides };
+  const result: ReconcileResult = { pulled: 0, completedLocally: 0, deletedLocally: 0, pushed: 0 };
+  if (!deps.isConnected(secrets)) return { ...result, error: "not_connected" };
+  try {
+    await withDeadline(runReconcile(db, deps, result), deps.timeoutMs, "google tasks reconcile timed out");
+  } catch (e) {
+    // Partial progress stands: every local write below is committed as it happens.
+    result.error = (e as Error).message;
+  }
+  return result;
+}
+
+async function runReconcile(db: Db, deps: GoogleTasksDeps, result: ReconcileResult): Promise<void> {
+  const tasklist = await deps.ensureTasklist();
+
+  // Read EVERY page before touching the database. A listing that fails halfway would
+  // otherwise look like "the owner deleted the rest of his tasks" and defer them all.
+  const remote: GoogleTaskLite[] = [];
+  let pageToken: string | undefined;
+  do {
+    const page = await deps.listTasks({ tasklist, pageToken });
+    remote.push(...(page.items ?? []));
+    pageToken = page.nextPageToken ?? undefined;
+  } while (pageToken);
+
+  pullFromGoogle(db, deps, remote, result);
+
+  // Push only after a clean pull — pushing on a failed pull would resurrect deletions.
+  const pushed = await deps.pushTasks();
+  result.pushed = pushed.pushed;
+}
+
+function pullFromGoogle(
+  db: Db,
+  deps: GoogleTasksDeps,
+  remote: readonly GoogleTaskLite[],
+  result: ReconcileResult
+): void {
+  const now = deps.now();
+  const byId = new Map<string, GoogleTaskLite>();
+  for (const g of remote) if (g.id) byId.set(g.id, g);
+
+  // Captured BEFORE any write: deferring a task clears its gtasks_id, and an id that was
+  // linked a moment ago must not then look like a brand-new Google-only task.
+  const linkedIds = new Set(
+    (db.prepare("SELECT gtasks_id FROM task WHERE gtasks_id IS NOT NULL").all() as { gtasks_id: string }[])
+      .map((r) => r.gtasks_id)
+  );
+
+  const locals = db
+    .prepare(
+      `SELECT id, title, hard_deadline_at, commitment_id, gtasks_id
+         FROM task
+        WHERE gtasks_id IS NOT NULL AND status IN (${LIVE_STATUSES.map(() => "?").join(",")})`
+    )
+    .all(...LIVE_STATUSES) as LocalTaskRow[];
+
+  for (const t of locals) {
+    const g = byId.get(t.gtasks_id);
+
+    // ── gone in Google ──────────────────────────────────────────────────────
+    if (!g || g.deleted === true) {
+      db.prepare("UPDATE task SET status = 'deferred', gtasks_id = NULL WHERE id = ?").run(t.id);
+      if (t.commitment_id != null) {
+        // Back to the review queue rather than silently vanishing: the obligation to a
+        // person outlives the checkbox the owner binned on his phone.
+        db.prepare(
+          "UPDATE commitment SET status = 'open', resolved_at = NULL WHERE id = ? AND status IN ('open','scheduled')"
+        ).run(t.commitment_id);
+      }
+      result.deletedLocally++;
+      continue;
+    }
+
+    // ── completed in Google ─────────────────────────────────────────────────
+    if (g.status === "completed") {
+      const at = sqliteUtc(g.completed, now);
+      db.prepare("UPDATE task SET status = 'done', completed_at = ? WHERE id = ?").run(at, t.id);
+      if (t.commitment_id != null) closeCommitment(db, t.commitment_id, at);
+      result.completedLocally++;
+      continue;
+    }
+
+    // ── edited in Google ────────────────────────────────────────────────────
+    const gTitle = (g.title ?? "").trim();
+    const gDue = dueDateOf(g.due);
+    const localDue = dueDateOf(t.hard_deadline_at);
+    let changed = false;
+    if (gTitle && gTitle !== t.title) {
+      db.prepare("UPDATE task SET title = ? WHERE id = ?").run(gTitle, t.id);
+      changed = true;
+    }
+    if (gDue !== localDue && gDue !== pushedDueDateOf(t.hard_deadline_at)) {
+      db.prepare("UPDATE task SET hard_deadline_at = ? WHERE id = ?").run(gDue ? `${gDue}T00:00:00` : null, t.id);
+      changed = true;
+    }
+    if (changed) result.pulled++;
+  }
+
+  // ── Google-side rows with no local counterpart ─────────────────────────────
+  for (const g of remote) {
+    if (!g.id || linkedIds.has(g.id)) continue;
+
+    const commitmentId = commitmentIdFromNotes(g.notes);
+    if (commitmentId != null) {
+      // A pushed commitment, ticked off or binned on the phone. Left alone it stays
+      // 'open' here and pushTasks re-creates it on this very run.
+      if (g.deleted === true) {
+        const r = db
+          .prepare(
+            "UPDATE commitment SET status = 'dropped', resolved_at = ? WHERE id = ? AND status IN ('open','scheduled')"
+          )
+          .run(sqliteUtc(null, now), commitmentId);
+        if (r.changes > 0) result.deletedLocally++;
+      } else if (g.status === "completed") {
+        if (closeCommitment(db, commitmentId, sqliteUtc(g.completed, now))) result.completedLocally++;
+      }
+      continue;
+    }
+
+    // Created by the owner directly in Google Tasks (phone). Deleted or already-done
+    // rows are history, not inbox items.
+    if (g.deleted === true || g.status === "completed") continue;
+    const title = (g.title ?? "").trim();
+    if (!title) continue; // Google keeps empty draft rows; they are not tasks yet
+    const due = dueDateOf(g.due);
+    db.prepare(
+      `INSERT INTO task (title, notes, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
+                         status, plan_date, hard_deadline_at, estimate_source, gtasks_id)
+       VALUES (?, ?, 'admin', 2, 30, 30, 'inbox', ?, ?, 'inferred', ?)`
+    ).run(title.slice(0, 200), g.notes ?? null, due, due ? `${due}T00:00:00` : null, g.id);
+    result.pulled++;
+  }
+}
+
+/** Close a commitment the Google side reports done. Returns true when a row changed. */
+function closeCommitment(db: Db, commitmentId: number, at: string): boolean {
+  const r = db
+    .prepare("UPDATE commitment SET status = 'done', resolved_at = ? WHERE id = ? AND status IN ('open','scheduled')")
+    .run(at, commitmentId);
+  return r.changes > 0;
+}

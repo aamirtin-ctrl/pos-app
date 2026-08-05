@@ -16,6 +16,7 @@ import {
   passesCommitmentGate,
   isExpiredSameDay,
   threadResolves,
+  dedupeKeyFor,
 } from "./crm/commitments.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { commitmentToTask, closeGoogleTask, readAnchors } from "./gcal/sync.ts";
@@ -23,6 +24,7 @@ import { eventsForDate as icsEventsForDate } from "./icscal.ts";
 import { distillWeek, distillWeekKey } from "./worklog.ts";
 import type { ConnectorDeps, SyncReport } from "./connectors/common.ts";
 import { syncAllMail, gmailConfigured } from "./connectors/gmail.ts";
+import { reconcileGoogleTasks } from "./gtasks-sync.ts";
 import { syncImessage, imessageAvailable } from "./connectors/imessage.ts";
 import { syncLinkedin } from "./connectors/linkedin.ts";
 import { syncLinkedinEmail } from "./connectors/linkedin-email.ts";
@@ -114,8 +116,9 @@ export function advanceLastContact(db: Db): number {
 /**
  * Run one connector inside a sync_run row. Connector errors (thrown OR reported) land in
  * sync_run.error and the returned report — they never propagate. On success, the
- * post-ingest hook runs: commitment extraction (when an LLM client is provided; capped at
- * EXTRACT_CAP newest unprocessed interactions), last-contact advancement, reconnect refresh.
+ * post-ingest hook runs: the one-shot duplicate-commitment backfill, commitment extraction
+ * (when an LLM client is provided; capped at EXTRACT_CAP newest unprocessed interactions —
+ * extraction itself costs exactly two LLM calls), last-contact advancement, reconnect refresh.
  *
  * `overrides` swaps a connector implementation (tests / dry runs).
  */
@@ -150,6 +153,9 @@ export async function runSync(
   // Post-ingest hook — best-effort, never fails the sync.
   if (!report.error && report.ingested > 0) {
     try {
+      // One-shot duplicate backfill, on the first sync after the upgrade. The setting
+      // guard makes every later call a single indexed lookup.
+      await cleanupDuplicateCommitments(db, secrets);
       const ids = (
         db
           .prepare(
@@ -535,6 +541,104 @@ export function cleanupTentativeTasksV3(db: Db): { dropped: number } {
   return { dropped };
 }
 
+/** One-shot flag: the 2026-08-05 duplicate-commitment backfill runs once per database. */
+export const CLEANUP_DUPES_KEY = "cleanup_dupes_v1";
+
+/**
+ * Backfill sweep for owner report 2026-08-05 (b): "these two events are the same thing
+ * albeit from different texts". Extraction now collapses semantic duplicates through
+ * commitment.dedupe_key, but the rows that already landed have no key. For every live
+ * commitment (status open/scheduled — done and dropped rows are history, left alone),
+ * compute the key from its description + person + due day and group:
+ *   - keep the highest-confidence row (earliest created_at breaks ties) and stamp the key
+ *     on it, so future extractions collapse INTO it;
+ *   - drop the rest (status 'dropped' + resolved_at, kept for audit exactly like
+ *     dropCommitment), close any local task they created, and best-effort complete its
+ *     Google counterpart (closeGoogleTask is time-boxed and swallows errors).
+ * Keyed on setting CLEANUP_DUPES_KEY, set only after the pass completes, so it runs on the
+ * first sync after the upgrade and is free forever after.
+ */
+export async function cleanupDuplicateCommitments(
+  db: Db,
+  secrets: SecretStore
+): Promise<{ groups: number; dropped: number; tasksClosed: number }> {
+  if (getSetting(db, CLEANUP_DUPES_KEY)) return { groups: 0, dropped: 0, tasksClosed: 0 };
+
+  const rows = db
+    .prepare(
+      `SELECT id, person_id, description, due_at, confidence, created_at, dedupe_key
+       FROM commitment WHERE status IN ('open','scheduled')
+       ORDER BY id ASC`
+    )
+    .all() as {
+    id: number;
+    person_id: number | null;
+    description: string;
+    due_at: string | null;
+    confidence: number;
+    created_at: string;
+    dedupe_key: string | null;
+  }[];
+
+  const groups = new Map<string, typeof rows>();
+  for (const r of rows) {
+    const key = dedupeKeyFor(r.description, r.person_id, r.due_at);
+    if (!key) continue; // no alphanumerics in the description — nothing to match on
+    const list = groups.get(key) ?? [];
+    list.push(r);
+    groups.set(key, list);
+  }
+
+  const setKey = db.prepare("UPDATE commitment SET dedupe_key = ? WHERE id = ?");
+  const drop = db.prepare(
+    "UPDATE commitment SET status = 'dropped', resolved_at = datetime('now') WHERE id = ?"
+  );
+  const openTasks = db.prepare(
+    "SELECT id, gtasks_id FROM task WHERE commitment_id = ? AND status IN ('inbox','planned','in_progress')"
+  );
+  const closeTask = db.prepare(
+    "UPDATE task SET status = 'done', completed_at = datetime('now') WHERE id = ?"
+  );
+
+  let dupGroups = 0;
+  let dropped = 0;
+  let tasksClosed = 0;
+  for (const [key, list] of groups) {
+    // Highest confidence wins; the earliest created_at (then the lowest id) breaks ties.
+    const ordered = [...list].sort(
+      (a, b) => b.confidence - a.confidence || a.created_at.localeCompare(b.created_at) || a.id - b.id
+    );
+    const keeper = ordered[0];
+    if (keeper.dedupe_key !== key) {
+      try {
+        setKey.run(key, keeper.id);
+      } catch {
+        /* another row (e.g. a resolved one) already owns this key — leave the keeper bare */
+      }
+    }
+    if (ordered.length === 1) continue;
+    dupGroups++;
+    for (const loser of ordered.slice(1)) {
+      drop.run(loser.id);
+      dropped++;
+      console.log(
+        `workers: ${CLEANUP_DUPES_KEY} dropped duplicate commitment ${loser.id} ("${loser.description}") in favour of ${keeper.id}`
+      );
+      for (const t of openTasks.all(loser.id) as { id: number; gtasks_id: string | null }[]) {
+        closeTask.run(t.id);
+        tasksClosed++;
+        if (t.gtasks_id) await closeGoogleTask(db, secrets, t.gtasks_id); // best-effort, time-boxed
+      }
+    }
+  }
+
+  setSetting(db, CLEANUP_DUPES_KEY, new Date().toISOString());
+  console.log(
+    `workers: ${CLEANUP_DUPES_KEY} examined ${rows.length} live commitment(s), collapsed ${dupGroups} duplicate group(s), dropped ${dropped} row(s), closed ${tasksClosed} task(s)`
+  );
+  return { groups: dupGroups, dropped, tasksClosed };
+}
+
 export interface WorkersHandle {
   stop(): void;
 }
@@ -593,6 +697,19 @@ export function startWorkers(
     running = true;
     try {
       // Skip silently only when ZERO mail accounts are configured.
+      // Two-way Google Tasks: pull the user's phone-side edits/deletions BEFORE any
+      // push, so a task deleted in Google is never resurrected on the same tick.
+      try {
+        const gt = await reconcileGoogleTasks(db, secrets);
+        if (gt.pulled || gt.completedLocally || gt.deletedLocally) {
+          notify?.(
+            `Google Tasks: ${gt.pulled} updated, ${gt.completedLocally} completed, ${gt.deletedLocally} removed`
+          );
+        }
+      } catch (e) {
+        console.warn(`gtasks reconcile failed: ${(e as Error).message}`);
+      }
+
       if (gmailConfigured({ secrets })) {
         announce(await runSync(db, secrets, llm, "gmail"));
         // Same accounts, LinkedIn notification mail only (invites/accepts → people).

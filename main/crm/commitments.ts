@@ -3,6 +3,28 @@
 // deterministic fallback (followups.ts) when the LLM is unavailable. Rows land in the
 // `commitment` table unconfirmed; confidence < 0.7 is the review queue.
 //
+// QUOTA SHAPE (owner directive 2026-08-05 #3): extraction costs exactly TWO fast-tier
+// calls per run, no matter how many candidates it looks at — never one per item. The
+// Gemini free tier is request-limited, so the pipeline is:
+//   query 1 (ONE call)  — classify which of the N numbered candidates are commitments
+//                         at all (strict JSON [{n, is_commitment, confidence}]);
+//   query 2 (ONE call)  — for the M survivors, return the NORMALIZED headline title
+//                         (what the app and Google Tasks show — never a quote), the
+//                         date it belongs on, and TASK vs CALENDAR EVENT.
+// Everything decided is written to `extraction_log` keyed by a content hash, so identical
+// text is never sent to the model again — on this run or any future one.
+//
+// DEDUPE (owner report 2026-08-05, "2 items landed ~4 times" / "these two events are the
+// same thing albeit from different texts"):
+//   a. content hash — normalize (lowercase, collapse whitespace, strip punctuation) →
+//      sha256. A hash already in extraction_log is skipped before any LLM call. This is
+//      what kills the duplicated self-texts (iMessage echoes the note-to-self thread) and
+//      the same task arriving through two paths.
+//   b. dedupe_key — a slug of the AI title + person + due day, UNIQUE where set. The same
+//      commitment stated in two DIFFERENT messages collapses into ONE row, both inside a
+//      single batch (before insert) and across runs (INSERT … ON CONFLICT DO UPDATE keeps
+//      the higher confidence and the earlier created_at).
+//
 // Quality layers (each catches what the previous one misses):
 //   1. The prompt demands REWRITING into imperative tasks and carries real failure
 //      examples as few-shot negatives — most junk never comes back from the model.
@@ -36,6 +58,7 @@
 //      post-hoc layer (workers.resolveFromThreads) closes already-open commitments
 //      when NEW messages resolve them.
 
+import { createHash } from "node:crypto";
 import type { Db } from "../db/db.ts";
 import { extractJson, type LlmClient } from "../llm/provider.ts";
 import { extractFollowups } from "./followups.ts";
@@ -44,7 +67,87 @@ import { parseWhen } from "./when.ts";
 export const REVIEW_CONFIDENCE = 0.7;
 /** Deterministic-fallback rows are raw message fragments, never rewrites — cap them here. */
 export const FALLBACK_CONFIDENCE = 0.5;
-const BATCH_SIZE = 20;
+/**
+ * Candidates looked at per run. The whole batch costs TWO LLM calls, so this is a prompt
+ * -size bound, not a cost bound; anything past it waits for the next sync (its interaction
+ * keeps extracted_at NULL).
+ */
+export const CANDIDATE_CAP = 30;
+
+// ── content-hash dedupe (cheap, deterministic, first line of defense) ────────
+
+/**
+ * Text → its comparison form: lowercase, punctuation and symbols stripped, whitespace
+ * collapsed. "Pick up the dry cleaning!!" and "pick up the  dry cleaning" normalize to
+ * the same string, so the iMessage self-thread echo hashes identically to its original.
+ */
+export function normalizeContent(text: string | null | undefined): string {
+  return (text ?? "")
+    .toLowerCase()
+    .replace(/[\p{P}\p{S}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** sha256 of the normalized text — the extraction_log key. */
+export function contentHash(text: string | null | undefined): string {
+  return createHash("sha256").update(normalizeContent(text)).digest("hex");
+}
+
+/** True when this exact content was already decided (any verdict) — never re-send it. */
+export function contentSeen(db: Db, hash: string): boolean {
+  return !!db.prepare("SELECT 1 FROM extraction_log WHERE content_hash = ?").get(hash);
+}
+
+/**
+ * Record a decision for a piece of content. Idempotent on the hash; an existing row keeps
+ * its original interaction_id (the first message that carried this text) and takes the new
+ * verdict, so a re-decision never creates a second row.
+ */
+export function logExtraction(
+  db: Db,
+  interactionId: number | null,
+  hash: string,
+  verdict: string
+): void {
+  db.prepare(
+    `INSERT INTO extraction_log (interaction_id, content_hash, verdict) VALUES (?, ?, ?)
+     ON CONFLICT(content_hash) DO UPDATE SET
+       verdict = excluded.verdict,
+       interaction_id = COALESCE(extraction_log.interaction_id, excluded.interaction_id)`
+  ).run(interactionId, hash, verdict);
+}
+
+// ── semantic duplicate collapse (dedupe_key) ─────────────────────────────────
+
+/** Title → slug: lowercase, alphanumerics joined by single hyphens, first 60 chars. */
+export function slugifyTitle(title: string | null | undefined): string {
+  return (title ?? "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60)
+    .replace(/-+$/g, "");
+}
+
+/**
+ * The semantic identity of a commitment: the normalized AI title, the person it involves,
+ * and the ISO day it is due on (or 'undated'). The SAME thing said in two different texts
+ * produces the same key — that is what collapses owner report (b) into one row. Different
+ * days stay different commitments. Null when the title has no alphanumerics at all (such a
+ * row is stored with dedupe_key NULL and never participates in collapse).
+ */
+export function dedupeKeyFor(
+  title: string | null | undefined,
+  personId: number | null,
+  dueAt: string | null | undefined
+): string | null {
+  const slug = slugifyTitle(title);
+  if (!slug) return null;
+  const day = dueAt && /^\d{4}-\d{2}-\d{2}/.test(dueAt) ? dueAt.slice(0, 10) : "undated";
+  return `p${personId ?? 0}:${day}:${slug}`;
+}
 
 // ── post-extraction sanity gate ──────────────────────────────────────────────
 
@@ -246,6 +349,12 @@ export interface CommitmentRow {
   confirmed_by_user: number;
   created_at: string;
   resolved_at: string | null;
+  /** Slug of the normalized title + person + due day; UNIQUE where set (migration 6). */
+  dedupe_key: string | null;
+  /** 'task' | 'event' — the second extraction query's verdict. */
+  kind: string | null;
+  /** HH:MM, only meaningful when kind = 'event'. */
+  start_time: string | null;
 }
 
 interface InteractionRow {
@@ -263,8 +372,12 @@ interface PersonContext {
   recent: { direction: string | null; occurred_at: string | null; subject: string | null; body_summary: string | null }[];
 }
 
-/** Recent interactions per person in the batch, direction-labeled, newest first. */
-export const CONTEXT_INTERACTIONS = 6;
+/**
+ * Recent interactions per person in the batch, direction-labeled, newest first. Kept SHORT
+ * (2 per person, down from 6) because both batched queries carry the same context block and
+ * the whole candidate batch now shares one prompt.
+ */
+export const CONTEXT_INTERACTIONS = 2;
 
 const DOW_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTH_NAMES = [
@@ -298,53 +411,117 @@ export function buildAnchoredDateReference(anchor: Date): string {
 
 const clip = (s: string | null | undefined, n: number) => (s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
 
-function buildPrompt(rows: InteractionRow[], contexts: Map<number, PersonContext>): string {
-  const records = rows.map((r) => ({
-    interaction_id: r.id,
-    person_id: r.person_id,
-    direction: r.direction,
-    occurred_at: r.occurred_at,
-    subject: r.subject,
-    body: r.body_summary,
-  }));
+/** A numbered candidate: exactly what both queries refer to by its `n`. */
+interface Candidate {
+  n: number;
+  row: InteractionRow;
+  /** subject + body_summary, joined — the text that was hashed. */
+  text: string;
+  hash: string;
+}
 
-  // One date-reference line per distinct sent DATE in the batch (msgplans technique).
-  const seenDates = new Set<string>();
-  const dateRefLines: string[] = [];
-  for (const r of rows) {
-    const iso = (r.occurred_at ?? "").slice(0, 10);
-    if (!iso || seenDates.has(iso)) continue;
-    seenDates.add(iso);
-    const anchor = new Date(r.occurred_at!);
-    if (Number.isNaN(anchor.getTime())) continue;
-    dateRefLines.push(`- messages sent ${iso}: ${buildAnchoredDateReference(anchor)}`);
-  }
-
-  // Per-person thread context, drafts.ts-style: last few interactions, direction-labeled.
-  const contextBlocks: string[] = [];
+/** Per-person thread context blocks, drafts.ts-style — shared by both queries. */
+function contextBlocks(contexts: Map<number, PersonContext>): string {
+  const blocks: string[] = [];
   for (const [personId, ctx] of contexts) {
     const lines = ctx.recent.map((h) =>
       `  [${h.direction ?? "?"} ${clip(h.occurred_at, 10)}] ${clip([h.subject, h.body_summary].filter(Boolean).join(" — "), 160)}`
     );
-    contextBlocks.push(`${ctx.name ?? "Unknown contact"} (person_id ${personId}):\n${lines.join("\n")}`);
+    blocks.push(`${ctx.name ?? "Unknown contact"} (person_id ${personId}):\n${lines.join("\n")}`);
   }
+  return blocks.join("\n") || "(none)";
+}
 
-  return `Extract real commitments from these interactions between the user and their contacts, and REWRITE each one as a clean imperative task, resolving references and dates from the context below.
+/** The numbered snippet list both queries share — `n` is the only handle the model gets. */
+function numberedSnippets(cands: Candidate[], contexts: Map<number, PersonContext>): string {
+  return cands
+    .map((c) => {
+      const who = c.row.person_id != null ? contexts.get(c.row.person_id)?.name ?? "Unknown contact" : "Unknown contact";
+      const when = clip(c.row.occurred_at, 10);
+      return `${c.n}. [${c.row.direction ?? "?"} ${when}] ${who}: ${clip(c.text, 400)}`;
+    })
+    .join("\n");
+}
+
+/** One date-reference line per distinct sent DATE in the batch (msgplans technique). */
+function dateReferenceLines(cands: Candidate[]): string {
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const c of cands) {
+    const iso = (c.row.occurred_at ?? "").slice(0, 10);
+    if (!iso || seen.has(iso)) continue;
+    seen.add(iso);
+    const anchor = new Date(c.row.occurred_at!);
+    if (Number.isNaN(anchor.getTime())) continue;
+    lines.push(`- messages sent ${iso}: ${buildAnchoredDateReference(anchor)}`);
+  }
+  return lines.join("\n") || "- (no dated messages in this batch)";
+}
+
+/**
+ * QUERY 1 (ONE call for the whole batch): which of these numbered snippets are real
+ * commitments at all? Classification only — no rewriting, no dates. Cheap output, so the
+ * expensive normalization prompt only ever runs over survivors.
+ */
+export function buildClassifyPrompt(cands: Candidate[], contexts: Map<number, PersonContext>): string {
+  return `Decide which of these numbered message snippets contain a REAL commitment between the user and a contact. Classify only — do not rewrite anything.
 
 WHAT COUNTS AS A COMMITMENT — every one of these must hold:
-- A concrete action the USER owes a contact ("i_owe_them") or a contact owes the user ("they_owe_me").
+- A concrete action the USER owes a contact, or a contact owes the user.
 - Someone actually agreed or promised to do it — not merely mentioned, offered, suggested, or asked about it.
 - It can be stated as a short imperative phrase a person would put on a to-do list.
 
-NEVER commitments — extract nothing for these:
+NEVER commitments — is_commitment must be false for these:
 - Questions of any kind ("do you want…", "what time…", "can you…?" that was never answered).
 - Offers and invitations that were not accepted.
 - Status updates, FYIs, opinions, links, screenshots, addresses, or things merely being discussed.
 - Explanatory chatter about how something works ("for our school it's a little different because…").
 - Old logistics fragments about a moment already past ("I wanna be back here at 5:30 latest").
 - Other people's plans or chatter that create no obligation involving the user.
+- Anything the thread already resolved: a later message fulfilled it ("sent it", "done", "got them", "here you go") or cancelled it ("nvm", "don't worry about it", "all set", "figured it out").
+- Automated/transactional messages: verification codes, appointment reminders, receipts, "do not reply".
 
-THREAD RESOLUTION — something resolved IN the message chain is CLOSED; extract nothing:
+REAL FAILURES — these exact snippets were wrongly turned into tasks before; is_commitment false:
+- "do you want eggs?" (a question/offer)
+- "find something" (unresolvable reference — nothing anyone can act on)
+- "This is the health plan you can upload for approval…" (an FYI about a document)
+- "what do you wanna inquire about?" (a question)
+- "looking at 345 Westwood Court on Google Maps" (a link/screenshot being discussed)
+- "for our school it's a little different because…" (explanatory chatter)
+- "I wanna be back here at 5:30 latest" (old logistics fragment)
+
+When unsure, answer false. An all-false answer is good and common.
+
+THREAD CONTEXT (per contact, newest first):
+${contextBlocks(contexts)}
+
+SNIPPETS:
+${numberedSnippets(cands, contexts)}
+
+Return STRICT JSON ONLY — no prose, no markdown fences — one object per snippet, using the SAME n:
+[{ "n": <number>, "is_commitment": true | false, "confidence": <0-1> }]`;
+}
+
+/**
+ * QUERY 2 (ONE call for all survivors): the normalization pass. For each surviving `n`,
+ * the model returns the HEADLINE TITLE the app and Google Tasks will show (a rewritten
+ * imperative, never a quote — owner report (c)), the date it belongs on, and whether it is
+ * a TASK or a CALENDAR EVENT. Carries the date-reference table and every date rule.
+ */
+export function buildNormalizePrompt(cands: Candidate[], contexts: Map<number, PersonContext>): string {
+  return `These numbered snippets each contain a real commitment. For each one, write the HEADLINE TITLE it should be called in a to-do app, the date it belongs on, and whether it is a TASK or a CALENDAR EVENT.
+
+TITLE — the headline, never a quote (this exact string becomes the task in the app and in Google Tasks):
+- "title" MUST be a rewritten imperative headline, NOT a copied message fragment. Copying the snippet is a failure.
+- Start with a verb. Name who it involves and what it is for whenever the thread makes that clear. Keep it under 120 characters.
+- Write "Bring cash for <person>", never "Give cash to contact". Never leave second-person fragments like "call you" or "you can upload".
+- Two snippets that mean the SAME thing must get the SAME title, word for word — they are one commitment, not two.
+
+TASK vs CALENDAR EVENT — set "kind":
+- "event" only when it happens at a place/time with other people: a meeting, call, dinner, flight, appointment, meetup. Give "start_time" as HH:MM (24h) when the snippet states a clock time, else null.
+- "task" for everything else — something to do by a date, with no meeting time. "start_time" MUST be null for tasks.
+
+STILL NOT A COMMITMENT — if a snippet turns out to be one of these, OMIT it entirely (the classifier is not perfect):
 - If a LATER message in the same thread — from EITHER side — shows the obligation was fulfilled ("sent it", "done", "got them", "just did", "here you go", an attachment delivering the thing), it is closed. Output nothing for it.
 - If a later message cancels it ("nvm", "don't worry about it", "never mind", "all set", "figured it out"), it is closed. Output nothing for it.
 - Only a message that ASKS for something new reopens the thread — treat that new ask on its own merits.
@@ -364,10 +541,8 @@ RESOLVE DATES — use the DATE REFERENCE table below; never invent:
 - If the message states or implies NO timeframe, due_at MUST be null. NEVER default to the sent date or to today — a null due_at is correct and common.
 - SAME-DAY SCOPE: a time-of-day or same-day marker with NO other date ("at 5:30", "by noon", "tonight", "this afternoon", "in an hour") refers to the message's SENT date, not to today. If that moment has already passed by now, the item is EXPIRED — output nothing for it. NEVER keep it as an undated task.
 
-REWRITE — never quote:
-- "description" MUST be a rewritten imperative task phrase, NOT a copied message fragment.
-- Start with a verb. Name who it involves and what it is for whenever the thread makes that clear. Keep it under 120 characters.
-- Write "Bring cash for <person>", never "Give cash to contact". Never leave second-person fragments like "call you" or "you can upload".
+DIRECTION:
+- "i_owe_them" when the USER owes the contact; "they_owe_me" when the contact owes the user.
 
 REAL FAILURES — these exact snippets were wrongly turned into tasks before. They are NOT commitments; for input like these, output nothing:
 - "do you want eggs?" (a question/offer)
@@ -381,11 +556,12 @@ REAL FAILURES — these exact snippets were wrongly turned into tasks before. Th
 - "I wanna be back here at 5:30 latest" (old logistics fragment)
 - "be back here at 5:30 latest (sent yesterday)" (expired same-day instruction — not a commitment)
 
-POSITIVE EXAMPLES (message → rewritten task):
-- Sarah: "can you send me the deck by fri?" — user: "yep will do" → { "description": "Send Sarah the pitch deck", "direction": "i_owe_them", "due_at": "<that Friday from the table>" }
-- User to Omar: "I'll bring the cash for the tickets tomorrow" → { "description": "Bring Omar cash for the tickets", "direction": "i_owe_them", "due_at": "<the day after send>" }
-- Dev: "I'll send over the signed lease on Monday" → { "description": "Collect the signed lease from Dev", "direction": "they_owe_me", "due_at": "<that Monday from the table>" }
-- Mom-thread about Stanford dorm packing — user: "add a boot tray to my list" → { "description": "Add boot tray to the Stanford dorm packing list", "direction": "i_owe_them", "due_at": null }
+POSITIVE EXAMPLES (message → normalized headline):
+- Sarah: "can you send me the deck by fri?" — user: "yep will do" → { "title": "Send Sarah the pitch deck", "direction": "i_owe_them", "due_at": "<that Friday from the table>", "kind": "task", "start_time": null }
+- User to Omar: "I'll bring the cash for the tickets tomorrow" → { "title": "Bring Omar cash for the tickets", "direction": "i_owe_them", "due_at": "<the day after send>", "kind": "task", "start_time": null }
+- Dev: "I'll send over the signed lease on Monday" → { "title": "Collect the signed lease from Dev", "direction": "they_owe_me", "due_at": "<that Monday from the table>", "kind": "task", "start_time": null }
+- Mom-thread about Stanford dorm packing — user: "add a boot tray to my list" → { "title": "Add boot tray to the Stanford dorm packing list", "direction": "i_owe_them", "due_at": null, "kind": "task", "start_time": null }
+- "dinner with Priya thursday 7pm" → { "title": "Dinner with Priya", "due_at": "<that Thursday from the table>", "kind": "event", "start_time": "19:00" }
 - Thread agrees on a meetup "in late September" → due_at = that September's late anchor (the 25th) from the table.
 
 CONFIDENCE — be honest:
@@ -394,34 +570,82 @@ CONFIDENCE — be honest:
 - When unsure whether something is a commitment at all, OMIT it entirely. An empty array is a good and common answer.
 
 DATE REFERENCE (precomputed — use these exact dates):
-${dateRefLines.join("\n") || "- (no dated messages in this batch)"}
+${dateReferenceLines(cands)}
 
 THREAD CONTEXT (per contact, newest first):
-${contextBlocks.join("\n") || "(none)"}
+${contextBlocks(contexts)}
 
-INTERACTIONS (JSON):
-${JSON.stringify(records, null, 2)}
+SNIPPETS:
+${numberedSnippets(cands, contexts)}
 
-Return STRICT JSON ONLY — no prose, no markdown fences — an array (possibly empty):
-[{ "interaction_id": <id from the list>, "description": "<rewritten imperative task>", "direction": "i_owe_them" | "they_owe_me", "due_at": "<ISO date>" | null, "confidence": <0-1> }]
+Return STRICT JSON ONLY — no prose, no markdown fences — an array (possibly empty), using the SAME n:
+[{ "n": <number>, "title": "<rewritten imperative headline>", "direction": "i_owe_them" | "they_owe_me", "due_at": "<ISO date>" | null, "kind": "task" | "event", "start_time": "<HH:MM>" | null, "confidence": <0-1> }]
 
-Rules: only use interaction_ids from the list; do not invent facts or dates; never copy message text verbatim into description.`;
+Rules: only use n values from the list; do not invent facts or dates; never copy snippet text verbatim into title.`;
 }
 
+/**
+ * Upsert on the semantic identity. A dedupe_key collision means the SAME commitment
+ * arrived again (a second text saying the same thing, or a re-run): keep the higher
+ * confidence — and with it that row's title/kind — and the earlier created_at, filling in
+ * any due_at/start_time the original lacked. Rows with dedupe_key NULL never conflict.
+ */
 const insertCommitment = (db: Db) =>
   db.prepare(
-    `INSERT INTO commitment (person_id, direction, description, due_at, status, source_interaction_id, confidence, confirmed_by_user)
-     VALUES (?, ?, ?, ?, 'open', ?, ?, 0)`
+    `INSERT INTO commitment (person_id, direction, description, due_at, status, source_interaction_id,
+                             confidence, confirmed_by_user, dedupe_key, kind, start_time, created_at)
+     VALUES (?, ?, ?, ?, 'open', ?, ?, 0, ?, ?, ?, datetime('now'))
+     ON CONFLICT(dedupe_key) WHERE dedupe_key IS NOT NULL DO UPDATE SET
+       description = CASE WHEN excluded.confidence > commitment.confidence THEN excluded.description ELSE commitment.description END,
+       kind        = CASE WHEN excluded.confidence > commitment.confidence THEN excluded.kind        ELSE commitment.kind        END,
+       direction   = CASE WHEN excluded.confidence > commitment.confidence THEN excluded.direction   ELSE commitment.direction   END,
+       confidence  = MAX(commitment.confidence, excluded.confidence),
+       due_at      = COALESCE(commitment.due_at, excluded.due_at),
+       start_time  = COALESCE(commitment.start_time, excluded.start_time),
+       created_at  = MIN(commitment.created_at, excluded.created_at)`
   );
 
+/** One commitment about to be written, after normalization and before collapse. */
+interface PendingCommitment {
+  /** The candidate it came from — used to write that candidate's extraction_log verdict. */
+  candidateN: number;
+  personId: number | null;
+  direction: CommitmentDirection;
+  /** The AI headline (LLM path) or the raw fragment (deterministic fallback). */
+  description: string;
+  dueAt: string | null;
+  kind: "task" | "event";
+  startTime: string | null;
+  sourceId: number;
+  confidence: number;
+  dedupeKey: string | null;
+}
+
+const joinText = (r: InteractionRow): string =>
+  [r.subject, r.body_summary].filter(Boolean).join(" — ").replace(/\s+/g, " ").trim();
+
+/** "HH:MM" (24h) or null — the model's start_time, defensively parsed. */
+function parseStartTime(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const m = v.trim().match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+  return m ? `${String(+m[1]).padStart(2, "0")}:${m[2]}` : null;
+}
+
 /**
- * Extract commitments from the given interactions. Batches subject+body_summary through the
- * fast tier (strict JSON); on llm null / call failure, degrades to the deterministic
- * followups extractor (confidence capped at FALLBACK_CONFIDENCE, direction i_owe_them).
- * Every candidate — LLM or fallback — must pass passesCommitmentGate before insert.
- * Sets interaction.extracted_at on every processed row so re-runs skip. Returns counts;
- * rows with confidence < REVIEW_CONFIDENCE are the review queue (status 'open',
- * confirmed_by_user 0).
+ * Extract commitments from the given interactions in TWO fast-tier calls total (see the
+ * module header): query 1 classifies the numbered candidates, query 2 normalizes the
+ * survivors into headline titles + dates + task/event. On llm null, a call failure, or
+ * unusable JSON from either query, the whole batch degrades to the deterministic followups
+ * extractor (confidence capped at FALLBACK_CONFIDENCE, direction i_owe_them) — unchanged
+ * behavior. Every candidate — LLM or fallback — must pass passesCommitmentGate before
+ * insert, and every candidate gets an extraction_log row so its content is never sent to
+ * the model again.
+ *
+ * Duplicate suppression: content-hash skip before the LLM (identical text, whether it is
+ * the iMessage self-thread echo or the same task arriving twice), then dedupe_key collapse
+ * inside the batch and again on insert. Sets interaction.extracted_at on every candidate so
+ * re-runs skip. Returns counts; rows with confidence < REVIEW_CONFIDENCE are the review
+ * queue (status 'open', confirmed_by_user 0).
  */
 export async function extractCommitmentsLlm(
   db: Db,
@@ -432,20 +656,62 @@ export async function extractCommitmentsLlm(
   const rows = db
     .prepare(
       `SELECT id, person_id, direction, occurred_at, subject, body_summary
-       FROM interaction WHERE extracted_at IS NULL AND id IN (${interactionIds.map(() => "?").join(",")})`
+       FROM interaction WHERE extracted_at IS NULL AND id IN (${interactionIds.map(() => "?").join(",")})
+       ORDER BY occurred_at ASC, id ASC`
     )
     .all(...interactionIds) as InteractionRow[];
   if (rows.length === 0) return { inserted: 0, needsReview: 0, processed: 0 };
 
-  const ins = insertCommitment(db);
+  // ── phase 0: content-hash dedupe (no LLM involved) ────────────────────────
+  // Anything whose normalized text was already decided — on an earlier run OR earlier in
+  // this same batch — is marked extracted and never looked at again. This is the layer
+  // that kills the duplicated self-texts.
+  const candidates: Candidate[] = [];
+  const handledIds: number[] = [];
+  const seenThisRun = new Set<string>();
+  for (const r of rows) {
+    if (candidates.length >= CANDIDATE_CAP) break; // the rest wait for the next run
+    const text = joinText(r);
+    if (!text) {
+      handledIds.push(r.id); // nothing to extract from an empty body
+      continue;
+    }
+    const hash = contentHash(text);
+    if (seenThisRun.has(hash) || contentSeen(db, hash)) {
+      handledIds.push(r.id); // exact duplicate content — already decided
+      continue;
+    }
+    seenThisRun.add(hash);
+    candidates.push({ n: candidates.length + 1, row: r, text, hash });
+  }
+  handledIds.push(...candidates.map((c) => c.row.id));
+
+  const markExtracted = db.prepare("UPDATE interaction SET extracted_at = datetime('now') WHERE id = ?");
+  const markAll = db.transaction((ids: number[]) => ids.forEach((id) => markExtracted.run(id)));
+  if (candidates.length === 0) {
+    markAll(handledIds);
+    return { inserted: 0, needsReview: 0, processed: handledIds.length };
+  }
+
+  // Per-person thread context (drafts.ts pattern), shared by both queries.
   const nameStmt = db.prepare("SELECT display_name FROM person WHERE id = ?");
   const recentStmt = db.prepare(
     `SELECT direction, occurred_at, subject, body_summary FROM interaction
      WHERE person_id = ? ORDER BY occurred_at DESC LIMIT ${CONTEXT_INTERACTIONS}`
   );
-  // Thread-resolution reinforcement: messages in the same person's thread AFTER the
-  // source message — if any of them fulfills/cancels the obligation (threadResolves),
-  // the candidate is dropped on both paths.
+  const contexts = new Map<number, PersonContext>();
+  for (const c of candidates) {
+    const pid = c.row.person_id;
+    if (pid == null || contexts.has(pid)) continue;
+    const person = nameStmt.get(pid) as { display_name: string | null } | undefined;
+    contexts.set(pid, {
+      name: person?.display_name ?? null,
+      recent: recentStmt.all(pid) as PersonContext["recent"],
+    });
+  }
+
+  // Thread-resolution reinforcement: messages in the same person's thread AFTER the source
+  // message — if any of them fulfills/cancels the obligation, the candidate is dropped.
   const laterStmt = db.prepare(
     `SELECT subject, body_summary FROM interaction
      WHERE person_id = ? AND occurred_at > ? ORDER BY occurred_at ASC LIMIT 12`
@@ -456,111 +722,215 @@ export async function extractCommitmentsLlm(
       : (laterStmt.all(personId, occurredAt) as { subject: string | null; body_summary: string | null }[])
           .map((r) => [r.subject, r.body_summary].filter(Boolean).join(" — "))
           .filter((t) => t.length > 0);
-  let inserted = 0;
-  let needsReview = 0;
 
-  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-    const batch = rows.slice(i, i + BATCH_SIZE);
-    let extracted = false;
+  const pending: PendingCommitment[] = [];
+  let llmHandled = false;
 
-    if (llm) {
-      // Per-person thread context (drafts.ts pattern) so references resolve.
-      const contexts = new Map<number, PersonContext>();
-      for (const r of batch) {
-        if (r.person_id == null || contexts.has(r.person_id)) continue;
-        const person = nameStmt.get(r.person_id) as { display_name: string | null } | undefined;
-        contexts.set(r.person_id, {
-          name: person?.display_name ?? null,
-          recent: recentStmt.all(r.person_id) as PersonContext["recent"],
-        });
-      }
-      const res = await llm.call("commitments", "fast", buildPrompt(batch, contexts), { json: true });
-      if (res) {
-        extracted = true;
-        try {
-          const parsed = extractJson(res.text);
-          const byId = new Map(batch.map((r) => [r.id, r]));
-          if (Array.isArray(parsed)) {
-            for (const item of parsed) {
-              if (!item || typeof item !== "object") continue;
-              const o = item as Record<string, unknown>;
-              const src = byId.get(Number(o.interaction_id));
-              const description = typeof o.description === "string" ? o.description.trim() : "";
-              const direction = o.direction === "they_owe_me" ? "they_owe_me" : "i_owe_them";
-              let dueAt = typeof o.due_at === "string" && o.due_at ? o.due_at : null;
-              const confRaw = Number(o.confidence);
-              const confidence = Number.isFinite(confRaw) ? Math.min(1, Math.max(0, confRaw)) : 0.5;
-              if (!src || !description) continue;
-              if (!passesCommitmentGate(description)) continue; // questions/quotes/FYIs never land
-              // Thread-resolution reinforcement: a later message in the same thread
-              // that fulfills ("sent it") or cancels ("nvm") the obligation means it
-              // is CLOSED — never inserted, regardless of what the model said.
-              if (threadResolves(description, laterTexts(src.person_id, src.occurred_at))) continue;
-              // Deterministic cross-check (crm/when.ts): the model gave no due date, but
-              // the message itself states one, anchored to its SENT date. Only a date
-              // still in the future is attached — a stale "next Friday" from months ago
-              // must not schedule anything.
-              if (!dueAt && src.occurred_at) {
-                const text = [src.subject, src.body_summary].filter(Boolean).join(" — ");
-                const anchor = new Date(src.occurred_at);
-                const when = text && !Number.isNaN(anchor.getTime()) ? parseWhen(text, anchor) : null;
-                if (when && when.getTime() > Date.now()) dueAt = when.toISOString().slice(0, 10);
-                // Same-day backstop: an item still undated here whose only temporal
-                // reference is a time-of-day / same-day marker was scoped to its
-                // message's SENT date — if that moment has passed, drop it entirely.
-                // Items the model dated (explicit future date) never reach this check.
-                if (
-                  !dueAt &&
-                  !Number.isNaN(anchor.getTime()) &&
-                  isExpiredSameDay([description, text].filter(Boolean).join(" — "), anchor)
-                ) {
-                  continue;
-                }
-              }
-              ins.run(src.person_id, direction, description, dueAt, src.id, confidence);
-              inserted++;
-              if (confidence < REVIEW_CONFIDENCE) needsReview++;
-            }
+  if (llm) {
+    // ── query 1 (ONE call): which candidates are commitments at all? ────────
+    const res1 = await llm.call("commitments-classify", "fast", buildClassifyPrompt(candidates, contexts), {
+      json: true,
+    });
+    let survivors: Candidate[] | null = null;
+    const classifyConfidence = new Map<number, number>();
+    if (res1) {
+      try {
+        const parsed = extractJson(res1.text);
+        if (Array.isArray(parsed)) {
+          const keep = new Set<number>();
+          for (const item of parsed) {
+            if (!item || typeof item !== "object") continue;
+            const o = item as Record<string, unknown>;
+            const n = Number(o.n);
+            if (!Number.isFinite(n) || o.is_commitment !== true) continue;
+            keep.add(n);
+            const conf = Number(o.confidence);
+            if (Number.isFinite(conf)) classifyConfidence.set(n, Math.min(1, Math.max(0, conf)));
           }
-        } catch (e) {
-          console.warn(`commitments: bad LLM JSON, batch skipped (${(e as Error).message})`);
+          survivors = candidates.filter((c) => keep.has(c.n));
         }
+      } catch (e) {
+        console.warn(`commitments: bad classify JSON, batch degrades (${(e as Error).message})`);
       }
     }
 
-    if (!extracted) {
-      // Deterministic fallback: each interaction's text runs through the follow-up extractor.
-      for (const r of batch) {
-        const text = [r.subject, r.body_summary].filter(Boolean).join(" — ");
-        if (!text || !r.occurred_at) continue;
-        const proposals = extractFollowups(db, r.person_id, [
-          { text, sentAt: r.occurred_at, direction: r.direction },
-        ]);
-        for (const p of proposals) {
-          if (!passesCommitmentGate(p.description)) continue; // same gate as the LLM path
-          // Thread-resolution reinforcement, same as the LLM path: an obligation a
-          // later message already fulfilled or cancelled never reaches the queue.
-          if (threadResolves(p.description, laterTexts(r.person_id, r.occurred_at))) continue;
-          // Same-day backstop, same as the LLM path: an expired "at 5:30"/"tonight"
-          // fragment never reaches the review queue. (A text with an explicit
-          // other-day date makes isExpiredSameDay return false, so dated proposals
-          // are untouched.)
-          if (isExpiredSameDay([p.description, text].join(" — "), new Date(r.occurred_at))) continue;
-          // Fallback proposals are raw message fragments, so their confidence is capped
-          // below the autonomy threshold — they queue for review, never auto-convert.
-          ins.run(r.person_id, "i_owe_them", p.description, p.dueAt, r.id, FALLBACK_CONFIDENCE);
-          inserted++;
-          needsReview++;
+    if (survivors) {
+      // A parsed classification IS the LLM's answer — an all-false verdict means the batch
+      // held nothing, and the deterministic fallback must NOT override that.
+      llmHandled = true;
+      // Deterministic reinforcement before spending the second call: an obligation a later
+      // message in the thread already fulfilled ("sent it") or cancelled ("nvm") is closed.
+      survivors = survivors.filter((c) => !threadResolves(c.text, laterTexts(c.row.person_id, c.row.occurred_at)));
+
+      if (survivors.length > 0) {
+        // ── query 2 (ONE call): normalize survivors into headlines + dates ──
+        const res2 = await llm.call("commitments-normalize", "fast", buildNormalizePrompt(survivors, contexts), {
+          json: true,
+        });
+        let normalized = false;
+        if (res2) {
+          try {
+            const parsed = extractJson(res2.text);
+            if (Array.isArray(parsed)) {
+              normalized = true;
+              const byN = new Map(survivors.map((c) => [c.n, c]));
+              for (const item of parsed) {
+                if (!item || typeof item !== "object") continue;
+                const o = item as Record<string, unknown>;
+                const src = byN.get(Number(o.n));
+                const title = typeof o.title === "string" ? o.title.replace(/\s+/g, " ").trim() : "";
+                if (!src || !title) continue;
+                // The gate runs on the AI HEADLINE (never on the raw snippet — raw messages
+                // are questions and first-person chatter by nature). Questions, quotes,
+                // FYIs and contentless stubs never land no matter what the model said.
+                if (!passesCommitmentGate(title)) continue;
+                const direction: CommitmentDirection = o.direction === "they_owe_me" ? "they_owe_me" : "i_owe_them";
+                const kind = o.kind === "event" ? "event" : "task";
+                const startTime = kind === "event" ? parseStartTime(o.start_time) : null;
+                const confRaw = Number(o.confidence);
+                const confidence = Number.isFinite(confRaw)
+                  ? Math.min(1, Math.max(0, confRaw))
+                  : classifyConfidence.get(src.n) ?? 0.5;
+                let dueAt = typeof o.due_at === "string" && o.due_at ? o.due_at.slice(0, 10) : null;
+                if (!dueAt && src.row.occurred_at) {
+                  // Deterministic cross-check (crm/when.ts): the model gave no due date, but
+                  // the message itself states one, anchored to its SENT date. Only a date
+                  // still in the future is attached — a stale "next Friday" from months ago
+                  // must not schedule anything.
+                  const anchor = new Date(src.row.occurred_at);
+                  const when = !Number.isNaN(anchor.getTime()) ? parseWhen(src.text, anchor) : null;
+                  if (when && when.getTime() > Date.now()) dueAt = when.toISOString().slice(0, 10);
+                  // Same-day backstop: an item still undated here whose only temporal
+                  // reference is a time-of-day / same-day marker was scoped to its message's
+                  // SENT date — if that moment has passed, drop it entirely. Items the model
+                  // dated (explicit future date) never reach this check.
+                  if (!dueAt && !Number.isNaN(anchor.getTime()) && isExpiredSameDay(`${title} — ${src.text}`, anchor)) {
+                    continue;
+                  }
+                }
+                pending.push({
+                  candidateN: src.n,
+                  personId: src.row.person_id,
+                  direction,
+                  description: title,
+                  dueAt,
+                  kind,
+                  startTime,
+                  sourceId: src.row.id,
+                  confidence,
+                  dedupeKey: dedupeKeyFor(title, src.row.person_id, dueAt),
+                });
+              }
+            }
+          } catch (e) {
+            console.warn(`commitments: bad normalize JSON, batch degrades (${(e as Error).message})`);
+          }
+        }
+        // The second call failing means we have no titles at all — degrade the whole batch
+        // to the deterministic path rather than inserting raw snippets.
+        if (!normalized) {
+          llmHandled = false;
+          pending.length = 0;
         }
       }
     }
-
-    const mark = db.prepare("UPDATE interaction SET extracted_at = datetime('now') WHERE id = ?");
-    const markAll = db.transaction((ids: number[]) => ids.forEach((id) => mark.run(id)));
-    markAll(batch.map((r) => r.id));
   }
 
-  return { inserted, needsReview, processed: rows.length };
+  if (!llmHandled) {
+    // Deterministic fallback (unchanged behavior): each candidate's text runs through the
+    // follow-up extractor, capped at FALLBACK_CONFIDENCE so it can never auto-convert.
+    for (const c of candidates) {
+      if (!c.row.occurred_at) continue;
+      const proposals = extractFollowups(db, c.row.person_id, [
+        { text: c.text, sentAt: c.row.occurred_at, direction: c.row.direction },
+      ]);
+      for (const p of proposals) {
+        if (!passesCommitmentGate(p.description)) continue; // same gate as the LLM path
+        if (threadResolves(p.description, laterTexts(c.row.person_id, c.row.occurred_at))) continue;
+        if (isExpiredSameDay(`${p.description} — ${c.text}`, new Date(c.row.occurred_at))) continue;
+        pending.push({
+          candidateN: c.n,
+          personId: c.row.person_id,
+          direction: "i_owe_them",
+          description: p.description,
+          dueAt: p.dueAt,
+          kind: "task",
+          startTime: null,
+          sourceId: c.row.id,
+          confidence: FALLBACK_CONFIDENCE,
+          dedupeKey: dedupeKeyFor(p.description, c.row.person_id, p.dueAt),
+        });
+      }
+    }
+  }
+
+  // ── batch-internal collapse: the same thing from two messages is ONE row ──
+  const survivorsByKey = new Map<string, PendingCommitment>();
+  const finals: PendingCommitment[] = [];
+  const producedCommitment = new Set<number>();
+  for (const p of pending) {
+    producedCommitment.add(p.candidateN);
+    if (!p.dedupeKey) {
+      finals.push(p);
+      continue;
+    }
+    const prev = survivorsByKey.get(p.dedupeKey);
+    if (!prev) {
+      survivorsByKey.set(p.dedupeKey, p);
+      finals.push(p);
+      continue;
+    }
+    // Merge into the row already claiming this key: better title/kind win with confidence,
+    // and any date the first one lacked is filled in.
+    if (p.confidence > prev.confidence) {
+      prev.description = p.description;
+      prev.kind = p.kind;
+      prev.direction = p.direction;
+      prev.confidence = p.confidence;
+    }
+    prev.dueAt = prev.dueAt ?? p.dueAt;
+    prev.startTime = prev.startTime ?? p.startTime;
+  }
+
+  // ── insert (cross-run collapse happens in the ON CONFLICT clause) ─────────
+  const ins = insertCommitment(db);
+  const existing = db.prepare("SELECT id FROM commitment WHERE dedupe_key = ?");
+  let inserted = 0;
+  let needsReview = 0;
+  let merged = 0;
+  for (const p of finals) {
+    const isUpdate = !!(p.dedupeKey && existing.get(p.dedupeKey));
+    ins.run(
+      p.personId,
+      p.direction,
+      p.description,
+      p.dueAt,
+      p.sourceId,
+      p.confidence,
+      p.dedupeKey,
+      p.kind,
+      p.startTime
+    );
+    if (isUpdate) {
+      merged++; // an existing commitment absorbed this one — no new row
+      continue;
+    }
+    inserted++;
+    if (p.confidence < REVIEW_CONFIDENCE) needsReview++;
+  }
+
+  // Every candidate is logged, so identical content is never sent to the model again.
+  for (const c of candidates) {
+    logExtraction(db, c.row.id, c.hash, producedCommitment.has(c.n) ? "commitment" : "rejected");
+  }
+  markAll(handledIds);
+
+  if (merged > 0 || pending.length !== finals.length) {
+    console.log(
+      `commitments: collapsed ${pending.length - finals.length} in-batch duplicate(s), ${merged} into existing commitment(s)`
+    );
+  }
+  return { inserted, needsReview, processed: handledIds.length };
 }
 
 /** User accepted an extracted commitment. */

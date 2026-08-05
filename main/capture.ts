@@ -17,6 +17,13 @@
 // Cursors advance ONLY after handleCommand succeeds for a message, so a failed run retries
 // the unprocessed tail next time and nothing is ever processed twice (strict > comparisons
 // on both cursors).
+//
+// Cursors are not enough on their own (owner report 2026-08-05 (a): two self-texts landed
+// about four times). The same text genuinely arrives more than once — iMessage echoes the
+// note-to-self thread, and a braindump often goes out to BOTH the self-mail address and the
+// self thread. So every message is also content-hashed (crm/commitments.contentHash) and
+// checked against `extraction_log`: identical normalized text is routed to the assistant
+// exactly once, ever. Digest replies are exempt — "confirm 2" is meant to be repeatable.
 
 import { createRequire } from "node:module";
 import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
@@ -31,6 +38,7 @@ import { normalizeEmail, normalizePhone } from "./crm/normalize.ts";
 import { handleCommand } from "./assistant.ts";
 import { listMailAccounts, type MailAccount } from "./connectors/gmail.ts";
 import { getCursor, setCursor, type ConnectorDeps, type SyncReport } from "./connectors/common.ts";
+import { contentHash, contentSeen, logExtraction } from "./crm/commitments.ts";
 import { decodeAttributedBody, imessageAvailable, DEFAULT_CHAT_DB } from "./connectors/imessage.ts";
 import { isDigestMessage, isDigestReply, handleDigestReply } from "./digest.ts";
 
@@ -386,14 +394,29 @@ export async function runCapture(deps: ConnectorDeps): Promise<SyncReport> {
         m.advance();
         continue;
       }
+      // Content-hash dedupe (owner report 2026-08-05 (a): "2 items landed ~4 times").
+      // A self-text reaches capture more than once — iMessage echoes the note-to-self
+      // thread, and the same braindump often arrives by BOTH mail and iMessage. Identical
+      // normalized text is routed exactly once, ever; the repeats advance the cursor and
+      // are counted as skipped. Digest replies are exempt: "confirm 2" is deliberately
+      // repeatable text.
+      const hash = contentHash(m.text);
+      const replyToDigest = isDigestReply(m.text);
+      if (!replyToDigest && contentSeen(deps.db, hash)) {
+        report.skipped++;
+        m.advance();
+        continue;
+      }
       try {
         // Confirm/drop replies to the digest go to the reply handler, not the assistant.
-        if (isDigestReply(m.text)) {
+        if (replyToDigest) {
           await handleDigestReply(deps.db, deps.secrets, m.text);
           kinds.set("digest-reply", (kinds.get("digest-reply") ?? 0) + 1);
         } else {
           const res = await handleCommand(cmdDeps, m.text);
           kinds.set(res.kind, (kinds.get(res.kind) ?? 0) + 1);
+          // Logged only after the assistant succeeded, so a failed run retries the text.
+          logExtraction(deps.db, null, hash, "capture");
         }
         report.ingested++;
         m.advance(); // cursor moves only after successful processing

@@ -282,4 +282,31 @@ CREATE TABLE worklog (
 CREATE INDEX idx_worklog_happened ON worklog(happened_at);
 `,
   },
+  {
+    version: 6,
+    name: "dedupe",
+    sql: `
+-- Owner report 2026-08-05 (duplicate commitments). Two independent defenses:
+--   1. extraction_log — a content hash of every interaction ever decided, so identical
+--      text (the iMessage self-thread echo, the same task arriving by mail AND iMessage)
+--      is never sent to the LLM or extracted twice. Cheap, deterministic, first line.
+--   2. commitment.dedupe_key — a normalized slug of the AI title + person + due day,
+--      unique where set, so the SAME commitment stated in two DIFFERENT messages
+--      collapses into ONE row (INSERT … ON CONFLICT DO UPDATE keeps the better one).
+-- kind/start_time carry the second extraction query's TASK-vs-CALENDAR-EVENT verdict.
+ALTER TABLE commitment ADD COLUMN dedupe_key TEXT;
+ALTER TABLE commitment ADD COLUMN kind TEXT DEFAULT 'task';   -- task | event
+ALTER TABLE commitment ADD COLUMN start_time TEXT;            -- HH:MM, only when kind='event'
+CREATE UNIQUE INDEX idx_commitment_dedupe ON commitment(dedupe_key) WHERE dedupe_key IS NOT NULL;
+
+CREATE TABLE extraction_log (
+  id INTEGER PRIMARY KEY,
+  interaction_id INTEGER,
+  content_hash TEXT UNIQUE,
+  decided_at TEXT NOT NULL DEFAULT (datetime('now')),
+  verdict TEXT                                                -- commitment | rejected | capture
+);
+CREATE INDEX idx_extraction_log_interaction ON extraction_log(interaction_id);
+`,
+  },
 ];
