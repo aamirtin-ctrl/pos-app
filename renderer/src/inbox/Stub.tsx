@@ -1,28 +1,33 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-// Messaging: a real two-pane unified inbox. Left = conversations grouped by
-// person (unanswered first). Right = the recent thread + a compose box prefilled
-// with the auto-drafted reply. Send routes per channel: email → SMTP via
-// inbox.sendEmail, iMessage → inbox.sendIMessage, LinkedIn → open the real
-// messaging window + copy the draft (no fake send). Every send is an explicit
-// user click — POS never auto-sends.
+// Messaging: a real two-pane unified inbox. Left = conversations (one row per
+// conversation key from listInbox — group chats keyed by chat guid, 1:1 by
+// person), unanswered first. Right = the recent thread + a compose box
+// prefilled with the auto-drafted reply. Send routes per channel: email → SMTP
+// via inbox.sendEmail, 1:1 iMessage → inbox.sendIMessage, group iMessage →
+// inbox.sendIMessageChat, LinkedIn → open the real messaging window + copy the
+// draft (no fake send). Every send is an explicit user click — POS never
+// auto-sends.
 
 type ThreadMessage = {
   id: number; channel: string; direction: string | null;
   subject: string | null; body_summary: string | null; occurred_at: string | null;
+  sender_name: string | null;
 };
 type InboxItem = {
   id: number; person_id: number; person_name: string; channel: string;
   subject: string | null; body_summary: string | null; occurred_at: string | null;
-  external_id: string | null; has_draft: 0 | 1; draft_id: number | null;
+  external_id: string | null; thread_external_id: string | null;
+  thread_key: string; is_group: 0 | 1; group_name: string | null;
+  has_draft: 0 | 1; draft_id: number | null;
   draft_body: string | null; answered: 0 | 1; unanswered: 0 | 1; thread: ThreadMessage[];
 };
 type Handles = { email: string | null; imessage: string | null };
 type MailAccount = { id: string; provider: string; user: string; host: string };
 
 type Conversation = {
-  personId: number; name: string; channel: string; latest: InboxItem;
-  unanswered: boolean; draft: string | null;
+  key: string; personId: number; name: string; channel: string; latest: InboxItem;
+  unanswered: boolean; draft: string | null; isGroup: boolean;
 };
 
 const EMAIL_CHANNELS = new Set(["gmail", "outlook", "icloud", "mailfile"]);
@@ -74,6 +79,18 @@ function ChannelIcon({ channel, size = 14 }: { channel: string; size?: number })
   );
 }
 
+// multi-person icon for group conversations
+function GroupIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="5.5" cy="5.2" r="2.3" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M1.5 13c.5-2.3 2.1-3.6 4-3.6s3.5 1.3 4 3.6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+      <circle cx="11.3" cy="5.8" r="1.9" stroke="currentColor" strokeWidth="1.2" />
+      <path d="M11.6 9.6c1.6.2 2.7 1.3 3 3.1" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 function fmtDate(iso: string | null): string {
   if (!iso) return "";
   const d = new Date(iso);
@@ -85,18 +102,24 @@ function fmtDate(iso: string | null): string {
     : d.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
+/** Distinct sender names across the thread, for the group-row subtitle. */
+function senderNames(thread: ThreadMessage[]): string {
+  return [...new Set(thread.map((m) => m.sender_name).filter(Boolean) as string[])].join(", ");
+}
+
 export default function Inbox() {
   const [items, setItems] = useState<InboxItem[]>([]);
-  const [selected, setSelected] = useState<number | null>(null); // person_id
+  const [selected, setSelected] = useState<string | null>(null); // thread_key
   const [handles, setHandles] = useState<Handles | null>(null);
   const [accounts, setAccounts] = useState<MailAccount[]>([]);
   const [accountUser, setAccountUser] = useState<string>("");
   const [compose, setCompose] = useState("");
-  const composeFor = useRef<number | null>(null);
-  const [busy, setBusy] = useState<string | null>(null); // "generate" | "voice" | "send"
+  const composeFor = useRef<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null); // "generate" | "voice" | "send" | "delete"
   const [msg, setMsg] = useState<string | null>(null);
   const [sendState, setSendState] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [copied, setCopied] = useState(false);
+  const [confirmKey, setConfirmKey] = useState<string | null>(null); // row showing the inline delete confirm
 
   const refetch = useCallback(async () => {
     const r = await window.pos.inbox.list({ limit: 50 });
@@ -111,46 +134,40 @@ export default function Inbox() {
     });
   }, [refetch]);
 
-  // Group by person; conversation order = unanswered first, then newest.
-  const conversations = useMemo<Conversation[]>(() => {
-    const byPerson = new Map<number, Conversation>();
-    for (const it of items) {
-      const existing = byPerson.get(it.person_id);
-      if (!existing) {
-        byPerson.set(it.person_id, {
-          personId: it.person_id, name: it.person_name, channel: it.channel,
-          latest: it, unanswered: it.unanswered === 1, draft: it.draft_body,
-        });
-      } else {
-        if ((it.occurred_at ?? "") > (existing.latest.occurred_at ?? "")) {
-          existing.latest = it; existing.channel = it.channel;
-        }
-        if (it.unanswered === 1) existing.unanswered = true;
-        if (!existing.draft && it.draft_body) existing.draft = it.draft_body;
-      }
-    }
-    return [...byPerson.values()].sort((a, b) => {
-      if (a.unanswered !== b.unanswered) return a.unanswered ? -1 : 1;
-      return (b.latest.occurred_at ?? "").localeCompare(a.latest.occurred_at ?? "");
-    });
-  }, [items]);
+  // listInbox already collapses to one row per conversation key, sorted
+  // unanswered-first then newest — a straight map is all that's left.
+  const conversations = useMemo<Conversation[]>(
+    () =>
+      items.map((it) => ({
+        key: it.thread_key,
+        personId: it.person_id,
+        name: it.is_group ? it.group_name ?? "Group chat" : it.person_name,
+        channel: it.channel,
+        latest: it,
+        unanswered: it.unanswered === 1,
+        draft: it.draft_body,
+        isGroup: it.is_group === 1,
+      })),
+    [items]
+  );
 
-  const convo = conversations.find((c) => c.personId === selected) ?? null;
+  const convo = conversations.find((c) => c.key === selected) ?? null;
 
   // Select the first conversation once loaded; refresh handles + compose per selection.
   useEffect(() => {
-    if (selected === null && conversations.length > 0) setSelected(conversations[0].personId);
+    if (selected === null && conversations.length > 0) setSelected(conversations[0].key);
   }, [conversations, selected]);
   useEffect(() => {
-    if (selected === null) return;
+    if (!convo) return;
     setHandles(null);
     setSendState(null);
-    window.pos.inbox.handles(selected).then((r) => setHandles(r.ok ? (r.data as Handles) : null));
-  }, [selected]);
+    window.pos.inbox.handles(convo.personId).then((r) => setHandles(r.ok ? (r.data as Handles) : null));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [convo?.key, convo?.personId]);
   useEffect(() => {
     if (!convo) return;
-    if (composeFor.current !== convo.personId) {
-      composeFor.current = convo.personId;
+    if (composeFor.current !== convo.key) {
+      composeFor.current = convo.key;
       setCompose(convo.draft ?? "");
     }
   }, [convo]);
@@ -178,7 +195,18 @@ export default function Inbox() {
     const channel = convo.channel;
     setBusy("send"); setSendState(null);
     try {
-      if (EMAIL_CHANNELS.has(channel)) {
+      if (convo.isGroup) {
+        // Group send exists for iMessage only; other channels fall through to the
+        // buttons below (LinkedIn opens the real window).
+        if (channel !== "imessage") return;
+        const chatGuid = convo.latest.thread_external_id;
+        if (!chatGuid) { setSendState({ kind: "err", text: "No chat id on file for this group." }); return; }
+        const r = await window.pos.inbox.sendIMessageChat({
+          chatGuid, body: compose, personId: convo.personId,
+        });
+        if (!r.ok) { setSendState({ kind: "err", text: friendlyError(r.error) }); return; }
+        setSendState({ kind: "ok", text: `Sent to ${convo.name}.` });
+      } else if (EMAIL_CHANNELS.has(channel)) {
         const to = handles?.email;
         if (!to) { setSendState({ kind: "err", text: friendlyError("no_recipient") }); return; }
         const subj = convo.latest.subject
@@ -207,6 +235,25 @@ export default function Inbox() {
     }
   };
 
+  // Quick-delete: removes the person the row represents (for groups, the thread's
+  // most recent sender) and, via DB cascade, their interactions and drafts.
+  const removeConvo = async (c: Conversation) => {
+    if (busy) return;
+    setBusy("delete");
+    try {
+      await window.pos.people.delete(c.personId);
+      setConfirmKey(null);
+      if (selected === c.key) {
+        setSelected(null); // auto-select the next conversation after refetch
+        composeFor.current = null;
+        setCompose("");
+      }
+      await refetch();
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const copyDraft = async () => {
     await navigator.clipboard.writeText(compose);
     setCopied(true);
@@ -214,13 +261,20 @@ export default function Inbox() {
   };
 
   const viaLabel = convo
-    ? EMAIL_CHANNELS.has(convo.channel)
+    ? convo.isGroup
+      ? convo.channel === "imessage" ? "via iMessage — replies go to the whole group"
+        : `via ${CHANNEL_LABEL[convo.channel] ?? convo.channel}`
+      : EMAIL_CHANNELS.has(convo.channel)
       ? `via ${accountUser || "email"}`
       : convo.channel === "imessage" ? "via iMessage"
       : convo.channel === "linkedin" ? "via LinkedIn — sends from the LinkedIn window"
       : `via ${CHANNEL_LABEL[convo.channel] ?? convo.channel}`
     : "";
-  const canSend = !!convo && (EMAIL_CHANNELS.has(convo.channel) || convo.channel === "imessage");
+  const canSend =
+    !!convo &&
+    (convo.isGroup
+      ? convo.channel === "imessage"
+      : EMAIL_CHANNELS.has(convo.channel) || convo.channel === "imessage");
 
   return (
     <div className="p-6 h-full flex flex-col max-w-5xl mx-auto">
@@ -258,10 +312,13 @@ export default function Inbox() {
           {/* ── left: conversation list ── */}
           <div className="w-72 shrink-0 overflow-y-auto rounded-xl border bg-white/70" style={{ borderColor: "var(--line)" }}>
             {conversations.map((c) => {
-              const active = c.personId === selected;
+              const active = c.key === selected;
+              const confirming = confirmKey === c.key;
               return (
-                <button key={c.personId} onClick={() => setSelected(c.personId)}
-                  className="w-full text-left px-3 py-2.5 border-b block"
+                <div key={c.key} onClick={() => setSelected(c.key)}
+                  role="button" tabIndex={0}
+                  onKeyDown={(e) => { if (e.key === "Enter") setSelected(c.key); }}
+                  className="group w-full text-left px-3 py-2.5 border-b block cursor-pointer"
                   style={{
                     borderColor: "var(--line)",
                     background: active ? "linear-gradient(160deg, white, var(--wash))" : "transparent",
@@ -270,16 +327,47 @@ export default function Inbox() {
                     {c.unanswered && (
                       <span className="w-2 h-2 rounded-full shrink-0" style={{ background: "var(--petal)" }} title="Needs a reply" />
                     )}
+                    {c.isGroup && (
+                      <span className="shrink-0" style={{ color: "var(--accent)" }} title="Group chat"><GroupIcon /></span>
+                    )}
                     <span className="text-sm font-medium truncate" style={{ color: "var(--ink)" }}>{c.name}</span>
                     <span className="ml-auto shrink-0 flex items-center gap-1.5">
                       <span style={{ color: "var(--accent)" }}><ChannelIcon channel={c.channel} /></span>
                       <span className="text-[10px]" style={{ color: "var(--muted)" }}>{fmtDate(c.latest.occurred_at)}</span>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setConfirmKey(confirming ? null : c.key); }}
+                        title={c.isGroup ? "Remove this sender" : "Remove contact"}
+                        aria-label={c.isGroup ? "Remove this sender" : "Remove contact"}
+                        className="opacity-0 group-hover:opacity-100 transition-opacity duration-[120ms] text-xs leading-none px-1 py-0.5 rounded hover:bg-black/[0.06]"
+                        style={{ color: "var(--muted)" }}>
+                        ✕
+                      </button>
                     </span>
                   </div>
-                  <div className="text-xs truncate mt-0.5" style={{ color: "var(--muted)" }}>
-                    {(c.latest.subject ? `${c.latest.subject} — ` : "") + (c.latest.body_summary ?? "")}
-                  </div>
-                </button>
+                  {confirming ? (
+                    <div className="flex items-center gap-2 mt-1" onClick={(e) => e.stopPropagation()}>
+                      <span className="text-[11px]" style={{ color: "var(--danger)" }}>
+                        {c.isGroup ? "Remove this sender and their history?" : "Remove contact and history?"}
+                      </span>
+                      <button onClick={() => removeConvo(c)} disabled={!!busy}
+                        className="text-[11px] px-1.5 py-0.5 rounded border disabled:opacity-50"
+                        style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
+                        {busy === "delete" ? "Removing…" : "Remove"}
+                      </button>
+                      <button onClick={() => setConfirmKey(null)}
+                        className="text-[11px] px-1.5 py-0.5 rounded border"
+                        style={{ borderColor: "var(--line)", color: "var(--muted)" }}>
+                        Cancel
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="text-xs truncate mt-0.5" style={{ color: "var(--muted)" }}>
+                      {c.isGroup
+                        ? senderNames(c.latest.thread) || c.latest.body_summary || ""
+                        : (c.latest.subject ? `${c.latest.subject} — ` : "") + (c.latest.body_summary ?? "")}
+                    </div>
+                  )}
+                </div>
               );
             })}
           </div>
@@ -291,10 +379,16 @@ export default function Inbox() {
             ) : (
               <>
                 <div className="px-4 py-2.5 border-b flex items-center gap-2 shrink-0 bg-white/60" style={{ borderColor: "var(--line)" }}>
-                  <span style={{ color: "var(--accent)" }}><ChannelIcon channel={convo.channel} size={16} /></span>
-                  <a href={`#/contact/${convo.personId}`} className="text-sm font-medium" style={{ color: "var(--ink)" }}>{convo.name}</a>
+                  <span style={{ color: "var(--accent)" }}>
+                    {convo.isGroup ? <GroupIcon size={16} /> : <ChannelIcon channel={convo.channel} size={16} />}
+                  </span>
+                  {convo.isGroup ? (
+                    <span className="text-sm font-medium" style={{ color: "var(--ink)" }}>{convo.name}</span>
+                  ) : (
+                    <a href={`#/contact/${convo.personId}`} className="text-sm font-medium" style={{ color: "var(--ink)" }}>{convo.name}</a>
+                  )}
                   <span className="text-[11px]" style={{ color: "var(--muted)" }}>{viaLabel}</span>
-                  {EMAIL_CHANNELS.has(convo.channel) && accounts.length > 1 && (
+                  {!convo.isGroup && EMAIL_CHANNELS.has(convo.channel) && accounts.length > 1 && (
                     <select value={accountUser} onChange={(e) => setAccountUser(e.target.value)}
                       className="ml-auto text-[11px] border rounded-md px-1 py-0.5 bg-white"
                       style={{ borderColor: "var(--line)", color: "var(--ink)" }}>
@@ -302,6 +396,12 @@ export default function Inbox() {
                     </select>
                   )}
                 </div>
+                {convo.isGroup && senderNames(convo.latest.thread) && (
+                  <div className="px-4 py-1.5 border-b text-[11px] truncate shrink-0 bg-white/40"
+                    style={{ borderColor: "var(--line)", color: "var(--muted)" }}>
+                    {senderNames(convo.latest.thread)}
+                  </div>
+                )}
 
                 <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
                   {convo.latest.thread.map((m) => {
@@ -312,7 +412,13 @@ export default function Inbox() {
                           style={out
                             ? { background: "linear-gradient(160deg, var(--pink-1), var(--wash))", borderColor: "var(--pink-2)", color: "var(--ink)" }
                             : { background: "linear-gradient(160deg, white, var(--panel))", borderColor: "var(--line)", color: "var(--ink)" }}>
-                          {m.subject && <div className="text-[11px] font-medium mb-0.5" style={{ color: "var(--muted)" }}>{m.subject}</div>}
+                          {convo.isGroup && !out && m.sender_name && (
+                            <div className="text-[11px] font-medium mb-0.5" style={{ color: "var(--accent)" }}>{m.sender_name}</div>
+                          )}
+                          {/* in group threads the subject is the chat name on every row — the sender line replaces it */}
+                          {!convo.isGroup && m.subject && (
+                            <div className="text-[11px] font-medium mb-0.5" style={{ color: "var(--muted)" }}>{m.subject}</div>
+                          )}
                           <div>{m.body_summary ?? <span style={{ color: "var(--muted)" }}>(no preview)</span>}</div>
                           <div className="text-[10px] mt-1 flex items-center gap-1" style={{ color: "var(--muted)" }}>
                             <ChannelIcon channel={m.channel} size={10} />
@@ -336,7 +442,7 @@ export default function Inbox() {
                     style={{ borderColor: "var(--line)", color: "var(--ink)" }} />
                   <div className="flex items-center gap-2 mt-2">
                     {canSend ? (
-                      <button onClick={send} disabled={!!busy || !compose.trim() || !handles}
+                      <button onClick={send} disabled={!!busy || !compose.trim() || (!convo.isGroup && !handles)}
                         className="px-3.5 py-1.5 rounded-lg text-sm text-white disabled:opacity-50"
                         style={{ background: "linear-gradient(135deg, var(--pink-3), var(--accent))" }}>
                         {busy === "send" ? "Sending…" : "Send"}

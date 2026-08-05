@@ -7,7 +7,7 @@ import { getSetting, setSetting, hasVec } from "./db/db.ts";
 import { SecretStore, SECRET_NAMES } from "./secrets.ts";
 import { LlmClient } from "./llm/provider.ts";
 import { monthSpend, getCeiling, setCeiling } from "./llm/meter.ts";
-import { listPeople, getPerson, patchPerson, mergePeople } from "./crm/people.ts";
+import { listPeople, getPerson, patchPerson, mergePeople, deletePerson } from "./crm/people.ts";
 import { rank } from "./crm/ranking.ts";
 import { reconnectDue, refreshNextTouch } from "./crm/reconnect.ts";
 import { listCommitments, confirmCommitment } from "./crm/commitments.ts";
@@ -28,7 +28,16 @@ import * as planner from "./planner.ts";
 import { handleCommand } from "./assistant.ts";
 import { transcribe } from "./stt.ts";
 import { generateDrafts, listDrafts, setDraftStatus, synthesizeVoices, getVoices } from "./crm/drafts.ts";
-import { listInbox, sendEmail, sendIMessage, personHandles, type SendEmailArgs, type SendIMessageArgs } from "./messaging.ts";
+import {
+  listInbox,
+  sendEmail,
+  sendIMessage,
+  sendIMessageToChat,
+  personHandles,
+  type SendEmailArgs,
+  type SendIMessageArgs,
+  type SendIMessageChatArgs,
+} from "./messaging.ts";
 import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learning.ts";
 import { runSync, syncStatus } from "./workers.ts";
 import { composeDigest, sendMorningDigest } from "./digest.ts";
@@ -82,6 +91,9 @@ export function registerIpc(deps: IpcDeps) {
   h("people.get", (id: number) => getPerson(db, id));
   h("people.patch", (id: number, fields: Record<string, unknown>) => patchPerson(db, id, fields));
   h("people.merge", (ids: number[]) => mergePeople(db, ids));
+  // Quick-delete from Messaging/Contacts: hard-removes the person; aliases,
+  // interactions and drafts cascade, commitments/tasks keep rows with refs nulled.
+  h("people.delete", (id: number) => ({ deleted: deletePerson(db, id) }));
   h("people.reconnect", () => {
     refreshNextTouch(db);
     return reconnectDue(db);
@@ -339,6 +351,7 @@ export function registerIpc(deps: IpcDeps) {
   // Both send paths are user-initiated only (explicit Send click in the renderer).
   h("inbox.sendEmail", (args: SendEmailArgs) => sendEmail(db, secrets, args));
   h("inbox.sendIMessage", (args: SendIMessageArgs) => sendIMessage(db, args));
+  h("inbox.sendIMessageChat", (args: SendIMessageChatArgs) => sendIMessageToChat(db, args));
   h("inbox.handles", (personId: number) => personHandles(db, personId));
 
   // ── messaging drafts + voices ──

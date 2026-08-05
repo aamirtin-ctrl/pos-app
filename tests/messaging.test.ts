@@ -11,8 +11,10 @@ import {
   personHandles,
   escapeAppleScript,
   iMessageScript,
+  iMessageChatScript,
   smtpConfigFor,
 } from "../main/messaging.ts";
+import { deletePerson } from "../main/crm/people.ts";
 
 let dir: string;
 let db: Db;
@@ -31,13 +33,20 @@ function addPerson(name: string): number {
 }
 function addInteraction(
   personId: number,
-  o: { channel?: string; direction: string; occurredAt: string; subject?: string | null; body?: string | null }
+  o: {
+    channel?: string;
+    direction: string;
+    occurredAt: string;
+    subject?: string | null;
+    body?: string | null;
+    threadExternalId?: string | null;
+  }
 ): number {
   return Number(
     db
       .prepare(
-        `INSERT INTO interaction (person_id, channel, direction, occurred_at, subject, body_summary, external_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO interaction (person_id, channel, direction, occurred_at, subject, body_summary, external_id, thread_external_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         personId,
@@ -46,7 +55,8 @@ function addInteraction(
         o.occurredAt,
         o.subject ?? null,
         o.body ?? null,
-        `ext-${Math.random().toString(36).slice(2)}`
+        `ext-${Math.random().toString(36).slice(2)}`,
+        o.threadExternalId ?? null
       ).lastInsertRowid
   );
 }
@@ -124,12 +134,97 @@ describe("listInbox", () => {
     expect(withDraft[0].unanswered).toBe(1);
   });
 
-  it("respects the limit option", () => {
+  it("collapses a person's messages into one conversation and respects the limit option", () => {
     const p = addPerson("Many");
     for (let i = 0; i < 6; i++) {
       addInteraction(p, { direction: "inbound", occurredAt: `2026-08-01T0${i}:00:00Z`, body: `m${i}` });
     }
+    // one 1:1 conversation, represented by the newest inbound
+    const collapsed = listInbox(db);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0].body_summary).toBe("m5");
+    // limit bounds the scanned inbound rows → conversations, one per person here
+    for (const name of ["P2", "P3", "P4"]) {
+      addInteraction(addPerson(name), { direction: "inbound", occurredAt: "2026-08-02T10:00:00Z", body: "hi" });
+    }
     expect(listInbox(db, { limit: 3 })).toHaveLength(3);
+  });
+});
+
+describe("listInbox group threading", () => {
+  const GUID = "iMessage;+;chat123";
+
+  function seedGroupAndOneToOne() {
+    const ada = addPerson("Ada");
+    const bob = addPerson("Bob");
+    const cleo = addPerson("Cleo");
+    // 3-sender group chat: same thread_external_id, subject carries the chat name
+    addInteraction(ada, {
+      channel: "imessage", direction: "inbound", occurredAt: "2026-08-01T09:00:00Z",
+      body: "who's in?", threadExternalId: GUID, subject: "Ski Trip",
+    });
+    addInteraction(bob, {
+      channel: "imessage", direction: "inbound", occurredAt: "2026-08-01T10:00:00Z",
+      body: "me", threadExternalId: GUID, subject: "Ski Trip",
+    });
+    addInteraction(cleo, {
+      channel: "imessage", direction: "inbound", occurredAt: "2026-08-01T11:00:00Z",
+      body: "same", threadExternalId: GUID, subject: null, // renamed rows can lack a subject
+    });
+    // 1:1 with one of the same senders, no thread_external_id
+    addInteraction(ada, {
+      channel: "imessage", direction: "inbound", occurredAt: "2026-08-01T12:00:00Z", body: "just us",
+    });
+    return { ada, bob, cleo };
+  }
+
+  it("returns one conversation per key: the group collapses to a single row, the 1:1 stays separate", () => {
+    const { ada, cleo } = seedGroupAndOneToOne();
+    const items = listInbox(db);
+    expect(items).toHaveLength(2);
+    const keys = items.map((i) => i.thread_key).sort();
+    expect(keys).toEqual([`chat:${GUID}`, `person:${ada}`]);
+    const group = items.find((i) => i.thread_key === `chat:${GUID}`)!;
+    // newest inbound (Cleo's) represents the group conversation
+    expect(group.person_id).toBe(cleo);
+    expect(group.is_group).toBe(1);
+    expect(group.thread_external_id).toBe(GUID);
+  });
+
+  it("titles the group from the most recent non-null subject in the thread", () => {
+    seedGroupAndOneToOne();
+    const group = listInbox(db).find((i) => i.is_group === 1)!;
+    expect(group.group_name).toBe("Ski Trip");
+  });
+
+  it("falls back to 'Group chat' when no row in the thread carries a subject", () => {
+    const p = addPerson("Solo");
+    addInteraction(p, {
+      channel: "imessage", direction: "inbound", occurredAt: "2026-08-01T09:00:00Z",
+      body: "hi", threadExternalId: "iMessage;+;noname", subject: null,
+    });
+    const group = listInbox(db).find((i) => i.is_group === 1)!;
+    expect(group.group_name).toBe("Group chat");
+  });
+
+  it("threads the group by chat guid with per-message sender_name, across all senders", () => {
+    seedGroupAndOneToOne();
+    const group = listInbox(db).find((i) => i.is_group === 1)!;
+    expect(group.thread.map((m) => m.sender_name)).toEqual(["Ada", "Bob", "Cleo"]);
+    expect(group.thread.map((m) => m.body_summary)).toEqual(["who's in?", "me", "same"]);
+  });
+
+  it("keeps the 1:1 conversation in today's shape: is_group 0, threaded by person only", () => {
+    const { ada } = seedGroupAndOneToOne();
+    const solo = listInbox(db).find((i) => i.thread_key === `person:${ada}`)!;
+    expect(solo.is_group).toBe(0);
+    expect(solo.group_name).toBeNull();
+    expect(solo.thread_external_id).toBeNull();
+    expect(solo.person_name).toBe("Ada");
+    // Ada's 1:1 thread excludes her group messages
+    expect(solo.thread).toHaveLength(1);
+    expect(solo.thread[0].body_summary).toBe("just us");
+    expect(solo.thread[0].sender_name).toBe("Ada");
   });
 });
 
@@ -185,6 +280,81 @@ describe("escapeAppleScript", () => {
     expect(script).toContain('send "line1\\nhe said \\"sure\\" \\\\ done"');
     expect(script).toContain('to participant "+1555"');
     expect(script).toContain('service type = iMessage');
+  });
+});
+
+describe("iMessageChatScript", () => {
+  it("targets the chat by id instead of a participant", () => {
+    const script = iMessageChatScript("iMessage;+;chat123", "hello all");
+    expect(script).toBe(
+      'tell application "Messages" to send "hello all" to chat id "iMessage;+;chat123"'
+    );
+  });
+
+  it("escapes the body and the guid with the same rules as the 1:1 script", () => {
+    const script = iMessageChatScript('guid"with\\quirks', 'line1\nhe said "sure" \\ done');
+    expect(script).not.toMatch(/\n/);
+    expect(script).toContain('send "line1\\nhe said \\"sure\\" \\\\ done"');
+    expect(script).toContain('to chat id "guid\\"with\\\\quirks"');
+  });
+});
+
+describe("people.delete (IPC shape)", () => {
+  // Mirrors the ipc.ts wrapper: throws → { ok: false, error }, results → { ok: true, data }.
+  const h =
+    <A extends unknown[], R>(fn: (...args: A) => R) =>
+    async (...args: A) => {
+      try {
+        return { ok: true as const, data: await fn(...args) };
+      } catch (err) {
+        return { ok: false as const, error: (err as Error).message };
+      }
+    };
+  const del = h((id: number) => ({ deleted: deletePerson(db, id) }));
+
+  const count = (table: string, personId: number | null): number =>
+    (
+      db
+        .prepare(
+          personId === null
+            ? `SELECT COUNT(*) AS n FROM ${table} WHERE person_id IS NULL`
+            : `SELECT COUNT(*) AS n FROM ${table} WHERE person_id = ?`
+        )
+        .get(...(personId === null ? [] : [personId])) as { n: number }
+    ).n;
+
+  it("cascades interactions and aliases; commitments survive with person_id NULL", async () => {
+    const p = addPerson("Doomed");
+    const other = addPerson("Bystander");
+    const inbound = addInteraction(p, { direction: "inbound", occurredAt: "2026-08-01T10:00:00Z", body: "hi" });
+    addInteraction(p, { direction: "outbound", occurredAt: "2026-08-01T11:00:00Z", body: "yo" });
+    addDraft(inbound, p, "drafted reply");
+    db.prepare("INSERT INTO alias (person_id, kind, value) VALUES (?, 'email', 'doomed@x.com')").run(p);
+    db.prepare("INSERT INTO alias (person_id, kind, value) VALUES (?, 'phone', '+15551234567')").run(p);
+    db.prepare("INSERT INTO commitment (person_id, description) VALUES (?, 'send the deck')").run(p);
+    addInteraction(other, { direction: "inbound", occurredAt: "2026-08-01T12:00:00Z", body: "unrelated" });
+
+    expect(count("interaction", p)).toBe(2);
+    expect(count("alias", p)).toBe(2);
+
+    const res = await del(p);
+    expect(res).toEqual({ ok: true, data: { deleted: true } });
+
+    expect(db.prepare("SELECT COUNT(*) AS n FROM person WHERE id = ?").get(p)).toEqual({ n: 0 });
+    expect(count("interaction", p)).toBe(0);
+    expect(count("alias", p)).toBe(0);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM draft").get() as { n: number }).n).toBe(0);
+    // commitment row survives, person ref nulled
+    const c = db.prepare("SELECT person_id, description FROM commitment").all();
+    expect(c).toEqual([{ person_id: null, description: "send the deck" }]);
+    // bystander untouched
+    expect(count("interaction", other)).toBe(1);
+    expect(listInbox(db).map((i) => i.person_name)).toEqual(["Bystander"]);
+  });
+
+  it("reports deleted: false for an unknown id", async () => {
+    const res = await del(99999);
+    expect(res).toEqual({ ok: true, data: { deleted: false } });
   });
 });
 

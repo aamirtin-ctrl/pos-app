@@ -27,6 +27,8 @@ export interface ThreadMessage {
   subject: string | null;
   body_summary: string | null;
   occurred_at: string | null;
+  /** Display name of the interaction's person (the sender for inbound rows). */
+  sender_name: string | null;
 }
 
 export interface InboxItem {
@@ -38,6 +40,13 @@ export interface InboxItem {
   body_summary: string | null;
   occurred_at: string | null;
   external_id: string | null;
+  /** Chat guid for group conversations; null for 1:1. */
+  thread_external_id: string | null;
+  /** Conversation key: `chat:<thread_external_id>` for groups, else `person:<person_id>`. */
+  thread_key: string;
+  is_group: 0 | 1;
+  /** Group display name (most recent non-null subject in the thread); null for 1:1. */
+  group_name: string | null;
   /** 1 when a 'suggested' draft exists for this inbound message. */
   has_draft: 0 | 1;
   draft_id: number | null;
@@ -46,23 +55,31 @@ export interface InboxItem {
   answered: 0 | 1;
   /** has_draft OR not answered — these sort first. */
   unanswered: 0 | 1;
-  /** The person's recent messages, both directions, oldest → newest. */
+  /** The conversation's recent messages, both directions, oldest → newest. */
   thread: ThreadMessage[];
 }
 
 const THREAD_LIMIT = 12;
 
+type InboxRow = Omit<
+  InboxItem,
+  "unanswered" | "thread" | "thread_key" | "is_group" | "group_name"
+>;
+
 /**
- * Recent INBOUND interactions joined to person, with a has_draft flag (+ the
- * suggested draft body) and an answered flag. Unanswered (has_draft or no later
- * outbound) sort first, then newest first. The renderer groups by person.
+ * Recent INBOUND interactions joined to person, collapsed to ONE row per
+ * conversation. A conversation is a group chat (`chat:<thread_external_id>`)
+ * or a 1:1 (`person:<person_id>`); the newest inbound message represents it.
+ * Group rows carry is_group=1 + group_name (latest non-null subject in the
+ * thread, fallback "Group chat") and thread by chat guid; 1:1 rows thread by
+ * person. Unanswered (has_draft or no later outbound) sort first, then newest.
  */
 export function listInbox(db: Db, opts: { limit?: number } = {}): InboxItem[] {
   const limit = opts.limit ?? 50;
   const rows = db
     .prepare(
       `SELECT i.id, i.person_id, p.display_name AS person_name, i.channel, i.subject,
-              i.body_summary, i.occurred_at, i.external_id,
+              i.body_summary, i.occurred_at, i.external_id, i.thread_external_id,
               d.id AS draft_id, d.body AS draft_body,
               CASE WHEN d.id IS NOT NULL THEN 1 ELSE 0 END AS has_draft,
               EXISTS(
@@ -82,21 +99,73 @@ export function listInbox(db: Db, opts: { limit?: number } = {}): InboxItem[] {
                 i.occurred_at DESC
        LIMIT ?`
     )
-    .all(limit) as Omit<InboxItem, "unanswered" | "thread">[];
+    .all(limit) as InboxRow[];
 
-  const threadStmt = db.prepare(
-    `SELECT id, channel, direction, subject, body_summary, occurred_at
-     FROM interaction WHERE person_id = ?
-     ORDER BY occurred_at DESC LIMIT ${THREAD_LIMIT}`
-  );
-  const threads = new Map<number, ThreadMessage[]>();
-  return rows.map((r) => {
-    let thread = threads.get(r.person_id);
-    if (!thread) {
-      thread = (threadStmt.all(r.person_id) as ThreadMessage[]).reverse(); // oldest → newest
-      threads.set(r.person_id, thread);
+  // Collapse to one representative row (the newest inbound) per conversation key.
+  // If an older inbound carries the suggested draft, the draft rides along so the
+  // compose box still prefills.
+  const byKey = new Map<string, InboxRow>();
+  for (const r of rows) {
+    const key = r.thread_external_id ? `chat:${r.thread_external_id}` : `person:${r.person_id}`;
+    const prev = byKey.get(key);
+    if (!prev) {
+      byKey.set(key, r);
+    } else {
+      const [newer, older] = (r.occurred_at ?? "") > (prev.occurred_at ?? "") ? [r, prev] : [prev, r];
+      if (!newer.has_draft && older.has_draft) {
+        byKey.set(key, { ...newer, has_draft: 1, draft_id: older.draft_id, draft_body: older.draft_body });
+      } else {
+        byKey.set(key, newer);
+      }
     }
-    return { ...r, unanswered: r.has_draft || !r.answered ? 1 : 0, thread };
+  }
+
+  const groupNameStmt = db.prepare(
+    `SELECT subject FROM interaction
+     WHERE thread_external_id = ? AND subject IS NOT NULL AND subject != ''
+     ORDER BY occurred_at DESC LIMIT 1`
+  );
+  // Group threads select by chat guid (NOT person) — every member's messages, each
+  // joined to its own person for sender_name. 1:1 threads keep the person query.
+  const chatThreadStmt = db.prepare(
+    `SELECT i.id, i.channel, i.direction, i.subject, i.body_summary, i.occurred_at,
+            p.display_name AS sender_name
+     FROM interaction i JOIN person p ON p.id = i.person_id
+     WHERE i.thread_external_id = ?
+     ORDER BY i.occurred_at DESC LIMIT ${THREAD_LIMIT}`
+  );
+  const personThreadStmt = db.prepare(
+    `SELECT i.id, i.channel, i.direction, i.subject, i.body_summary, i.occurred_at,
+            p.display_name AS sender_name
+     FROM interaction i JOIN person p ON p.id = i.person_id
+     WHERE i.person_id = ? AND i.thread_external_id IS NULL
+     ORDER BY i.occurred_at DESC LIMIT ${THREAD_LIMIT}`
+  );
+
+  const items: InboxItem[] = [];
+  for (const [key, r] of byKey) {
+    const isGroup = r.thread_external_id != null;
+    const thread = (
+      isGroup
+        ? (chatThreadStmt.all(r.thread_external_id) as ThreadMessage[])
+        : (personThreadStmt.all(r.person_id) as ThreadMessage[])
+    ).reverse(); // oldest → newest
+    const groupName = isGroup
+      ? ((groupNameStmt.get(r.thread_external_id) as { subject: string } | undefined)?.subject ??
+        "Group chat")
+      : null;
+    items.push({
+      ...r,
+      thread_key: key,
+      is_group: isGroup ? 1 : 0,
+      group_name: groupName,
+      unanswered: r.has_draft || !r.answered ? 1 : 0,
+      thread,
+    });
+  }
+  return items.sort((a, b) => {
+    if (a.unanswered !== b.unanswered) return b.unanswered - a.unanswered;
+    return (b.occurred_at ?? "").localeCompare(a.occurred_at ?? "");
   });
 }
 
@@ -248,6 +317,14 @@ export function iMessageScript(handle: string, body: string): string {
   );
 }
 
+/** The exact osascript program sendIMessageToChat runs (exported for tests). */
+export function iMessageChatScript(chatGuid: string, body: string): string {
+  return (
+    `tell application "Messages" to send "${escapeAppleScript(body)}" ` +
+    `to chat id "${escapeAppleScript(chatGuid)}"`
+  );
+}
+
 function runOsascript(script: string): Promise<void> {
   return new Promise((resolve, reject) => {
     execFile("/usr/bin/osascript", ["-e", script], { timeout: 15_000 }, (err, _out, stderr) => {
@@ -288,5 +365,41 @@ export async function sendIMessage(
     externalId: `sent:${Date.now()}`,
   });
   markLatestDraftSent(db, args.personId);
+  return { sent: true, channel: "imessage" };
+}
+
+export interface SendIMessageChatArgs {
+  /** Messages chat guid — the conversation's thread_external_id. */
+  chatGuid: string;
+  body: string;
+  /**
+   * Person to attribute the outbound row to. The caller (renderer) passes the
+   * person_id of the thread's most recent sender, so the sent message lands in
+   * the same conversation the user replied from.
+   */
+  personId: number;
+}
+
+/**
+ * Send an iMessage to a GROUP chat by its chat guid via Messages.app.
+ * USER-INITIATED ONLY — called from an explicit Send click, never automatic.
+ * On success records an outbound interaction attributed to args.personId with
+ * thread_external_id = chatGuid so the group thread stays whole.
+ */
+export async function sendIMessageToChat(
+  db: Db,
+  args: SendIMessageChatArgs
+): Promise<{ sent: true; channel: "imessage" }> {
+  if (!args.chatGuid?.trim()) throw new Error("no_recipient");
+  await runOsascript(iMessageChatScript(args.chatGuid.trim(), args.body));
+  insertInteraction(db, {
+    personId: args.personId,
+    channel: "imessage",
+    direction: "outbound",
+    occurredAt: new Date().toISOString(),
+    bodySummary: snippet(args.body),
+    externalId: `sent:${Date.now()}`,
+    threadExternalId: args.chatGuid.trim(),
+  });
   return { sent: true, channel: "imessage" };
 }

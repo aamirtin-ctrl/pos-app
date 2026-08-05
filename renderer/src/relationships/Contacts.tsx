@@ -2,8 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { GroupChips } from "./Home.tsx";
 
 // Contacts list: debounced search over name/org/role, group chips (migrated CRM
-// groups; click to filter, "All" resets), freshness dot (opacity decays with days
-// since last contact), multi-select → merge duplicates.
+// groups; click to filter, "All" resets — plus an "Unverified" chip filtering by
+// the 'unverified' tag connectors put on auto-created unknown senders), freshness
+// dot (opacity decays with days since last contact), multi-select → merge
+// duplicates. Unverified rows get a hover ✕ quick-delete (person + history).
 
 type PersonListItem = {
   id: number;
@@ -29,6 +31,10 @@ function freshnessOpacity(days: number | null): number {
 
 type GroupRow = { id: number; name: string; hidden: number; members: number };
 
+// Pseudo-group chip backed by the 'unverified' person_tag (client-side filter).
+const UNVERIFIED_CHIP = "Unverified";
+const isUnverified = (p: PersonListItem) => (p.tags ?? []).includes("unverified");
+
 export default function Contacts() {
   const [q, setQ] = useState("");
   const [people, setPeople] = useState<PersonListItem[]>([]);
@@ -38,6 +44,8 @@ export default function Contacts() {
   const [error, setError] = useState<string | null>(null);
   const [groups, setGroups] = useState<GroupRow[]>([]);
   const [groupFilter, setGroupFilter] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<number | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const debounce = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refetch = useCallback(async (query: string) => {
@@ -53,8 +61,15 @@ export default function Contacts() {
     });
   }, []);
 
-  // people.list already returns each person's groups — filter client-side
-  const shown = groupFilter ? people.filter((p) => (p.groups ?? []).includes(groupFilter)) : people;
+  // people.list already returns each person's groups + tags — filter client-side
+  const shown =
+    groupFilter === UNVERIFIED_CHIP
+      ? people.filter(isUnverified)
+      : groupFilter
+      ? people.filter((p) => (p.groups ?? []).includes(groupFilter))
+      : people;
+  const hasUnverified = people.some(isUnverified);
+  const chipNames = [...groups.map((g) => g.name), ...(hasUnverified ? [UNVERIFIED_CHIP] : [])];
 
   const onSearch = (value: string) => {
     setQ(value);
@@ -81,6 +96,24 @@ export default function Contacts() {
     setMerging(false);
   };
 
+  // Quick-delete for unverified rows: person + interactions/aliases cascade away;
+  // commitments survive with person_id nulled (see main/crm/people.ts deletePerson).
+  const quickDelete = async (id: number) => {
+    if (deleting) return;
+    setDeleting(true);
+    setError(null);
+    const r = await window.pos.people.delete(id);
+    if (!r.ok) setError(r.error ?? "delete failed");
+    setConfirmDelete(null);
+    setSelected((s) => {
+      const next = new Set(s);
+      next.delete(id);
+      return next;
+    });
+    await refetch(q);
+    setDeleting(false);
+  };
+
   return (
     <div className="p-6 max-w-3xl mx-auto relative min-h-full">
       <div className="drag-region h-4" />
@@ -97,7 +130,7 @@ export default function Contacts() {
         style={{ borderColor: "var(--line)" }}
       />
 
-      <GroupChips groups={groups.map((g) => g.name)} active={groupFilter} onPick={setGroupFilter} />
+      <GroupChips groups={chipNames} active={groupFilter} onPick={setGroupFilter} />
 
       {loaded && shown.length === 0 ? (
         <p className="text-sm py-6 text-center" style={{ color: "var(--muted)" }}>
@@ -110,7 +143,7 @@ export default function Contacts() {
           {shown.map((p) => (
             <div
               key={p.id}
-              className="flex items-center gap-3 px-3 py-2 hover:bg-black/[0.02] transition-colors duration-[120ms]"
+              className="group flex items-center gap-3 px-3 py-2 hover:bg-black/[0.02] transition-colors duration-[120ms]"
               style={{ borderColor: "var(--line)" }}
             >
               <input
@@ -143,6 +176,39 @@ export default function Contacts() {
                   ))}
                 </span>
               </a>
+              {isUnverified(p) &&
+                (confirmDelete === p.id ? (
+                  <span className="flex items-center gap-1.5 shrink-0">
+                    <span className="text-[11px]" style={{ color: "var(--danger)" }}>
+                      Remove contact and history?
+                    </span>
+                    <button
+                      onClick={() => quickDelete(p.id)}
+                      disabled={deleting}
+                      className="text-[11px] px-1.5 py-0.5 rounded border disabled:opacity-50"
+                      style={{ borderColor: "var(--danger)", color: "var(--danger)" }}
+                    >
+                      {deleting ? "Removing…" : "Remove"}
+                    </button>
+                    <button
+                      onClick={() => setConfirmDelete(null)}
+                      className="text-[11px] px-1.5 py-0.5 rounded border"
+                      style={{ borderColor: "var(--line)", color: "var(--muted)" }}
+                    >
+                      Cancel
+                    </button>
+                  </span>
+                ) : (
+                  <button
+                    onClick={() => setConfirmDelete(p.id)}
+                    title="Remove contact"
+                    aria-label="Remove contact"
+                    className="opacity-0 group-hover:opacity-100 transition-opacity duration-[120ms] text-xs leading-none px-1 py-0.5 rounded hover:bg-black/[0.06] shrink-0"
+                    style={{ color: "var(--muted)" }}
+                  >
+                    ✕
+                  </button>
+                ))}
             </div>
           ))}
         </div>
