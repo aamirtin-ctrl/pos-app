@@ -142,12 +142,12 @@ describe("splitBio / composeBio", () => {
 });
 
 describe("isContent", () => {
-  it("drops tapbacks, filler, automated mail, and duplicates", () => {
+  it("drops tapbacks, filler, automated mail, punctuation-only text, and duplicates", () => {
     const seen = new Set<string>();
     expect(isContent("Loved “see you then”", seen)).toBe(false);
     expect(isContent("ok", seen)).toBe(false);
     expect(isContent("Your verification code is 123456", seen)).toBe(false);
-    expect(isContent("👍👍👍👍👍👍👍👍👍👍👍👍", seen)).toBe(false);
+    expect(isContent("!!!!!!! ?????? ...", seen)).toBe(false); // no letters at all
     expect(isContent("Closed the seed round yesterday", seen)).toBe(true);
     expect(isContent("Closed the seed round yesterday", seen)).toBe(false); // duplicate
   });

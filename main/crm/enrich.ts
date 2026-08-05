@@ -58,8 +58,8 @@ const AUTOMATED_RE =
 const FILLER = new Set([
   "ok", "okay", "k", "kk", "lol", "lmao", "lmaoo", "haha", "hahaha", "ya", "yah", "yeah", "yes",
   "yep", "no", "nope", "nah", "bet", "word", "fr", "frfr", "np", "ty", "thanks", "thx", "ok!",
-  "sounds good", "sg", "got it", "cool", "nice", "true", "facts", "same", "ok thanks", "👍", "🙏",
-]);
+  "sounds good", "sg", "got it", "cool", "nice", "true", "facts", "same", "ok thanks",
+]); // emoji-only messages are caught by the "must contain a letter" test below
 
 /** Keep only content-bearing, non-duplicate messages worth spending a call on. */
 export function isContent(snippet: string | null, seen: Set<string>): boolean {
