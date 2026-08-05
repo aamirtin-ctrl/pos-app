@@ -28,6 +28,13 @@
 //   4. Deterministic-fallback rows are capped at confidence 0.5 (they are raw message
 //      fragments, not rewrites), so they can never clear the autonomy threshold in
 //      workers.autoTentativeTasks — they land in the review queue instead.
+//   5. Thread-resolution awareness (owner spec 2026-08-05 #3): something resolved IN
+//      the message chain must not live on as an open commitment. The prompt closes
+//      ask→fulfilled/cancelled pairs at extraction time, and threadResolves() — a
+//      conservative keyword check over LATER messages in the same person's thread —
+//      deterministically reinforces it on BOTH the LLM and fallback paths. The
+//      post-hoc layer (workers.resolveFromThreads) closes already-open commitments
+//      when NEW messages resolve them.
 
 import type { Db } from "../db/db.ts";
 import { extractJson, type LlmClient } from "../llm/provider.ts";
@@ -173,6 +180,58 @@ export function isExpiredSameDay(text: string, sentDate: Date, now: Date = new D
   return deadline < now.getTime();
 }
 
+// ── thread-resolution awareness ──────────────────────────────────────────────
+
+// A later message that asks for something NEW is a continuation of the thread, never
+// a resolution ("sent it! also can you review the memo?" keeps the thread open).
+const RESOLUTION_NEW_ASK =
+  /\?|\b(?:can|could|would|will)\s+you\b|\bplease\b|\bdon'?t\s+forget\b|\bone\s+more\s+thing\b|\balso\s+(?:need|send|bring|grab|get|do)\b/i;
+
+// Cancellations: either side withdraws the obligation ("nvm", "don't worry about it").
+const RESOLUTION_CANCEL =
+  /\b(?:nvm|never\s*mind|don'?t\s+worry\s+about\s+it|all\s+set|figured\s+it\s+out|no\s+longer\s+need(?:ed)?|not\s+needed\s+anymore|forget\s+(?:about\s+)?it|took\s+care\s+of\s+it)\b/i;
+
+// Fulfillment reports: the thing was done and handed over ("sent it", "here you go",
+// "got them", a bare "done" message). Deliberately narrow — "got it" alone is an
+// acknowledgment ("understood"), not a completion, so it is NOT here.
+const RESOLUTION_FULFILL =
+  /\b(?:just\s+)?(?:sent|emailed|forwarded|shared|uploaded|delivered|attached|dropped\s+off)\s+(?:it|that|them|those|these|one|over|everything|the\s+\S+)\b|\bjust\s+sent\b|\bhere\s+(?:you\s+go|it\s+is|they\s+are)\b|\bjust\s+did\s*(?:it|that)?\b|\bgot\s+(?:them|those|it\s+done)\b|\b(?:it'?s|that'?s|all|everything'?s)\s+(?:done|sorted|handled|taken\s+care\s+of)\b|^(?:ok(?:ay)?[,!.\s]+)?(?:all\s+)?done[.!\s]*$/i;
+
+// "done"-adjacent phrasing that is NOT a completion report ("not done yet",
+// "when you're done", "almost done", "getting it done").
+const RESOLUTION_NOT_DONE =
+  /\b(?:not|isn'?t|aren'?t|almost|nearly|barely|when|once|until|till|before|after|get|getting)\b[^.!?]{0,24}\bdone\b/i;
+
+// Promising to do it later is not doing it ("got it, will send tomorrow").
+const RESOLUTION_FUTURE =
+  /\b(?:will|i'?ll|we'?ll|gonna|going\s+to|about\s+to|planning\s+to|tomorrow|tonight|later|soon|in\s+a\s+bit|this\s+(?:afternoon|evening|week|weekend))\b/i;
+
+/**
+ * Conservative deterministic check: do these LATER messages (from either side of the
+ * thread) resolve the obligation? True only when some later message carries a
+ * cancellation ("nvm", "never mind", "don't worry about it", "all set", "figured it
+ * out") or a fulfillment report ("sent it", "here you go", "got them", "just did",
+ * a bare "done") AND that message references no new ask (no question, no "can you…",
+ * no "also need…") — a message asking for something new keeps the thread open.
+ * Promises ("will send tonight") and negated/deferred "done"s never count.
+ *
+ * `commitmentText` is required non-empty (there must be something to resolve) but the
+ * match itself is message-driven: callers scope the later messages to the thread the
+ * commitment came from, which is the disambiguation this check relies on.
+ */
+export function threadResolves(commitmentText: string, laterMessages: string[]): boolean {
+  if (!(commitmentText ?? "").trim() || !Array.isArray(laterMessages)) return false;
+  for (const raw of laterMessages) {
+    const m = (raw ?? "").replace(/\s+/g, " ").trim();
+    if (!m) continue;
+    if (RESOLUTION_NEW_ASK.test(m)) continue; // a new ask keeps the thread open
+    if (RESOLUTION_CANCEL.test(m)) return true;
+    if (RESOLUTION_FUTURE.test(m)) continue; // a promise, not a report
+    if (RESOLUTION_FULFILL.test(m) && !RESOLUTION_NOT_DONE.test(m)) return true;
+  }
+  return false;
+}
+
 export type CommitmentDirection = "i_owe_them" | "they_owe_me";
 
 export interface CommitmentRow {
@@ -285,6 +344,15 @@ NEVER commitments — extract nothing for these:
 - Old logistics fragments about a moment already past ("I wanna be back here at 5:30 latest").
 - Other people's plans or chatter that create no obligation involving the user.
 
+THREAD RESOLUTION — something resolved IN the message chain is CLOSED; extract nothing:
+- If a LATER message in the same thread — from EITHER side — shows the obligation was fulfilled ("sent it", "done", "got them", "just did", "here you go", an attachment delivering the thing), it is closed. Output nothing for it.
+- If a later message cancels it ("nvm", "don't worry about it", "never mind", "all set", "figured it out"), it is closed. Output nothing for it.
+- Only a message that ASKS for something new reopens the thread — treat that new ask on its own merits.
+
+RESOLVED-IN-THREAD EXAMPLES — ask→fulfilled pairs like these produce NOTHING:
+- Sarah: "can you send me the pitch deck?" — user: "yep will do" — user, later in the thread: "sent it!" → fulfilled within the thread; not a commitment; output nothing.
+- User: "could you grab the game tickets?" — Omar, later in the thread: "got them, here you go" → fulfilled within the thread; not a commitment; output nothing.
+
 RESOLVE REFERENCES — use THREAD CONTEXT below:
 - Each contact's recent messages (newest first, direction-labeled) are given. Use them to resolve "my list", "that place", "the doc" into what the thread is actually about.
 - Example: "add a boot tray to my list" in a thread about Stanford dorm packing → "Add boot tray to the Stanford dorm packing list".
@@ -375,6 +443,19 @@ export async function extractCommitmentsLlm(
     `SELECT direction, occurred_at, subject, body_summary FROM interaction
      WHERE person_id = ? ORDER BY occurred_at DESC LIMIT ${CONTEXT_INTERACTIONS}`
   );
+  // Thread-resolution reinforcement: messages in the same person's thread AFTER the
+  // source message — if any of them fulfills/cancels the obligation (threadResolves),
+  // the candidate is dropped on both paths.
+  const laterStmt = db.prepare(
+    `SELECT subject, body_summary FROM interaction
+     WHERE person_id = ? AND occurred_at > ? ORDER BY occurred_at ASC LIMIT 12`
+  );
+  const laterTexts = (personId: number | null, occurredAt: string | null): string[] =>
+    personId == null || !occurredAt
+      ? []
+      : (laterStmt.all(personId, occurredAt) as { subject: string | null; body_summary: string | null }[])
+          .map((r) => [r.subject, r.body_summary].filter(Boolean).join(" — "))
+          .filter((t) => t.length > 0);
   let inserted = 0;
   let needsReview = 0;
 
@@ -411,6 +492,10 @@ export async function extractCommitmentsLlm(
               const confidence = Number.isFinite(confRaw) ? Math.min(1, Math.max(0, confRaw)) : 0.5;
               if (!src || !description) continue;
               if (!passesCommitmentGate(description)) continue; // questions/quotes/FYIs never land
+              // Thread-resolution reinforcement: a later message in the same thread
+              // that fulfills ("sent it") or cancels ("nvm") the obligation means it
+              // is CLOSED — never inserted, regardless of what the model said.
+              if (threadResolves(description, laterTexts(src.person_id, src.occurred_at))) continue;
               // Deterministic cross-check (crm/when.ts): the model gave no due date, but
               // the message itself states one, anchored to its SENT date. Only a date
               // still in the future is attached — a stale "next Friday" from months ago
@@ -453,6 +538,9 @@ export async function extractCommitmentsLlm(
         ]);
         for (const p of proposals) {
           if (!passesCommitmentGate(p.description)) continue; // same gate as the LLM path
+          // Thread-resolution reinforcement, same as the LLM path: an obligation a
+          // later message already fulfilled or cancelled never reaches the queue.
+          if (threadResolves(p.description, laterTexts(r.person_id, r.occurred_at))) continue;
           // Same-day backstop, same as the LLM path: an expired "at 5:30"/"tonight"
           // fragment never reaches the review queue. (A text with an explicit
           // other-day date makes isExpiredSameDay return false, so dated proposals

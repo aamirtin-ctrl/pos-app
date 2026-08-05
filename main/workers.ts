@@ -1,15 +1,22 @@
 // Sync orchestration. runSync wraps one connector run in a sync_run row (started/finished/
 // records/error — errors are recorded, NEVER propagated), then runs the post-ingest hook:
-// commitment extraction over the newest unprocessed interactions (LLM optional), forward-only
-// last-contact advancement from outbound interactions, and the reconnect-cadence refresh.
+// commitment extraction over the newest unprocessed interactions (LLM optional), the
+// thread-resolution pass (resolveFromThreads — new messages that fulfill/cancel open
+// commitments close them and their tasks), forward-only last-contact advancement from
+// outbound interactions, and the reconnect-cadence refresh.
 // startWorkers schedules gmail + linkedin-email + imessage every 15 minutes while the app is open, guarded by
 // a running flag so runs never overlap; sources with missing creds/FDA are skipped silently.
 
 import { createRequire } from "node:module";
 import type { Db } from "./db/db.ts";
 import type { SecretStore } from "./secrets.ts";
-import type { LlmClient } from "./llm/provider.ts";
-import { extractCommitmentsLlm, passesCommitmentGate, isExpiredSameDay } from "./crm/commitments.ts";
+import { extractJson, type LlmClient } from "./llm/provider.ts";
+import {
+  extractCommitmentsLlm,
+  passesCommitmentGate,
+  isExpiredSameDay,
+  threadResolves,
+} from "./crm/commitments.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { commitmentToTask, closeGoogleTask, readAnchors } from "./gcal/sync.ts";
 import { eventsForDate as icsEventsForDate } from "./icscal.ts";
@@ -143,20 +150,28 @@ export async function runSync(
   // Post-ingest hook — best-effort, never fails the sync.
   if (!report.error && report.ingested > 0) {
     try {
-      if (llm) {
-        const ids = (
-          db
-            .prepare(
-              "SELECT id FROM interaction WHERE extracted_at IS NULL ORDER BY id DESC LIMIT ?"
-            )
-            .all(EXTRACT_CAP) as { id: number }[]
-        ).map((r) => r.id);
-        if (ids.length) {
-          const beforeMax = (
-            db.prepare("SELECT COALESCE(MAX(id), 0) AS m FROM commitment").get() as { m: number }
-          ).m;
-          await extractCommitmentsLlm(db, llm, ids);
-          await autoTentativeTasks(db, secrets, beforeMax);
+      const ids = (
+        db
+          .prepare(
+            "SELECT id FROM interaction WHERE extracted_at IS NULL ORDER BY id DESC LIMIT ?"
+          )
+          .all(EXTRACT_CAP) as { id: number }[]
+      ).map((r) => r.id);
+      if (llm && ids.length) {
+        const beforeMax = (
+          db.prepare("SELECT COALESCE(MAX(id), 0) AS m FROM commitment").get() as { m: number }
+        ).m;
+        await extractCommitmentsLlm(db, llm, ids);
+        await autoTentativeTasks(db, secrets, beforeMax);
+      }
+      // Thread-resolution pass AFTER extraction: new messages that fulfill or cancel
+      // an already-open commitment close it (and its task). Counts land on the report.
+      if (ids.length) {
+        const rr = await resolveFromThreads(db, secrets, llm, ids);
+        if (rr.resolved > 0) {
+          const r = report as SyncReport & { threadResolved?: number; threadTasksClosed?: number };
+          r.threadResolved = rr.resolved;
+          r.threadTasksClosed = rr.tasksClosed;
         }
       }
       advanceLastContact(db);
@@ -167,6 +182,171 @@ export async function runSync(
   }
 
   return report;
+}
+
+// ── thread-resolution pass (post-hoc layer) ──────────────────────────────────
+
+export interface ThreadResolutionResult {
+  /** Commitments moved to status 'done' because new messages resolved them. */
+  resolved: number;
+  /** Open linked tasks closed alongside (local 'done' + best-effort Google complete). */
+  tasksClosed: number;
+  /** People whose open commitments were checked (people with none cost nothing). */
+  peopleChecked: number;
+}
+
+interface ResolutionMsg {
+  direction: string | null;
+  occurred_at: string | null;
+  subject: string | null;
+  body_summary: string | null;
+}
+
+function buildResolutionPrompt(
+  name: string | null,
+  open: { id: number; description: string; due_at: string | null }[],
+  msgs: ResolutionMsg[]
+): string {
+  const clip = (s: string | null | undefined, n: number) =>
+    (s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+  const commitments = open.map(
+    (c) => `- id ${c.id}: ${clip(c.description, 160)}${c.due_at ? ` (due ${c.due_at.slice(0, 10)})` : ""}`
+  );
+  const lines = msgs.map(
+    (m) =>
+      `[${m.direction ?? "?"} ${clip(m.occurred_at, 16)}] ${clip([m.subject, m.body_summary].filter(Boolean).join(" — "), 200)}`
+  );
+  return `These commitments between the user and ${name ?? "a contact"} are currently OPEN. New messages just arrived in their conversation. Decide which commitments these NEW messages CLEARLY show as already fulfilled or cancelled.
+
+OPEN COMMITMENTS:
+${commitments.join("\n")}
+
+NEW MESSAGES (direction-labeled, oldest first):
+${lines.join("\n")}
+
+Rules:
+- "resolved" means a NEW message shows the obligation was FULFILLED ("sent it", "done", "got them", "here you go", an attachment delivering the thing) or explicitly CANCELLED ("nvm", "never mind", "don't worry about it", "all set", "figured it out").
+- The message that CREATED an obligation does not resolve it. A promise to do it later ("will send tonight") does not resolve it. A new ask does not resolve anything.
+- Only include ids CLEARLY fulfilled or cancelled by these messages. When unsure, OMIT the id — an empty array is a good and common answer.
+
+Return STRICT JSON ONLY — no prose, no markdown fences — an array (possibly empty):
+[{ "id": <commitment id from the list>, "resolved": true, "reason": "<short phrase citing the message>" }]`;
+}
+
+/**
+ * Post-hoc thread-resolution layer (owner spec 2026-08-05 #3): when something is
+ * resolved IN the message chain, it must not live on as an open task/commitment.
+ * For each person with NEW messages this sync, load their OPEN commitments (status
+ * open/scheduled); people with none are skipped before any LLM call (zero cost).
+ * With an LLM: one fast-tier strict-JSON call per person — only ids CLEARLY
+ * fulfilled/cancelled by the new messages come back; unsure ids are omitted.
+ * Without an LLM (or on call failure): deterministic threadResolves only, and only
+ * when the person has exactly ONE open commitment — a keyword match can't tell WHICH
+ * of several "sent it" refers to, so ambiguity resolves nothing (conservative).
+ *
+ * Each resolved commitment: status 'done' + resolved_at; any open linked task goes
+ * status 'done' + completed_at with a best-effort, time-boxed closeGoogleTask.
+ * Automatic action → NO undo entries, but every resolution logs a console line.
+ */
+export async function resolveFromThreads(
+  db: Db,
+  secrets: SecretStore,
+  llm: LlmClient | null,
+  newInteractionIds: number[]
+): Promise<ThreadResolutionResult> {
+  const out: ThreadResolutionResult = { resolved: 0, tasksClosed: 0, peopleChecked: 0 };
+  if (newInteractionIds.length === 0) return out;
+
+  const msgs = db
+    .prepare(
+      `SELECT id, person_id, direction, occurred_at, subject, body_summary
+       FROM interaction
+       WHERE person_id IS NOT NULL AND id IN (${newInteractionIds.map(() => "?").join(",")})
+       ORDER BY occurred_at ASC`
+    )
+    .all(...newInteractionIds) as (ResolutionMsg & { id: number; person_id: number })[];
+  const byPerson = new Map<number, ResolutionMsg[]>();
+  for (const m of msgs) {
+    const list = byPerson.get(m.person_id) ?? [];
+    list.push(m);
+    byPerson.set(m.person_id, list);
+  }
+
+  const openStmt = db.prepare(
+    "SELECT id, description, due_at FROM commitment WHERE person_id = ? AND status IN ('open','scheduled')"
+  );
+  const nameStmt = db.prepare("SELECT display_name FROM person WHERE id = ?");
+  const markDone = db.prepare(
+    "UPDATE commitment SET status = 'done', resolved_at = datetime('now') WHERE id = ?"
+  );
+  const openTasks = db.prepare(
+    "SELECT id, gtasks_id FROM task WHERE commitment_id = ? AND status IN ('inbox','planned','in_progress')"
+  );
+  const closeTask = db.prepare(
+    "UPDATE task SET status = 'done', completed_at = datetime('now') WHERE id = ?"
+  );
+
+  for (const [personId, personMsgs] of byPerson) {
+    const open = openStmt.all(personId) as { id: number; description: string; due_at: string | null }[];
+    if (open.length === 0) continue; // nothing to resolve — zero LLM cost
+
+    out.peopleChecked++;
+    const resolutions: { id: number; reason: string }[] = [];
+    let usedLlm = false;
+    if (llm) {
+      const name = (nameStmt.get(personId) as { display_name: string | null } | undefined)?.display_name ?? null;
+      const res = await llm.call("thread-resolution", "fast", buildResolutionPrompt(name, open, personMsgs), {
+        json: true,
+      });
+      if (res) {
+        usedLlm = true;
+        try {
+          const parsed = extractJson(res.text);
+          if (Array.isArray(parsed)) {
+            const openIds = new Set(open.map((c) => c.id));
+            for (const item of parsed) {
+              if (!item || typeof item !== "object") continue;
+              const o = item as Record<string, unknown>;
+              const id = Number(o.id);
+              // Only ids from the open list, explicitly resolved: true. Anything else
+              // (unknown ids, resolved: false, unsure omissions) leaves rows untouched.
+              if (o.resolved !== true || !openIds.has(id)) continue;
+              resolutions.push({
+                id,
+                reason: typeof o.reason === "string" && o.reason ? o.reason : "resolved by new messages",
+              });
+            }
+          }
+        } catch (e) {
+          console.warn(`workers: thread-resolution bad LLM JSON for person ${personId} (${(e as Error).message})`);
+        }
+      }
+    }
+    if (!usedLlm && open.length === 1) {
+      // Deterministic path (no LLM / call failed): conservative — only an unambiguous
+      // single open commitment can be closed by a keyword match.
+      const texts = personMsgs
+        .map((m) => [m.subject, m.body_summary].filter(Boolean).join(" — "))
+        .filter((t) => t.length > 0);
+      if (threadResolves(open[0].description, texts)) {
+        resolutions.push({ id: open[0].id, reason: "deterministic thread-resolution match" });
+      }
+    }
+
+    for (const r of resolutions) {
+      markDone.run(r.id);
+      out.resolved++;
+      const desc = open.find((c) => c.id === r.id)?.description ?? "";
+      console.log(`workers: thread-resolution closed commitment ${r.id} ("${desc}") — ${r.reason}`);
+      for (const t of openTasks.all(r.id) as { id: number; gtasks_id: string | null }[]) {
+        closeTask.run(t.id);
+        out.tasksClosed++;
+        if (t.gtasks_id) await closeGoogleTask(db, secrets, t.gtasks_id); // best-effort, time-boxed
+      }
+    }
+  }
+
+  return out;
 }
 
 /** Autonomy threshold: only commitments at or above this confidence auto-convert. */

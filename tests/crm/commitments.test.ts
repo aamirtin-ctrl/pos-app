@@ -248,6 +248,68 @@ describe("extractCommitmentsLlm (fake LLM → context + dates)", () => {
   });
 });
 
+// ── thread-resolution awareness at extraction time ───────────────────────────
+
+describe("extractCommitmentsLlm (thread resolution — resolved in the chain never inserts)", () => {
+  const laterThanYesterday = new Date(Date.now() - 82_800_000).toISOString(); // yesterday + 1h
+
+  it("LLM path: a later 'sent it!' in the thread drops the candidate; prompt carries the rules", async () => {
+    const ask = addInteraction(null, "can you send me the pitch deck?", yesterday);
+    addInteraction(null, "sent it!", laterThanYesterday); // the fulfillment, later in the same thread
+
+    let seenPrompt = "";
+    const llm = fakeLlm((prompt) => {
+      seenPrompt = prompt;
+      // The model (wrongly) still emits the obligation — the deterministic
+      // reinforcement must drop it because a later message fulfilled it.
+      return [
+        {
+          interaction_id: ask,
+          description: "Send Cory the pitch deck",
+          direction: "i_owe_them",
+          due_at: null,
+          confidence: 0.9,
+        },
+      ];
+    });
+    const res = await extractCommitmentsLlm(db, llm, [ask]);
+    expect(res.inserted).toBe(0);
+    expect(listCommitments(db)).toHaveLength(0);
+
+    // The prompt itself teaches thread resolution, with ask→fulfilled few-shot pairs.
+    expect(seenPrompt).toContain("THREAD RESOLUTION");
+    expect(seenPrompt).toContain("RESOLVED-IN-THREAD EXAMPLES");
+    expect(seenPrompt).toContain('"sent it!"');
+    expect(seenPrompt).toContain('"nvm"');
+  });
+
+  it("LLM path: unrelated later chatter does NOT drop the candidate", async () => {
+    const ask = addInteraction(null, "can you send me the pitch deck?", yesterday);
+    addInteraction(null, "lol see you at the game", laterThanYesterday);
+    const llm = fakeLlm(() => [
+      {
+        interaction_id: ask,
+        description: "Send Cory the pitch deck",
+        direction: "i_owe_them",
+        due_at: null,
+        confidence: 0.9,
+      },
+    ]);
+    const res = await extractCommitmentsLlm(db, llm, [ask]);
+    expect(res.inserted).toBe(1);
+    expect(listCommitments(db, "open")[0].description).toBe("Send Cory the pitch deck");
+  });
+
+  it("fallback path (llm = null): a later cancellation ('nvm') drops the proposal", async () => {
+    const ask = addInteraction(null, "we should catch up soon!", yesterday);
+    addInteraction(null, "nvm don't worry about it", laterThanYesterday);
+    const res = await extractCommitmentsLlm(db, null, [ask]);
+    expect(res.processed).toBe(1);
+    expect(res.inserted).toBe(0);
+    expect(listCommitments(db)).toHaveLength(0);
+  });
+});
+
 describe("buildAnchoredDateReference (pure)", () => {
   it("maps the week after the send date and early/mid/late month anchors", () => {
     const ref = buildAnchoredDateReference(new Date("2026-08-04T15:00:00Z")); // a Tuesday
