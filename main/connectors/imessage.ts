@@ -292,22 +292,32 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
             matched++;
           } else if (res.status === "ambiguous") {
             personId = null; // never auto-pick
-          } else if (canCreate) {
-            // Only create people for counterparts SAVED in macOS Contacts.
-            const hit = ab.index.get(key);
+          } else {
+            // Saved in macOS Contacts → full contact with their real name.
+            const hit = canCreate ? ab.index.get(key) : undefined;
             if (hit) {
               personId = createPerson(db, { displayName: hit.name, org: hit.company });
-              // Phone handles get kind 'imessage_handle' (resolveHandle checks it alongside
-              // 'phone'); email handles get kind 'email' so email-based resolution finds them.
               if (email) addAlias(db, personId, "email", email.norm, "imessage");
               else addAlias(db, personId, "imessage_handle", phone!.norm, "imessage");
               report.created++;
               matched++;
             } else {
-              personId = null; // unsaved number/email → skip
+              // Unsaved but REAL sender → unverified archive-tier contact so the
+              // unified inbox shows everyone (owner spec 2026-08-05). Tier 3 keeps
+              // them out of Reconnect; the 'unverified' tag makes triage/delete easy.
+              const displayName = email ? email.norm : phone!.norm;
+              const ins = db.prepare(
+                "INSERT INTO person (display_name, tier) VALUES (?, 3)"
+              ).run(displayName);
+              personId = Number(ins.lastInsertRowid);
+              db.prepare(
+                "INSERT OR IGNORE INTO person_tag (person_id, tag) VALUES (?, 'unverified')"
+              ).run(personId);
+              if (email) addAlias(db, personId, "email", email.norm, "imessage");
+              else addAlias(db, personId, "imessage_handle", phone!.norm, "imessage");
+              report.created++;
+              matched++;
             }
-          } else {
-            personId = null; // AddressBook unreadable → resolve-only, create nothing
           }
           personByHandle.set(key, personId);
         }

@@ -134,11 +134,12 @@ describe("syncImessage with a migrated date-shaped cursor", () => {
     expect(getCursor(db, "imessage")).toBe("7");
   });
 
-  it("counts unmatched counterparts in the skip breakdown so 0-ingested runs are explainable", async () => {
+  it("auto-creates unverified archive-tier contacts for unknown real senders (owner spec 2026-08-05)", async () => {
     const DAY = 86_400_000;
     buildChatDb([{ rowid: 1, guid: "g-known", text: "hi", atMs: Date.now() - 1 * DAY }]);
-    // Second 1:1 chat with a counterpart nobody knows (not in aliases; the invalid
-    // +1999 number cannot be a saved contact) → resolve fails → skippedUnmatched.
+    // Second 1:1 chat with a counterpart nobody knows. Old policy skipped these;
+    // new policy: real unsaved senders become tier-3 'unverified' contacts so the
+    // unified inbox shows everyone.
     const chat = new Database(chatDbPath);
     chat.prepare("INSERT INTO handle (ROWID, id) VALUES (2, '+19995550100')").run();
     chat.prepare("INSERT INTO chat (ROWID, guid) VALUES (2, 'iMessage;-;+19995550100')").run();
@@ -149,9 +150,17 @@ describe("syncImessage with a migrated date-shaped cursor", () => {
     chat.prepare("INSERT INTO chat_message_join (chat_id, message_id) VALUES (2, 2)").run();
     chat.close();
 
-    const report = await syncImessage(deps(), { chatDbPath });
-    expect(report.ingested).toBe(1);
-    expect(report.skippedUnmatched).toBeGreaterThanOrEqual(1);
-    expect(report.skipped).toBeGreaterThanOrEqual(report.skippedUnmatched);
+    const d = deps();
+    const report = await syncImessage(d, { chatDbPath });
+    expect(report.ingested).toBe(2); // both messages land — unknown sender included
+    expect(report.created).toBeGreaterThanOrEqual(1);
+    const p = d.db
+      .prepare(
+        `SELECT p.tier, (SELECT COUNT(*) FROM person_tag t WHERE t.person_id = p.id AND t.tag = 'unverified') AS unv
+         FROM person p JOIN alias a ON a.person_id = p.id WHERE a.value = '+19995550100'`
+      )
+      .get() as { tier: number; unv: number };
+    expect(p.tier).toBe(3);       // archive tier — never surfaces in Reconnect
+    expect(p.unv).toBe(1);        // tagged for easy triage/delete
   });
 });
