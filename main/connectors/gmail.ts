@@ -1,8 +1,8 @@
 // Mail connector — read-only IMAP (INBOX + sent folder) for any number of accounts:
 // Gmail, Outlook, or custom IMAP. Ported from PersonalCRM2 connectors/gmail.ts; adapted
 // to the no-staging architecture: each message's counterpart is resolved inline via
-// resolveHandle and, when matched, written directly to `interaction`. Unmatched
-// counterparts are skipped (mail never creates people — email alone isn't enough
+// resolveHandle and written directly to `interaction`. Unknown REAL senders become
+// unverified tier-3 contacts (owner spec 2026-08-05); automated senders are skipped
 // evidence of a real relationship).
 //
 // Accounts: JSON array under secret MAIL_ACCOUNTS (id/provider/user/password/host/port).
@@ -325,15 +325,35 @@ export async function syncMailAccount(
 
             attempted++;
             const res = resolveHandle(db, { email: cpEmail, name: cpName });
-            if (res.status !== "matched" || !res.personId) {
-              report.skipped++; // unmatched/ambiguous → no person, no row (no staging table)
+            let personId: number;
+            if (res.status === "matched" && res.personId) {
+              personId = res.personId;
+              matched++;
+            } else if (res.status === "ambiguous") {
+              report.skipped++; // never auto-pick between candidates
               continue;
+            } else {
+              // Unknown REAL sender (automated already filtered above) → unverified
+              // archive-tier contact so the unified inbox shows everyone
+              // (owner spec 2026-08-05). Tier 3 keeps them out of Reconnect.
+              const normEmail = cpEmail.trim().toLowerCase();
+              const ins = db
+                .prepare("INSERT INTO person (display_name, tier) VALUES (?, 3)")
+                .run(cpName?.trim() || normEmail);
+              personId = Number(ins.lastInsertRowid);
+              db.prepare(
+                "INSERT OR IGNORE INTO person_tag (person_id, tag) VALUES (?, 'unverified')"
+              ).run(personId);
+              db.prepare(
+                "INSERT OR IGNORE INTO alias (person_id, kind, value, source) VALUES (?, 'email', ?, 'mail')"
+              ).run(personId, normEmail);
+              report.created++;
+              matched++;
             }
-            matched++;
 
             const externalId = parsed.messageId ?? `gmail:${box}:${msg.uid}`;
             const inserted = insertInteraction(db, {
-              personId: res.personId,
+              personId,
               channel: "gmail",
               direction: outbound ? "outbound" : "inbound",
               occurredAt: when.toISOString(),
