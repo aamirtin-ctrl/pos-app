@@ -16,6 +16,7 @@ import { getSetting, setSetting } from "../db/db.ts";
 import type { SecretStore } from "../secrets.ts";
 import { isGoogleConnected, oauthClient } from "./auth.ts";
 import { confirmCommitment, dropCommitment } from "../crm/commitments.ts";
+import { resolveNamedDate } from "../context.ts";
 
 export const POS_CALENDAR_NAME = "POS — Planned";
 export const POS_TASKLIST_NAME = "POS";
@@ -710,8 +711,14 @@ export async function commitmentToTask(
     // with no due date and no picked date becomes an INBOX item — plan_date NULL,
     // hard_deadline_at NULL, Google task with no due date. Never default to today.
     const due = c.due_at ? c.due_at.slice(0, 10) : null;
-    const planDate = pickedDate ?? due; // may be NULL → inbox, not on today's list
-    const deadline = pickedDate ? `${pickedDate}T00:00:00` : c.due_at;
+    // …unless the description names a date the app actually knows (main/context.ts):
+    // "meetup at the start of school" lands on the user's term-start anchor. This is the
+    // owner's exact click-path — the picker used to prefill TODAY for exactly this row.
+    const named = !pickedDate && !due ? resolveNamedDate(db, c.description) : null;
+    const planDate = pickedDate ?? due ?? named; // may be NULL → inbox, not on today's list
+    const deadline = pickedDate
+      ? `${pickedDate}T00:00:00`
+      : c.due_at ?? (named ? `${named}T00:00:00` : null);
     const r = db.prepare(
       `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
         commitment_id, status, plan_date, hard_deadline_at, estimate_source)
@@ -835,7 +842,10 @@ export function commitmentToEvent(db: Db, id: number, dateISO?: string, hhmm?: s
   const c = db.prepare("SELECT id, description, due_at FROM commitment WHERE id = ?").get(id) as
     | { id: number; description: string; due_at: string | null } | undefined;
   if (!c) throw new Error("commitment not found");
-  const date = dateISO || (c.due_at ? c.due_at.slice(0, 10) : null);
+  // Named-date fallback before giving up: "dinner at the start of school" resolves against
+  // the user's date anchors (main/context.ts) rather than forcing the UI to ask.
+  const date =
+    dateISO || (c.due_at ? c.due_at.slice(0, 10) : null) || resolveNamedDate(db, c.description);
   if (!date) return { needsDate: true };
   const time = hhmm && /^\d{2}:\d{2}$/.test(hhmm) ? hhmm : "10:00";
   const startsAt = `${date}T${time}:00`;

@@ -437,19 +437,30 @@ function CommitmentList({
   const pad = (n: number) => String(n).padStart(2, "0");
   const isoDate = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 
-  /** Prefill: task date = due date else today; event date = due date else tomorrow,
-   *  time = the due date's clock time when it has one (non-midnight), else 10:00. */
-  const openPicker = (c: CommitmentRow, mode: "task" | "event") => {
+  /**
+   * Prefill: the commitment's own due date when it has one; otherwise the date its TEXT
+   * names, resolved against the user's personal facts (main/context.ts) — "meetup at the
+   * start of school" prefills the term-start date, not today (owner report 2026-08-05).
+   * Only when neither exists does it fall back to today (task) / tomorrow (event).
+   * Time = the due date's clock time when it has one (non-midnight), else 10:00.
+   */
+  const openPicker = async (c: CommitmentRow, mode: "task" | "event") => {
     setNotice(null);
     const due = c.due_at ? c.due_at.slice(0, 10) : null;
+    let named: string | null = null;
+    if (!due) {
+      const r = await window.pos.context.resolveDate(c.description);
+      const d = r.ok ? (r.data as { date: string | null } | undefined)?.date ?? null : null;
+      named = d && /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null;
+    }
     if (mode === "task") {
-      setPicker({ id: c.id, mode, date: due ?? isoDate(new Date()), time: "" });
+      setPicker({ id: c.id, mode, date: due ?? named ?? isoDate(new Date()), time: "" });
     } else {
       const dueTime = c.due_at ? c.due_at.slice(11, 16) : "";
       setPicker({
         id: c.id,
         mode,
-        date: due ?? isoDate(new Date(Date.now() + 24 * 60 * 60_000)),
+        date: due ?? named ?? isoDate(new Date(Date.now() + 24 * 60 * 60_000)),
         time: dueTime && dueTime !== "00:00" ? dueTime : "10:00",
       });
     }

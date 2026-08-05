@@ -50,6 +50,7 @@ import {
   makeDraftStatusEntry,
 } from "./undo.ts";
 import { addManual, entriesSince, catchUpParagraph } from "./worklog.ts";
+import { listFacts, setFact, deleteFact, resolveNamedDate, type SetFactInput } from "./context.ts";
 import { embedProfiles, makeQueryEmbedder } from "./llm/embeddings.ts";
 import * as planner from "./planner.ts";
 import { handleCommand } from "./assistant.ts";
@@ -433,6 +434,16 @@ export function registerIpc(deps: IpcDeps) {
   );
   h("worklog.add", (title: string) => addManual(db, title));
   h("worklog.catchUp", (personId: number) => catchUpParagraph(db, deps.llm(), personId));
+
+  // ── personal context ("About you") ──
+  // Bodies live in main/context.ts. list() seeds the editable defaults on a first-ever
+  // read, so the Settings card is never blank on a fresh install.
+  h("context.list", () => listFacts(db));
+  h("context.set", (fact: SetFactInput) => setFact(db, { source: "manual", ...fact }));
+  h("context.delete", (key: string) => ({ deleted: deleteFact(db, key) }));
+  // The commitment date picker asks this before prefilling: "meetup at the start of
+  // school" resolves to the user's term-start anchor instead of defaulting to today.
+  h("context.resolveDate", (phrase: string) => ({ date: resolveNamedDate(db, phrase) }));
 
   // ── unified assistant ──
   h("assistant.command", (text: string) =>

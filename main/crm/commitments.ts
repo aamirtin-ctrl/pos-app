@@ -50,6 +50,10 @@
 //   4. Deterministic-fallback rows are capped at confidence 0.5 (they are raw message
 //      fragments, not rewrites), so they can never clear the autonomy threshold in
 //      workers.autoTentativeTasks — they land in the review queue instead.
+//   4b. Personal context (main/context.ts): both prompts open with an ABOUT THE USER
+//      block, and any survivor the model left undated gets resolveNamedDate() run over
+//      its title + raw text. That is what turns "meetup at the start of school" into the
+//      user's actual term-start date instead of leaving it undated (or, worse, today).
 //   5. Thread-resolution awareness (owner spec 2026-08-05 #3): something resolved IN
 //      the message chain must not live on as an open commitment. The prompt closes
 //      ask→fulfilled/cancelled pairs at extraction time, and threadResolves() — a
@@ -60,6 +64,7 @@
 
 import { createHash } from "node:crypto";
 import type { Db } from "../db/db.ts";
+import { contextBlock, resolveNamedDate } from "../context.ts";
 import { extractJson, type LlmClient } from "../llm/provider.ts";
 import { extractFollowups } from "./followups.ts";
 import { parseWhen } from "./when.ts";
@@ -443,6 +448,17 @@ function numberedSnippets(cands: Candidate[], contexts: Map<number, PersonContex
     .join("\n");
 }
 
+/**
+ * The ABOUT THE USER block (main/context.ts), rendered as a prompt preamble. Both queries
+ * carry it so the model can resolve personal references the message never spells out —
+ * "meetup at the start of school" only means 2026-09-22 if you know where he goes to
+ * school and when its term starts. Empty when the user has no facts recorded.
+ */
+function aboutPreamble(about: string | undefined): string {
+  const block = (about ?? "").trim();
+  return block ? `${block}\n\n` : "";
+}
+
 /** One date-reference line per distinct sent DATE in the batch (msgplans technique). */
 function dateReferenceLines(cands: Candidate[]): string {
   const seen = new Set<string>();
@@ -463,8 +479,12 @@ function dateReferenceLines(cands: Candidate[]): string {
  * commitments at all? Classification only — no rewriting, no dates. Cheap output, so the
  * expensive normalization prompt only ever runs over survivors.
  */
-export function buildClassifyPrompt(cands: Candidate[], contexts: Map<number, PersonContext>): string {
-  return `Decide which of these numbered message snippets contain a REAL commitment between the user and a contact. Classify only — do not rewrite anything.
+export function buildClassifyPrompt(
+  cands: Candidate[],
+  contexts: Map<number, PersonContext>,
+  about?: string
+): string {
+  return `${aboutPreamble(about)}Decide which of these numbered message snippets contain a REAL commitment between the user and a contact. Classify only — do not rewrite anything.
 
 WHAT COUNTS AS A COMMITMENT — every one of these must hold:
 - A concrete action the USER owes a contact, or a contact owes the user.
@@ -508,8 +528,12 @@ Return STRICT JSON ONLY — no prose, no markdown fences — one object per snip
  * imperative, never a quote — owner report (c)), the date it belongs on, and whether it is
  * a TASK or a CALENDAR EVENT. Carries the date-reference table and every date rule.
  */
-export function buildNormalizePrompt(cands: Candidate[], contexts: Map<number, PersonContext>): string {
-  return `These numbered snippets each contain a real commitment. For each one, write the HEADLINE TITLE it should be called in a to-do app, the date it belongs on, and whether it is a TASK or a CALENDAR EVENT.
+export function buildNormalizePrompt(
+  cands: Candidate[],
+  contexts: Map<number, PersonContext>,
+  about?: string
+): string {
+  return `${aboutPreamble(about)}These numbered snippets each contain a real commitment. For each one, write the HEADLINE TITLE it should be called in a to-do app, the date it belongs on, and whether it is a TASK or a CALENDAR EVENT.
 
 TITLE — the headline, never a quote (this exact string becomes the task in the app and in Google Tasks):
 - "title" MUST be a rewritten imperative headline, NOT a copied message fragment. Copying the snippet is a failure.
@@ -540,6 +564,7 @@ RESOLVE DATES — use the DATE REFERENCE table below; never invent:
 - A stated timeframe becomes due_at: "in <month>" → that month's mid anchor (the 15th); "early <month>" → the 05 anchor; "late <month>" → the 25 anchor; "next week" / a weekday → the exact date from the table.
 - If the message states or implies NO timeframe, due_at MUST be null. NEVER default to the sent date or to today — a null due_at is correct and common.
 - SAME-DAY SCOPE: a time-of-day or same-day marker with NO other date ("at 5:30", "by noon", "tonight", "this afternoon", "in an hour") refers to the message's SENT date, not to today. If that moment has already passed by now, the item is EXPIRED — output nothing for it. NEVER keep it as an undated task.
+- PERSONAL ANCHORS: a reference to a named point in the USER's own life — "the start of school", "when school starts", "the beginning of the term", "move-in", "next semester" — resolves against the ABOUT THE USER block at the top of this prompt. "meetup at the start of school" gets that term-start date as due_at. If the block records no such date, leave due_at null; never guess one.
 
 DIRECTION:
 - "i_owe_them" when the USER owes the contact; "they_owe_me" when the contact owes the user.
@@ -725,10 +750,15 @@ export async function extractCommitmentsLlm(
 
   const pending: PendingCommitment[] = [];
   let llmHandled = false;
+  // Personal context (main/context.ts): who the user is, where they are, and the named
+  // dates in their life. Carried by BOTH queries so "start of school" is resolvable text
+  // rather than a phrase the model has to guess at.
+  const about = contextBlock(db);
+  const now = new Date();
 
   if (llm) {
     // ── query 1 (ONE call): which candidates are commitments at all? ────────
-    const res1 = await llm.call("commitments-classify", "fast", buildClassifyPrompt(candidates, contexts), {
+    const res1 = await llm.call("commitments-classify", "fast", buildClassifyPrompt(candidates, contexts, about), {
       json: true,
     });
     let survivors: Candidate[] | null = null;
@@ -764,7 +794,7 @@ export async function extractCommitmentsLlm(
 
       if (survivors.length > 0) {
         // ── query 2 (ONE call): normalize survivors into headlines + dates ──
-        const res2 = await llm.call("commitments-normalize", "fast", buildNormalizePrompt(survivors, contexts), {
+        const res2 = await llm.call("commitments-normalize", "fast", buildNormalizePrompt(survivors, contexts, about), {
           json: true,
         });
         let normalized = false;
@@ -792,6 +822,13 @@ export async function extractCommitmentsLlm(
                   ? Math.min(1, Math.max(0, confRaw))
                   : classifyConfidence.get(src.n) ?? 0.5;
                 let dueAt = typeof o.due_at === "string" && o.due_at ? o.due_at.slice(0, 10) : null;
+                if (!dueAt) {
+                  // Named-date cross-check (main/context.ts): the model left this undated,
+                  // but the text points at a named moment in the USER's own life — "meetup
+                  // at the start of school". Resolve it against their date anchors. Null
+                  // when nothing matches, which leaves the existing paths untouched.
+                  dueAt = resolveNamedDate(db, `${title} ${src.text}`, now);
+                }
                 if (!dueAt && src.row.occurred_at) {
                   // Deterministic cross-check (crm/when.ts): the model gave no due date, but
                   // the message itself states one, anchored to its SENT date. Only a date

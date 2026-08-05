@@ -95,6 +95,12 @@ contextBridge.exposeInMainWorld("pos", {
   digest: { send: call("digest.send"), preview: call("digest.preview") },
   undo: { do: call("undo.do"), redo: call("undo.redo") },
   worklog: { list: call("worklog.list"), add: call("worklog.add"), catchUp: call("worklog.catchUp") },
+  context: {
+    list: call("context.list"),
+    set: call("context.set"),
+    delete: call("context.delete"),
+    resolveDate: call("context.resolveDate"),
+  },
   assistant: { command: call("assistant.command") },
   stt: { transcribe: call("stt.transcribe") },
   inbox: {

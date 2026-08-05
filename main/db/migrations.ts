@@ -309,4 +309,31 @@ CREATE TABLE extraction_log (
 CREATE INDEX idx_extraction_log_interaction ON extraction_log(interaction_id);
 `,
   },
+  {
+    version: 7,
+    name: "user_fact",
+    sql: `
+-- Personal context ("about you") — owner report 2026-08-05: clicking "Add task" on a
+-- commitment about a "meetup at the start of school" prefilled TODAY, because nothing in
+-- the app knew he attends Stanford and that the fall term starts ~Sept 22. These rows are
+-- the app's memory of the USER themselves (main/context.ts). They render into a compact
+-- ABOUT THE USER block at the top of the extraction prompts and the assistant's context,
+-- and 'date_anchor' rows let resolveNamedDate() turn "start of school" into a real date.
+--   kind = 'fact'       — a durable statement ("Stanford University", "Dallas, TX")
+--        | 'date_anchor' — a named point in time (school-start); its date lives in starts_at
+--        | 'recurring'   — something that repeats (a weekly class, an annual trip)
+-- source = 'seed' (editable defaults) | 'manual' (Settings) | 'assistant' ("remember: …").
+CREATE TABLE user_fact (
+  id INTEGER PRIMARY KEY,
+  key TEXT NOT NULL UNIQUE,
+  value TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'fact',
+  starts_at TEXT,
+  ends_at TEXT,
+  source TEXT NOT NULL DEFAULT 'manual',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_user_fact_kind ON user_fact(kind);
+`,
+  },
 ];

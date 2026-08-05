@@ -12,6 +12,15 @@ import { patchPersonWithExtract } from "./crm/people.ts";
 import { reconnectDue, refreshNextTouch } from "./crm/reconnect.ts";
 import * as planner from "./planner.ts";
 import { addManual } from "./worklog.ts";
+import {
+  contextBlock,
+  setFact,
+  parseFactDeterministic,
+  normalizeKey,
+  REMEMBER_PREFIX,
+  type FactKind,
+  type FactRequest,
+} from "./context.ts";
 
 export interface AssistantResult {
   kind: "plan" | "people" | "note" | "answer" | "search" | "event" | "rule" | "error";
@@ -124,6 +133,71 @@ Return STRICT JSON ONLY — no prose: { "action": "suppress_followups" | "unsupp
   }
 }
 
+// ── "remember: …" → a personal fact (main/context.ts) ────────────────────────
+// Two layers, same shape as the rules engine above: the deterministic parser handles the
+// phrasings that matter ("remember: school starts Sept 22", "I go to Stanford", "my
+// birthday is March 4") for free and offline; the LLM only covers what it misses.
+
+/** LLM parse of a free-form fact statement. Null on no key / bad JSON / nothing to store. */
+export async function parseFactRequest(llm: LlmClient | null, message: string): Promise<FactRequest | null> {
+  if (!llm || !message.trim()) return null;
+  const todayISO = today();
+  const res = await llm.call(
+    "assistant_fact",
+    "fast",
+    `The user is telling their personal assistant a durable fact about THEMSELVES, to be remembered and reused later. Today is ${todayISO}.
+
+Turn it into ONE stored fact:
+- "key": lower_snake_case, stable and reusable. Use these exact keys when they fit: school, school_term_start, school_term_end, home_city, employer, birthday. Otherwise invent a short one ("gym", "advisor", "dorm").
+- "value": the fact itself, under 120 characters, no leading "my"/"I".
+- "kind": "date_anchor" when the fact IS a point in time the user will refer to colloquially later (a term start, a birthday, a move-in day); "recurring" when it repeats on a schedule; "fact" otherwise.
+- "date": for a date_anchor, the resolved date as YYYY-MM-DD (pick the next upcoming occurrence when no year is stated). null for everything else.
+
+Statement:
+"""${message.slice(0, 300)}"""
+
+Return STRICT JSON ONLY — no prose: { "key": "<key>", "value": "<value>", "kind": "fact" | "date_anchor" | "recurring", "date": "YYYY-MM-DD" | null }`,
+    { json: true }
+  );
+  if (!res) return null;
+  try {
+    const p = extractJson(res.text) as Record<string, unknown>;
+    const key = normalizeKey(typeof p.key === "string" ? p.key : null);
+    const rawValue = typeof p.value === "string" ? p.value.replace(/\s+/g, " ").trim() : "";
+    const date = typeof p.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(p.date.slice(0, 10))
+      ? p.date.slice(0, 10)
+      : null;
+    const kind: FactKind =
+      p.kind === "date_anchor" ? "date_anchor" : p.kind === "recurring" ? "recurring" : "fact";
+    const value = rawValue || date || "";
+    if (!key || !value) return null;
+    return { key, value, kind, date };
+  } catch {
+    return null;
+  }
+}
+
+/** Store a parsed fact and describe what was kept, in the user's own terms. */
+export function applyFact(db: Db, req: FactRequest): AssistantResult {
+  const stored = setFact(db, {
+    key: req.key,
+    value: req.value,
+    kind: req.kind,
+    startsAt: req.date,
+    source: "assistant",
+  });
+  const label = stored.key.replace(/_/g, " ");
+  // The date is usually the value itself ("school starts Sept 22") — don't say it twice.
+  const when =
+    stored.kind === "date_anchor" && stored.starts_at && stored.starts_at !== stored.value
+      ? ` (${stored.starts_at})`
+      : "";
+  return {
+    kind: "note",
+    reply: `Got it — I'll remember your ${label}: ${stored.value}${when}. Edit it any time in Settings → About you.`,
+  };
+}
+
 interface GroupRow {
   id: number;
   name: string;
@@ -200,12 +274,13 @@ export async function handleCommand(
       "assistant_route",
       "fast",
       `Classify this personal-assistant command. STRICT JSON only:
-{"intent":"plan_day"|"add_event"|"find_people"|"add_note"|"log_work"|"search"|"rule"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>"}
+{"intent":"plan_day"|"add_event"|"find_people"|"add_note"|"log_work"|"remember"|"search"|"rule"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>"}
 "plan_day" = a braindump of tasks to schedule, or asking to plan the day.
 "add_event" = ONE specific commitment at a stated time ("lunch with Raj Thursday 1pm", "dentist tomorrow at 9"). A time must be stated or clearly implied.
 "find_people" = who should I talk to / reach out to / intro ideas.
 "add_note" = remember/save a fact about a person in the network.
 "log_work" = record something the USER did into their worklog ("log: shipped the deck", "log closed the Series A intro").
+"remember" = a durable fact about the USER THEMSELVES, not about a contact ("remember: school starts Sept 22", "I go to Stanford", "my birthday is March 4", "I live in Dallas"). Facts about someone else in the network are add_note, not remember.
 "rule" = change how the CRM behaves for a GROUP of people ("my family group shouldn't show as follow-ups", "stop follow-ups for recruiters", "re-enable follow-ups for investors", "delete the mentors group").
 "search" = find/look up specific info they saved (a person, message, commitment, task, note).
 "question" = anything else about their calendar, commitments, or contacts.
@@ -231,6 +306,8 @@ Command: """${t.slice(0, 600)}"""`,
   }
   // Deterministic worklog prefix wins over everything (incl. the add_note "log" regex).
   if (/^log[:\s]/i.test(t)) intent = "log_work";
+  // Same for the "remember: …" prefix — it must never be read as a note about a contact.
+  if (REMEMBER_PREFIX.test(t)) intent = "remember";
   // Group rules are unambiguous when a pattern matches, so they win over the classifier.
   const ruleReq = parseRuleDeterministic(t);
   if (ruleReq) intent = "rule";
@@ -239,6 +316,18 @@ Command: """${t.slice(0, 600)}"""`,
     if (intent === "rule") {
       const req = ruleReq ?? (await parseRuleRequest(llm, t)) ?? { action: "none" as const, group: null };
       return applyRule(db, req);
+    }
+
+    if (intent === "remember") {
+      // Deterministic first (free, offline, predictable), LLM only for what it misses.
+      const req = parseFactDeterministic(t) ?? (await parseFactRequest(llm, t));
+      if (!req) {
+        return {
+          kind: "error",
+          reply: "What should I remember? Try: \"remember: school starts Sept 22\" or \"remember: I go to Stanford\".",
+        };
+      }
+      return applyFact(db, req);
     }
 
     if (intent === "log_work") {
@@ -366,7 +455,10 @@ Command: """${t.slice(0, 600)}"""`,
       .all() as { happened_at: string; title: string; detail: string | null }[])
       .map((w) => `${w.happened_at.slice(0, 10)}: ${w.title}${w.detail ? ` (${w.detail})` : ""}`)
       .join("; ");
-    const context = `TODAY'S PLAN: ${blocks || "(none generated)"}\nOPEN COMMITMENTS: ${commitments || "(none)"}\nRECONNECT DUE: ${due || "(none)"}\nRECENT MESSAGES: ${recent || "(none)"}\nRECENT WORKLOG: ${worklog || "(none)"}`;
+    // Personal context first (main/context.ts): "what do I have when school starts" is
+    // unanswerable without knowing when the user's school starts.
+    const about = contextBlock(db);
+    const context = `${about ? `${about}\n\n` : ""}TODAY'S PLAN: ${blocks || "(none generated)"}\nOPEN COMMITMENTS: ${commitments || "(none)"}\nRECONNECT DUE: ${due || "(none)"}\nRECENT MESSAGES: ${recent || "(none)"}\nRECENT WORKLOG: ${worklog || "(none)"}`;
     if (llm) {
       const res = await llm.call(
         "assistant_answer",

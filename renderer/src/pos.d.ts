@@ -40,6 +40,7 @@ declare global {
       digest: { send: Call; preview: Call };
       undo: { do: Call; redo: Call };
       worklog: { list: Call; add: Call; catchUp: Call };
+      context: { list: Call; set: Call; delete: Call; resolveDate: Call };
       assistant: { command: Call };
       stt: { transcribe: Call };
       inbox: { list: Call; sendEmail: Call; sendIMessage: Call; sendIMessageChat: Call; handles: Call };

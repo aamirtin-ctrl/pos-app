@@ -65,6 +65,7 @@ export default function Settings() {
       <div className="drag-region h-4" />
       <h1 className="font-display text-2xl font-semibold mb-5 no-drag">Settings</h1>
       <Integrations />
+      <AboutYou />
       <SpendMeter />
       <Doctrine />
       <Adherence />
@@ -1735,6 +1736,221 @@ function KeyRowView({
         </button>
       </div>
     </div>
+  );
+}
+
+// ── a2. About you ────────────────────────────────────────────────────────────
+//
+// The facts main/context.ts uses to resolve colloquial dates ("start of school") and to
+// personalize scheduling. Everything here is user-owned and editable: the app ships a
+// short list of guessed defaults precisely so they can be corrected in one place.
+
+type Fact = {
+  id: number;
+  key: string;
+  value: string;
+  kind: string;
+  starts_at: string | null;
+  ends_at: string | null;
+  source: string;
+  updated_at: string;
+};
+
+const FACT_KINDS: { value: string; label: string }[] = [
+  { value: "fact", label: "Fact" },
+  { value: "date_anchor", label: "Date" },
+  { value: "recurring", label: "Recurring" },
+];
+
+const prettyKey = (key: string) => key.replace(/_/g, " ");
+
+function AboutYou() {
+  const [facts, setFacts] = useState<Fact[] | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, { value: string; kind: string; date: string }>>({});
+  const [newFact, setNewFact] = useState({ key: "", value: "", kind: "fact", date: "" });
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refetch = useCallback(async () => {
+    const r = await window.pos.context.list();
+    if (!r.ok) {
+      setError(r.error ?? "Couldn't load your facts.");
+      setFacts([]);
+      return;
+    }
+    const rows = (r.data as Fact[]) ?? [];
+    setFacts(rows);
+    setDrafts(
+      Object.fromEntries(
+        rows.map((f) => [f.key, { value: f.value, kind: f.kind, date: (f.starts_at ?? "").slice(0, 10) }])
+      )
+    );
+    setError(null);
+  }, []);
+  useEffect(() => { refetch(); }, [refetch]);
+
+  const save = async (key: string) => {
+    const d = drafts[key];
+    if (!d || !d.value.trim() || busy) return;
+    setBusy(key);
+    const r = await window.pos.context.set({
+      key,
+      value: d.value.trim(),
+      kind: d.kind,
+      startsAt: d.kind === "date_anchor" ? d.date || null : null,
+      source: "manual",
+    });
+    setBusy(null);
+    if (!r.ok) { setError(r.error ?? "Couldn't save that fact."); return; }
+    refetch();
+  };
+
+  const remove = async (key: string) => {
+    if (busy) return;
+    setBusy(key);
+    const r = await window.pos.context.delete(key);
+    setBusy(null);
+    if (!r.ok) { setError(r.error ?? "Couldn't delete that fact."); return; }
+    refetch();
+  };
+
+  const add = async () => {
+    if (!newFact.key.trim() || !newFact.value.trim() || busy) return;
+    setBusy("__new__");
+    const r = await window.pos.context.set({
+      key: newFact.key.trim(),
+      value: newFact.value.trim(),
+      kind: newFact.kind,
+      startsAt: newFact.kind === "date_anchor" ? newFact.date || null : null,
+      source: "manual",
+    });
+    setBusy(null);
+    if (!r.ok) { setError(r.error ?? "Couldn't add that fact."); return; }
+    setNewFact({ key: "", value: "", kind: "fact", date: "" });
+    refetch();
+  };
+
+  const dirty = (f: Fact) => {
+    const d = drafts[f.key];
+    if (!d) return false;
+    return (
+      d.value !== f.value ||
+      d.kind !== f.kind ||
+      (d.kind === "date_anchor" && d.date !== (f.starts_at ?? "").slice(0, 10))
+    );
+  };
+
+  const inputStyle = { borderColor: "var(--line)", color: "var(--ink)" };
+
+  return (
+    <Section title="About you">
+      <p className="text-[12px] mb-3" style={{ color: "var(--muted)" }}>
+        Facts POS uses to resolve dates and personalize scheduling. Say "remember: …" in the command box to add one by voice.
+      </p>
+      {error && (
+        <p className="text-[12px] mb-2" style={{ color: "var(--danger)" }}>{error}</p>
+      )}
+      {facts == null ? (
+        <p className="text-sm" style={{ color: "var(--muted)" }}>Loading…</p>
+      ) : (
+        <div className="space-y-1.5">
+          {facts.map((f) => {
+            const d = drafts[f.key] ?? { value: f.value, kind: f.kind, date: "" };
+            return (
+              <div key={f.key} className="flex items-center gap-1.5 flex-wrap text-sm">
+                <span className="w-36 shrink-0 truncate" style={{ color: "var(--muted)" }} title={f.key}>
+                  {prettyKey(f.key)}
+                </span>
+                <input
+                  value={d.value}
+                  onChange={(e) => setDrafts({ ...drafts, [f.key]: { ...d, value: e.target.value } })}
+                  className="flex-1 min-w-[9rem] border rounded-md px-2 py-1 bg-white"
+                  style={inputStyle}
+                />
+                <select
+                  value={d.kind}
+                  onChange={(e) => setDrafts({ ...drafts, [f.key]: { ...d, kind: e.target.value } })}
+                  className="border rounded-md px-1.5 py-1 bg-white text-[12px]"
+                  style={inputStyle}
+                >
+                  {FACT_KINDS.map((k) => <option key={k.value} value={k.value}>{k.label}</option>)}
+                </select>
+                {d.kind === "date_anchor" && (
+                  <input
+                    type="date"
+                    value={d.date}
+                    onChange={(e) => setDrafts({ ...drafts, [f.key]: { ...d, date: e.target.value } })}
+                    className="border rounded-md px-1.5 py-1 bg-white text-[12px]"
+                    style={inputStyle}
+                  />
+                )}
+                <button
+                  onClick={() => save(f.key)}
+                  disabled={!dirty(f) || busy === f.key}
+                  className="px-2 py-1 rounded-md text-[12px] border bg-white disabled:opacity-40"
+                  style={{ borderColor: "var(--line)" }}
+                >
+                  Save
+                </button>
+                <button
+                  onClick={() => remove(f.key)}
+                  disabled={busy === f.key}
+                  className="px-2 py-1 rounded-md text-[12px] border bg-white disabled:opacity-40"
+                  style={{ borderColor: "var(--line)", color: "var(--danger)" }}
+                >
+                  Delete
+                </button>
+              </div>
+            );
+          })}
+          {facts.length === 0 && (
+            <p className="text-sm" style={{ color: "var(--muted)" }}>Nothing recorded yet.</p>
+          )}
+
+          <div className="flex items-center gap-1.5 flex-wrap text-sm pt-2 mt-1 border-t" style={{ borderColor: "var(--line)" }}>
+            <input
+              value={newFact.key}
+              onChange={(e) => setNewFact({ ...newFact, key: e.target.value })}
+              placeholder="key (e.g. dorm)"
+              className="w-36 shrink-0 border rounded-md px-2 py-1 bg-white"
+              style={inputStyle}
+            />
+            <input
+              value={newFact.value}
+              onChange={(e) => setNewFact({ ...newFact, value: e.target.value })}
+              placeholder="value"
+              className="flex-1 min-w-[9rem] border rounded-md px-2 py-1 bg-white"
+              style={inputStyle}
+            />
+            <select
+              value={newFact.kind}
+              onChange={(e) => setNewFact({ ...newFact, kind: e.target.value })}
+              className="border rounded-md px-1.5 py-1 bg-white text-[12px]"
+              style={inputStyle}
+            >
+              {FACT_KINDS.map((k) => <option key={k.value} value={k.value}>{k.label}</option>)}
+            </select>
+            {newFact.kind === "date_anchor" && (
+              <input
+                type="date"
+                value={newFact.date}
+                onChange={(e) => setNewFact({ ...newFact, date: e.target.value })}
+                className="border rounded-md px-1.5 py-1 bg-white text-[12px]"
+                style={inputStyle}
+              />
+            )}
+            <button
+              onClick={add}
+              disabled={!newFact.key.trim() || !newFact.value.trim() || busy === "__new__"}
+              className="px-2.5 py-1 rounded-md text-[12px] border bg-white disabled:opacity-40"
+              style={{ borderColor: "var(--line)" }}
+            >
+              Add
+            </button>
+          </div>
+        </div>
+      )}
+    </Section>
   );
 }
 
