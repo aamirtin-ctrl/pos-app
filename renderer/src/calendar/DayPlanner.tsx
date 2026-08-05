@@ -1,15 +1,22 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import PreviewColumn from "./PreviewColumn.tsx";
 import {
-  COLORS, FALLBACK_COLOR, addDaysISO, buildItems, fmtDur, fmtMin, todayISO,
-  type DayData, type ExternalEvent, type Item, type PlanView,
+  COLORS, DOCTRINE_NARRATION, FALLBACK_COLOR, GRID_END_MIN, GRID_START_MIN, GUTTER_PX,
+  MIN_CARD_PX, PX_PER_MIN, WINDOW_START_MIN, addDaysISO, buildItems, firstSentences, fmtDur,
+  fmtHour, fmtMin, freeGaps, layoutLanes, todayISO, yOf,
+  type DayData, type ExternalEvent, type Item, type LaidOutItem, type PlanView,
 } from "./shared.ts";
 
-// Structured-style day view on the cream/pink/brown watercolor theme:
-// a single centered vertical timeline with tinted icon circles, rounded event
-// cards, free-time gaps and a pulsing now indicator. External Google events
-// populate the timeline even before a plan exists; a generated plan overlays
-// them as anchors. All plan/gcal/outcomes behavior is unchanged.
+// Structured-style day view on the cream/pink/brown watercolor theme, rendered
+// as a TIME-PROPORTIONAL grid: every card is absolutely positioned by clock
+// time (top = startMin * PX_PER_MIN, height = duration * PX_PER_MIN), so a 7am
+// block sits near the top of the day and a 7pm one near the bottom. The full
+// 24h is drawn and the container scrolls; 07:00 is scrolled into view on mount
+// and on every date change. Tinted icon circles, rounded cards, dimmed past /
+// outlined current with a progress bar, a pulsing now-line and hour gridlines
+// with labels in a left gutter carry the same aesthetic as before. External
+// Google events populate the grid even before a plan exists; a generated plan
+// overlays them as anchors. All plan/gcal/outcomes behavior is unchanged.
 //
 // Around the center column, a multi-day carousel: adjacent days render as
 // narrow no-text preview columns that taper in width and opacity toward the
@@ -244,51 +251,27 @@ export default function DayPlanner() {
     });
   }, [date]);
 
-  const status = (it: Item): "past" | "current" | "future" => {
+  const status = (it: { startMin: number; endMin: number }): "past" | "current" | "future" => {
     if (isPastDay) return "past";
     if (!isToday) return "future";
     if (it.endMin <= nowMin) return "past";
     if (it.startMin <= nowMin) return "current";
     return "future";
   };
-  const nowInsideItem = isToday && items.some((it) => it.startMin <= nowMin && nowMin < it.endMin);
 
-  // rows: events + free-time gaps, with the now-line spliced in chronologically
-  const rows: React.ReactNode[] = [];
-  let nowPlaced = !isToday || nowInsideItem;
-  const pushNow = () => {
-    rows.push(
-      <div key="now" className="flex items-center gap-3 py-1" aria-label="Current time">
-        <span className="w-14 shrink-0 text-right text-[11px] font-semibold tabular-nums" style={{ color: "#d95d5d" }}>
-          {fmtMin(nowMin)}
-        </span>
-        <span className="relative w-9 shrink-0 self-stretch flex items-center justify-center">
-          <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2" style={{ background: "var(--line)" }} />
-          <span className="now-dot relative z-[1] w-2.5 h-2.5 rounded-full" style={{ background: "#d95d5d" }} />
-        </span>
-        <span className="flex-1 h-[2px] rounded-full" style={{ background: "#d95d5d", opacity: 0.85 }} />
-      </div>
-    );
-    nowPlaced = true;
-  };
-  let prevEnd: number | null = null;
-  items.forEach((it) => {
-    const gap = prevEnd !== null ? it.startMin - prevEnd : 0;
-    if (!nowPlaced && nowMin < it.startMin && (prevEnd === null || nowMin >= prevEnd)) {
-      if (gap >= 20 && prevEnd !== null && nowMin > prevEnd) {
-        rows.push(<GapRow key={`g${it.key}`} minutes={gap} dim={isPastDay} />);
-        pushNow();
-      } else {
-        pushNow();
-        if (gap >= 20) rows.push(<GapRow key={`g${it.key}`} minutes={gap} dim={isPastDay} />);
-      }
-    } else if (gap >= 20) {
-      rows.push(<GapRow key={`g${it.key}`} minutes={gap} dim={isPastDay || (isToday && it.startMin <= nowMin)} />);
-    }
-    rows.push(<EventRow key={it.key} item={it} status={status(it)} nowMin={nowMin} />);
-    prevEnd = Math.max(prevEnd ?? 0, it.endMin);
-  });
-  if (!nowPlaced && items.length > 0) pushNow();
+  // Side-by-side lanes for anything that overlaps in time (see layoutLanes).
+  const laid = useMemo(() => layoutLanes(items), [items]);
+  // Empty stretches, painted as faint dashed affordances in otherwise-blank grid.
+  const gaps = useMemo(() => freeGaps(items), [items]);
+
+  // Scroll 07:00 into view on mount and whenever the day changes. The scroll
+  // container stays mounted across flips (only its contents are keyed for the
+  // slide animation), so this has to be re-applied per date.
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = Math.max(0, yOf(WINDOW_START_MIN) - 8);
+  }, [date]);
 
   const previewCols = (side: "left" | "right") =>
     previews
@@ -368,23 +351,44 @@ export default function DayPlanner() {
       <div className="flex-1 min-h-0 px-4 pb-3 flex items-stretch justify-center gap-2.5">
         {previewCols("left")}
 
-        {/* center day — keyed by date so each flip re-enters with a subtle slide+fade */}
-        <div className="w-full max-w-xl min-w-0 overflow-y-auto px-2 pb-32">
+        {/* center day — the scroll container is stable (so 7am can be scrolled
+            into view); its contents are keyed by date for the slide+fade */}
+        <div ref={scrollRef} className="w-full max-w-xl min-w-0 overflow-y-auto px-2 pb-32">
         <div key={date} className={slideDir.current >= 0 ? "day-enter-fwd" : "day-enter-back"}>
-          {items.length > 0 ? (
-            <div className="mt-1">{rows}</div>
-          ) : (
-            <div className="mt-6 rounded-2xl border-2 border-dashed px-4 py-10 flex flex-col items-center gap-2 text-center"
-              style={{ borderColor: "var(--accent-soft)", color: "var(--muted)" }}>
-              <span className="w-10 h-10 rounded-full flex items-center justify-center"
-                style={{ background: "var(--pink-1)", color: "var(--accent)" }}>
-                <TypeIcon type="event" size={18} />
-              </span>
-              <p className="text-sm font-medium" style={{ color: "var(--ink)" }}>Nothing scheduled</p>
-              <p className="text-xs">A clear day — plan it or let it breathe.</p>
-            </div>
-          )}
+          {/* time-proportional grid: full 24h, absolutely positioned by clock time */}
+          <div className="relative mt-1" style={{ height: yOf(GRID_END_MIN) }}>
+            <HourGrid />
 
+            {/* free time is just empty grid — a faint dashed hint, never a row */}
+            {gaps.map((g) => (
+              <GapHint key={`g${g.startMin}`} startMin={g.startMin} endMin={g.endMin}
+                dim={isPastDay || (isToday && g.endMin <= nowMin)} />
+            ))}
+
+            {laid.map((it) => (
+              <EventCard key={it.key} item={it} status={status(it)} nowMin={nowMin} />
+            ))}
+
+            {isToday && <NowLine nowMin={nowMin} />}
+
+            {items.length === 0 && (
+              <div className="absolute rounded-2xl border-2 border-dashed px-4 py-8 flex flex-col items-center gap-2 text-center"
+                style={{
+                  top: yOf(WINDOW_START_MIN) + 120, left: GUTTER_PX + 6, right: 4,
+                  borderColor: "var(--accent-soft)", color: "var(--muted)",
+                  background: "color-mix(in srgb, var(--bg) 70%, transparent)",
+                }}>
+                <span className="w-10 h-10 rounded-full flex items-center justify-center"
+                  style={{ background: "var(--pink-1)", color: "var(--accent)" }}>
+                  <TypeIcon type="event" size={18} />
+                </span>
+                <p className="text-sm font-medium" style={{ color: "var(--ink)" }}>Nothing scheduled</p>
+                <p className="text-xs">A clear day — plan it or let it breathe.</p>
+              </div>
+            )}
+          </div>
+
+          <NarrationFooter plan={plan} />
           <PlanControls plan={plan} onChange={refresh} />
           {outcomes.length > 0 && <OutcomeCapture blocks={outcomes} onDone={refresh} />}
         </div>
@@ -396,26 +400,80 @@ export default function DayPlanner() {
   );
 }
 
-/** One event card on the timeline: time gutter, tinted icon circle on the spine, rounded card. */
-function EventRow({ item, status, nowMin }: { item: Item; status: "past" | "current" | "future"; nowMin: number }) {
+/** Hour rules across the grid with their labels in the left gutter. */
+function HourGrid() {
+  const hours: number[] = [];
+  for (let m = GRID_START_MIN; m <= GRID_END_MIN; m += 60) hours.push(m);
+  return (
+    <>
+      {/* the gutter's own soft spine */}
+      <div className="absolute inset-y-0" style={{ left: GUTTER_PX - 6, width: 1, background: "var(--line)" }} />
+      {hours.map((m) => {
+        const inWindow = m >= WINDOW_START_MIN && m <= GRID_END_MIN;
+        return (
+          <React.Fragment key={m}>
+            <div className="absolute text-[10px] tabular-nums -translate-y-1/2 text-right"
+              style={{ top: yOf(m), left: 0, width: GUTTER_PX - 12, color: "var(--muted)", opacity: inWindow ? 0.85 : 0.5 }}>
+              {m === GRID_END_MIN ? "" : fmtHour(m)}
+            </div>
+            <div className="absolute" style={{ top: yOf(m), left: GUTTER_PX - 6, right: 0, height: 1, background: "var(--line)", opacity: 0.75 }} />
+            {m + 30 < GRID_END_MIN && (
+              <div className="absolute" style={{ top: yOf(m + 30), left: GUTTER_PX - 6, right: 0, height: 1, background: "var(--line)", opacity: 0.3 }} />
+            )}
+          </React.Fragment>
+        );
+      })}
+    </>
+  );
+}
+
+/** Free time: a faint dashed affordance sitting in the empty grid space itself. */
+function GapHint({ startMin, endMin, dim }: { startMin: number; endMin: number; dim: boolean }) {
+  const height = (endMin - startMin) * PX_PER_MIN;
+  return (
+    <div className="absolute rounded-xl border border-dashed flex items-center justify-center pointer-events-none"
+      style={{
+        top: yOf(startMin) + 2, height: Math.max(0, height - 4), left: GUTTER_PX + 6, right: 4,
+        borderColor: "var(--line)", background: "color-mix(in srgb, var(--wash) 35%, transparent)",
+        opacity: dim ? 0.35 : 0.7,
+      }}>
+      {height >= 46 && (
+        <span className="text-[10px] tabular-nums" style={{ color: "var(--muted)" }}>
+          Free · {fmtDur(endMin - startMin)}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One event, absolutely positioned by clock time: `top` is its start minute and
+ * `height` its duration, both scaled by PX_PER_MIN. Horizontally it occupies
+ * its packed lane span, so overlapping events sit side by side. The card sheds
+ * detail as it gets shorter (time row, then the icon circle, then padding).
+ */
+function EventCard({ item, status, nowMin }: { item: LaidOutItem; status: "past" | "current" | "future"; nowMin: number }) {
   const c = COLORS[item.type] ?? FALLBACK_COLOR;
   const dur = item.endMin - item.startMin;
+  const height = Math.max(MIN_CARD_PX, dur * PX_PER_MIN);
   const progress = status === "current" ? Math.min(100, Math.max(0, ((nowMin - item.startMin) / Math.max(1, dur)) * 100)) : 0;
   const dim = status === "past";
+  const tight = height < 44;   // no time row / meta pills
+  const roomy = height >= 76;  // full card: icon circle, time row, progress bar
+  const laneW = 100 / item.lanes;
   return (
-    <div className="flex gap-3 py-1" style={{ opacity: dim ? 0.55 : 1 }}>
-      <span className="w-14 shrink-0 pt-2.5 text-right text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
-        {fmtMin(item.startMin)}
-      </span>
-      <span className="relative w-9 shrink-0 flex justify-center">
-        <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2" style={{ background: "var(--line)" }} />
-        <span className="relative z-[1] mt-1 w-9 h-9 rounded-full flex items-center justify-center shadow-sm"
-          style={{ background: c.bg, color: c.fg, border: "2px solid var(--bg)" }}>
-          <TypeIcon type={item.type} />
-        </span>
-      </span>
-      <div className="flex-1 min-w-0 rounded-2xl border px-3.5 py-2.5 shadow-sm"
+    <div className="absolute"
+      style={{
+        top: yOf(item.startMin), height,
+        left: `calc(${GUTTER_PX + 6}px + (100% - ${GUTTER_PX + 10}px) * ${item.lane * laneW / 100})`,
+        width: `calc((100% - ${GUTTER_PX + 10}px) * ${item.span * laneW / 100} - 4px)`,
+        opacity: dim ? 0.55 : 1,
+        zIndex: 2 + item.lane,
+      }}>
+      <div className="h-full w-full rounded-2xl border shadow-sm overflow-hidden flex gap-2 items-start"
         style={{
+          padding: tight ? "3px 8px" : "7px 10px",
+          borderRadius: tight ? 10 : 14,
           background: item.external
             ? "color-mix(in srgb, var(--pink-1) 40%, white)"
             : `color-mix(in srgb, ${c.bg} 22%, white)`,
@@ -423,60 +481,96 @@ function EventRow({ item, status, nowMin }: { item: Item; status: "past" | "curr
           borderStyle: item.external ? "dashed" : "solid",
           outline: status === "current" ? "2px solid var(--accent)" : item.locked ? "2px solid var(--danger)" : "none",
           outlineOffset: "1px",
-        }}>
-        <div className="flex items-center gap-2">
-          <span className="flex-1 min-w-0 truncate text-sm font-semibold" style={{ color: "var(--ink)" }}>
-            {item.title}
-          </span>
-          {item.locked && <span title="Locked" style={{ color: "var(--danger)" }}><LockGlyph /></span>}
-          {item.external && (
-            <span className="shrink-0 px-1.5 py-0.5 rounded-full text-[9px] font-medium uppercase tracking-wide"
-              style={{ background: "var(--pink-1)", color: "var(--accent)" }}>
-              Google
+        }}
+        title={`${item.title} · ${fmtMin(item.startMin)} – ${fmtMin(item.endMin)}`}>
+        {/* tinted type circle, shrinking with the card */}
+        <span className="shrink-0 rounded-full flex items-center justify-center shadow-sm"
+          style={{
+            width: roomy ? 28 : 20, height: roomy ? 28 : 20,
+            background: c.bg, color: c.fg, border: "1.5px solid var(--bg)",
+          }}>
+          <TypeIcon type={item.type} size={roomy ? 14 : 11} />
+        </span>
+
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5">
+            <span className="flex-1 min-w-0 truncate font-semibold"
+              style={{ color: "var(--ink)", fontSize: tight ? 11 : 13, lineHeight: 1.3 }}>
+              {item.title}
             </span>
-          )}
-          {!item.external && item.anchor && (
-            <span className="shrink-0 px-1.5 py-0.5 rounded-full text-[9px] font-medium uppercase tracking-wide"
-              style={{ background: "var(--panel)", color: "var(--muted)" }}>
-              Anchor
-            </span>
-          )}
-          <span className="shrink-0 px-2 py-0.5 rounded-full text-[10px] font-medium tabular-nums"
-            style={{ background: "color-mix(in srgb, white 65%, transparent)", color: "var(--muted)", border: "1px solid var(--line)" }}>
-            {fmtDur(dur)}
-          </span>
-        </div>
-        <div className="mt-0.5 text-[11px] tabular-nums" style={{ color: "var(--muted)" }}>
-          {fmtMin(item.startMin)} – {fmtMin(item.endMin)}
-          {status === "current" && <span className="ml-2 font-semibold" style={{ color: "var(--accent)" }}>Now</span>}
-        </div>
-        {status === "current" && (
-          <div className="mt-2 h-1 rounded-full overflow-hidden" style={{ background: "var(--pink-1)" }}>
-            <div className="h-full rounded-full transition-[width]" style={{ width: `${progress}%`, background: "var(--accent)" }} />
+            {item.locked && <span title="Locked" style={{ color: "var(--danger)" }}><LockGlyph /></span>}
+            {!tight && item.external && (
+              <span className="shrink-0 px-1.5 py-0.5 rounded-full text-[9px] font-medium uppercase tracking-wide"
+                style={{ background: "var(--pink-1)", color: "var(--accent)" }}>
+                Google
+              </span>
+            )}
+            {!tight && !item.external && item.anchor && (
+              <span className="shrink-0 px-1.5 py-0.5 rounded-full text-[9px] font-medium uppercase tracking-wide"
+                style={{ background: "var(--panel)", color: "var(--muted)" }}>
+                Anchor
+              </span>
+            )}
+            {!tight && (
+              <span className="shrink-0 px-2 py-0.5 rounded-full text-[10px] font-medium tabular-nums"
+                style={{ background: "color-mix(in srgb, white 65%, transparent)", color: "var(--muted)", border: "1px solid var(--line)" }}>
+                {fmtDur(dur)}
+              </span>
+            )}
           </div>
-        )}
+          {!tight && (
+            <div className="mt-0.5 text-[11px] tabular-nums truncate" style={{ color: "var(--muted)" }}>
+              {fmtMin(item.startMin)} – {fmtMin(item.endMin)}
+              {status === "current" && <span className="ml-2 font-semibold" style={{ color: "var(--accent)" }}>Now</span>}
+            </div>
+          )}
+          {status === "current" && roomy && (
+            <div className="mt-1.5 h-1 rounded-full overflow-hidden" style={{ background: "var(--pink-1)" }}>
+              <div className="h-full rounded-full transition-[width]" style={{ width: `${progress}%`, background: "var(--accent)" }} />
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
 }
 
-/** Free time between events, shown as a subtle dashed affordance. */
-function GapRow({ minutes, dim }: { minutes: number; dim: boolean }) {
+/** Pulsing current-time line, positioned by the same time → px mapping. */
+function NowLine({ nowMin }: { nowMin: number }) {
   return (
-    <div className="flex gap-3 py-0.5" style={{ opacity: dim ? 0.45 : 1 }}>
-      <span className="w-14 shrink-0" />
-      <span className="relative w-9 shrink-0 flex justify-center">
-        <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 border-l border-dashed" style={{ borderColor: "var(--line)" }} />
+    <div className="absolute flex items-center pointer-events-none" aria-label="Current time"
+      style={{ top: yOf(nowMin), left: 0, right: 0, height: 0, zIndex: 30 }}>
+      <span className="shrink-0 text-right text-[10px] font-semibold tabular-nums leading-none"
+        style={{
+          width: GUTTER_PX - 12, color: "#d95d5d", padding: "2px 0", borderRadius: 4,
+          background: "color-mix(in srgb, var(--bg) 92%, transparent)", // sits over the hour label
+        }}>
+        {fmtMin(nowMin)}
       </span>
-      <div className="flex-1 rounded-xl border border-dashed px-3.5 py-1.5 text-[11px]"
-        style={{ borderColor: "var(--line)", color: "var(--muted)", background: "color-mix(in srgb, var(--wash) 45%, transparent)" }}>
-        Free time · {fmtDur(minutes)}
-      </div>
+      <span className="now-dot shrink-0 w-2.5 h-2.5 rounded-full ml-1.5" style={{ background: "#d95d5d" }} />
+      <span className="flex-1 h-[2px] rounded-full" style={{ background: "#d95d5d", opacity: 0.85 }} />
     </div>
   );
 }
 
-/** Compact narration + accept/push strip; planning itself happens in the top-right command box. */
+/** Always-visible footer: why the engine shaped the day the way it did. */
+function NarrationFooter({ plan }: { plan: PlanView | null }) {
+  const text = firstSentences(plan?.plan?.narration, 2) || DOCTRINE_NARRATION;
+  return (
+    <div className="mt-5 rounded-2xl border px-4 py-3"
+      style={{
+        borderColor: "color-mix(in srgb, var(--line) 70%, transparent)",
+        background: "color-mix(in srgb, var(--wash) 60%, white)",
+      }}>
+      <div className="text-[10px] font-medium uppercase tracking-wide mb-1" style={{ color: "var(--accent)", opacity: 0.85 }}>
+        Why today looks like this
+      </div>
+      <p className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>{text}</p>
+    </div>
+  );
+}
+
+/** Accept/push strip; the narration itself now lives in NarrationFooter above. */
 function PlanControls({ plan, onChange }: { plan: PlanView | null; onChange: () => void }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
@@ -491,10 +585,7 @@ function PlanControls({ plan, onChange }: { plan: PlanView | null; onChange: () 
     setBusy(null);
   };
   return (
-    <div className="mt-5 rounded-2xl border bg-white p-4 shadow-sm" style={{ borderColor: "var(--line)" }}>
-      {plan.plan.narration && (
-        <p className="text-xs leading-relaxed mb-2" style={{ color: "var(--muted)" }}>{plan.plan.narration}</p>
-      )}
+    <div className="mt-3 rounded-2xl border bg-white p-4 shadow-sm" style={{ borderColor: "var(--line)" }}>
       {(plan.unplaced?.length ?? 0) > 0 && (
         <p className="text-xs mb-2" style={{ color: "var(--danger)" }}>
           Didn't fit: {plan.unplaced.map((u) => `${u.title} (${u.reason.replace(/_/g, " ")})`).join(", ")}

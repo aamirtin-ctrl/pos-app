@@ -37,6 +37,105 @@ export const FALLBACK_COLOR = { bg: "rgba(200,182,166,0.55)", fg: "#5b4636" };
 export const DAY_START_MIN = 6 * 60;
 export const DAY_END_MIN = 24 * 60;
 
+/* ── time-proportional day grid geometry ──
+   The center day is a real time grid: the full 24h is rendered and the
+   container scrolls, but 07:00–22:00 is the window scrolled into view. At
+   1.2 px/min those 15 hours are 1080px tall — a comfortable viewport — and the
+   whole 24h day is 1728px. Everything (cards, gridlines, now-line, free gaps)
+   derives its top/height from these two constants alone. */
+export const PX_PER_MIN = 1.2;
+export const GRID_START_MIN = 0;
+export const GRID_END_MIN = 24 * 60;
+/** Default visible window scrolled into view on mount / date change. */
+export const WINDOW_START_MIN = 7 * 60;
+export const WINDOW_END_MIN = 22 * 60;
+/** Left gutter holding the hour labels, in px. */
+export const GUTTER_PX = 54;
+/** Shortest card we will draw, so a 10-minute block stays readable. */
+export const MIN_CARD_PX = 26;
+
+/** Absolute offset (px from 00:00) of a minute-of-day on the grid. */
+export const yOf = (min: number) => (min - GRID_START_MIN) * PX_PER_MIN;
+
+/** Doctrine fallback when the engine produced no narration for the day. */
+export const DOCTRINE_NARRATION =
+  "Deep work sits in your 10am–noon peak; admin and comms cluster in the afternoon dip.";
+
+/** First `n` sentences of a narration, trimmed — keeps the footer to two lines. */
+export function firstSentences(text: string | null | undefined, n = 2): string {
+  const s = String(text ?? "").trim();
+  if (!s) return "";
+  const parts = s.match(/[^.!?]+[.!?]*/g);
+  if (!parts) return s;
+  return parts.slice(0, n).join(" ").replace(/\s+/g, " ").trim() || s;
+}
+
+/** An item placed into a horizontal lane so overlapping events sit side by side. */
+export type LaidOutItem = Item & { lane: number; span: number; lanes: number };
+
+// zero/negative-length items would break both overlap tests and the sweep below
+const endOf = (i: Item) => Math.max(i.endMin, i.startMin + 1);
+const overlaps = (a: Item, b: Item) => a.startMin < endOf(b) && b.startMin < endOf(a);
+
+/**
+ * Standard calendar lane packing. Items are swept in start order and grouped
+ * into clusters of transitively-overlapping events; inside a cluster each item
+ * takes the first lane whose previous occupant has already ended, then widens
+ * across any adjacent lanes that stay free for its whole span. Non-overlapping
+ * events end up in a one-lane cluster and keep the full width.
+ */
+export function layoutLanes(items: Item[]): LaidOutItem[] {
+  const sorted = [...items].sort((a, b) => a.startMin - b.startMin || endOf(b) - endOf(a));
+  const out: LaidOutItem[] = [];
+  let cluster: { item: Item; lane: number }[] = [];
+  let laneEnds: number[] = [];
+  let clusterEnd = -1;
+
+  const flush = () => {
+    if (cluster.length === 0) return;
+    const lanes = laneEnds.length;
+    for (const c of cluster) {
+      let span = 1;
+      // widen right while the next lane holds nothing overlapping this item
+      while (
+        c.lane + span < lanes &&
+        !cluster.some((o) => o !== c && o.lane === c.lane + span && overlaps(o.item, c.item))
+      ) span++;
+      out.push({ ...c.item, lane: c.lane, span, lanes });
+    }
+    cluster = [];
+    laneEnds = [];
+    clusterEnd = -1;
+  };
+
+  for (const it of sorted) {
+    if (cluster.length > 0 && it.startMin >= clusterEnd) flush(); // disjoint from the cluster so far
+    let lane = laneEnds.findIndex((e) => e <= it.startMin);
+    if (lane === -1) { lane = laneEnds.length; laneEnds.push(endOf(it)); }
+    else laneEnds[lane] = endOf(it);
+    cluster.push({ item: it, lane });
+    clusterEnd = Math.max(clusterEnd, endOf(it));
+  }
+  flush();
+  return out.sort((a, b) => a.startMin - b.startMin || a.lane - b.lane);
+}
+
+/**
+ * Empty stretches between busy time, from a merged sweep of the day's items
+ * (so overlapping events don't fake a gap). Only used to paint a faint dashed
+ * affordance in otherwise-empty grid space — never a row in a list.
+ */
+export function freeGaps(items: Item[], minMinutes = 25): { startMin: number; endMin: number }[] {
+  const sorted = [...items].sort((a, b) => a.startMin - b.startMin);
+  const gaps: { startMin: number; endMin: number }[] = [];
+  let cursor: number | null = null;
+  for (const it of sorted) {
+    if (cursor !== null && it.startMin - cursor >= minMinutes) gaps.push({ startMin: cursor, endMin: it.startMin });
+    cursor = cursor === null ? endOf(it) : Math.max(cursor, endOf(it));
+  }
+  return gaps;
+}
+
 export const todayISO = () => new Date().toISOString().slice(0, 10);
 export const addDaysISO = (iso: string, n: number) =>
   new Date(new Date(`${iso}T12:00:00`).getTime() + n * 86400000).toISOString().slice(0, 10);
@@ -44,6 +143,11 @@ export const minOf = (iso: string) => parseInt(iso.slice(11, 13), 10) * 60 + par
 export const fmtMin = (m: number) => {
   const h = Math.floor(m / 60) % 24, mm = m % 60;
   return `${((h + 11) % 12) + 1}:${String(mm).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`;
+};
+/** Compact hour-gutter label: 0 → "12 AM", 780 → "1 PM". */
+export const fmtHour = (m: number) => {
+  const h = Math.floor(m / 60) % 24;
+  return `${((h + 11) % 12) + 1} ${h < 12 ? "AM" : "PM"}`;
 };
 export const fmtDur = (m: number) =>
   m < 60 ? `${m} min` : m % 60 === 0 ? `${m / 60} hr` : `${Math.floor(m / 60)} hr ${m % 60} min`;
