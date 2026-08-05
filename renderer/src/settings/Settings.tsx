@@ -311,6 +311,10 @@ function MorningCaptureCard({
   const [saving, setSaving] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [digestEnabled, setDigestEnabled] = useState(false);
+  const [digestBusy, setDigestBusy] = useState<"send" | "preview" | null>(null);
+  const [digestMsg, setDigestMsg] = useState<string | null>(null);
+  const [digestPreview, setDigestPreview] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -319,6 +323,8 @@ function MorningCaptureCard({
         setHandles(r.data);
         setSavedHandles(r.data);
       }
+      const d = await window.pos.settings.get("digest_enabled");
+      if (d.ok) setDigestEnabled(d.data === "1");
       const a = await window.pos.mail.list();
       if (a.ok && Array.isArray(a.data)) setMailAccounts((a.data as unknown[]).length);
       setLoaded(true);
@@ -345,6 +351,44 @@ function MorningCaptureCard({
     else setMsg(str(d?.summary) ?? `Scanned — ${num(d?.ingested) ?? 0} new.`);
     setBusy(false);
     refetchSync();
+  };
+
+  const AUTOMATION_HINT =
+    "macOS blocked the send. System Settings > Privacy & Security > Automation: allow POS to control Messages.";
+
+  const toggleDigest = async () => {
+    const next = !digestEnabled;
+    setDigestMsg(null);
+    const r = await window.pos.settings.set("digest_enabled", next ? "1" : "0");
+    if (r.ok) setDigestEnabled(next);
+    else setDigestMsg(r.error ?? "could not save");
+  };
+
+  const sendDigestNow = async () => {
+    setDigestBusy("send");
+    setDigestMsg(null);
+    const r = await window.pos.digest.send();
+    if (!r.ok) {
+      setDigestMsg(r.error === "automation_denied" ? AUTOMATION_HINT : (r.error ?? "send failed"));
+    } else {
+      const d = r.data as { sent: boolean; items?: number; reason?: string; detail?: string };
+      if (d.sent) {
+        setDigestMsg(`Sent — ${d.items ?? 0} item${d.items === 1 ? "" : "s"} to confirm.`);
+      } else if (d.reason === "automation_denied") setDigestMsg(AUTOMATION_HINT);
+      else if (d.reason === "no_self_handle") setDigestMsg("Add your own phone/email handle above and save first.");
+      else if (d.reason === "disabled") setDigestMsg("Turn the digest on first.");
+      else setDigestMsg(`Send failed${d.detail ? `: ${d.detail}` : "."}`);
+    }
+    setDigestBusy(null);
+  };
+
+  const previewDigest = async () => {
+    setDigestBusy("preview");
+    setDigestMsg(null);
+    const r = await window.pos.digest.preview();
+    if (r.ok) setDigestPreview((r.data as { text?: string } | undefined)?.text ?? "");
+    else setDigestMsg(r.error ?? "preview failed");
+    setDigestBusy(null);
   };
 
   const status: IntegrationStatus =
@@ -393,6 +437,43 @@ function MorningCaptureCard({
       </button>
       <LastRunLine row={row} />
       {msg && <p className="text-xs mt-1" style={{ color: "var(--muted)" }}>{msg}</p>}
+      <div className="mt-4 pt-3 border-t" style={{ borderColor: "var(--line)" }}>
+        <div className="text-sm font-medium mb-1" style={{ color: "var(--ink)" }}>Morning digest</div>
+        <p className="text-xs mb-2" style={{ color: "var(--muted)" }}>
+          Texts your own iMessage thread ~15 min after wake; reply to confirm.
+        </p>
+        <label className="flex items-center gap-2 text-sm mb-2 no-drag" style={{ color: "var(--ink)" }}>
+          <input type="checkbox" checked={digestEnabled} onChange={toggleDigest} disabled={!loaded} />
+          Send a confirmation text each morning
+        </label>
+        <div className="flex gap-2">
+          <button
+            onClick={sendDigestNow}
+            disabled={digestBusy != null || !digestEnabled}
+            className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-40"
+            style={{ borderColor: "var(--line)" }}
+          >
+            {digestBusy === "send" ? "Sending…" : "Send now"}
+          </button>
+          <button
+            onClick={previewDigest}
+            disabled={digestBusy != null}
+            className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-40"
+            style={{ borderColor: "var(--line)" }}
+          >
+            {digestBusy === "preview" ? "Loading…" : "Preview"}
+          </button>
+        </div>
+        {digestMsg && <p className="text-xs mt-2" style={{ color: "var(--muted)" }}>{digestMsg}</p>}
+        {digestPreview != null && (
+          <pre
+            className="text-xs mt-2 p-2 rounded-md border whitespace-pre-wrap"
+            style={{ borderColor: "var(--line)", color: "var(--muted)", background: "var(--accent-soft, #f6f6f4)" }}
+          >
+            {digestPreview || "Nothing to preview."}
+          </pre>
+        )}
+      </div>
     </IntegrationCard>
   );
 }

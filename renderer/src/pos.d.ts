@@ -29,6 +29,7 @@ declare global {
         spend: Call; setCeiling: Call; get: Call; set: Call;
       };
       msgplans: { run: Call; list: Call };
+      digest: { send: Call; preview: Call };
       undo: { do: Call; redo: Call };
       worklog: { list: Call; add: Call; catchUp: Call };
       assistant: { command: Call };

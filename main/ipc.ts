@@ -31,6 +31,7 @@ import { generateDrafts, listDrafts, setDraftStatus, synthesizeVoices, getVoices
 import { listInbox, sendEmail, sendIMessage, personHandles, type SendEmailArgs, type SendIMessageArgs } from "./messaging.ts";
 import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learning.ts";
 import { runSync, syncStatus } from "./workers.ts";
+import { composeDigest, sendMorningDigest } from "./digest.ts";
 import { listMsgPlans } from "./msgplans.ts";
 import { listMailAccounts, addMailAccount, removeMailAccount, type MailProvider } from "./connectors/gmail.ts";
 import { saveDoctrine } from "./engine/doctrine.ts";
@@ -254,6 +255,12 @@ export function registerIpc(deps: IpcDeps) {
   // Manual trigger; the same connector also runs on the 15-min cron.
   h("msgplans.run", () => runSync(db, secrets, deps.llm(), "msgplans"));
   h("msgplans.list", () => listMsgPlans(db));
+
+  // ── morning digest ──
+  // Manual trigger for testing (`force` bypasses the once-per-day guard, never the
+  // digest_enabled gate) + a compose-only preview. The scheduled path lives in workers.ts.
+  h("digest.send", () => sendMorningDigest(db, secrets, { force: true }));
+  h("digest.preview", () => composeDigest(db));
 
   // ── unified inbox ──
   h("inbox.list", (opts?: { limit?: number }) => listInbox(db, opts ?? {}));

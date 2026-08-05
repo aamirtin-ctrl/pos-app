@@ -1,6 +1,8 @@
 // Morning capture — ingest the user's SELF-messages (note-to-self email + the iMessage
 // note-to-self thread) and route each through the unified assistant (handleCommand), which
 // turns braindumps into a generated day plan, notes into contact updates, etc.
+// Two exceptions (main/digest.ts): the app's OWN digests (prefix "POS — ") are skipped
+// outright, and confirm/drop replies to a digest route to handleDigestReply instead.
 //
 // Sources:
 //   - Email: for every configured mail account, INBOX messages whose From address is the
@@ -30,6 +32,7 @@ import { handleCommand } from "./assistant.ts";
 import { listMailAccounts, type MailAccount } from "./connectors/gmail.ts";
 import { getCursor, setCursor, type ConnectorDeps, type SyncReport } from "./connectors/common.ts";
 import { decodeAttributedBody, imessageAvailable, DEFAULT_CHAT_DB } from "./connectors/imessage.ts";
+import { isDigestMessage, isDigestReply, handleDigestReply } from "./digest.ts";
 
 const req: ReturnType<typeof createRequire> =
   typeof require === "function" ? require : createRequire(import.meta.url);
@@ -342,7 +345,7 @@ export async function captureFromIMessage(
  * ~/Library/Application Support/pos in main/index.ts); outside Electron (tests) fall
  * back to the same path via os.homedir.
  */
-function resolveDoctrineDir(): string {
+export function resolveDoctrineDir(): string {
   try {
     const electron = req("electron") as { app?: { getPath(name: string): string } };
     const p = electron.app?.getPath("userData");
@@ -377,9 +380,21 @@ export async function runCapture(deps: ConnectorDeps): Promise<SyncReport> {
   outer: for (const batch of batches) {
     report.skipped += batch.skipped;
     for (const m of batch.messages) {
+      // The app's own morning digests land in the same self thread — never re-ingest them.
+      if (isDigestMessage(m.text)) {
+        report.skipped++;
+        m.advance();
+        continue;
+      }
       try {
-        const res = await handleCommand(cmdDeps, m.text);
-        kinds.set(res.kind, (kinds.get(res.kind) ?? 0) + 1);
+        // Confirm/drop replies to the digest go to the reply handler, not the assistant.
+        if (isDigestReply(m.text)) {
+          await handleDigestReply(deps.db, deps.secrets, m.text);
+          kinds.set("digest-reply", (kinds.get("digest-reply") ?? 0) + 1);
+        } else {
+          const res = await handleCommand(cmdDeps, m.text);
+          kinds.set(res.kind, (kinds.get(res.kind) ?? 0) + 1);
+        }
         report.ingested++;
         m.advance(); // cursor moves only after successful processing
       } catch (e) {

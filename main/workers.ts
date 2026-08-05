@@ -19,7 +19,9 @@ import { syncImessage, imessageAvailable } from "./connectors/imessage.ts";
 import { syncLinkedin } from "./connectors/linkedin.ts";
 import { syncLinkedinEmail } from "./connectors/linkedin-email.ts";
 import { syncMailfile } from "./connectors/mailfile.ts";
-import { runCapture } from "./capture.ts";
+import { runCapture, resolveDoctrineDir } from "./capture.ts";
+import { sendMorningDigest, shouldSendDigest } from "./digest.ts";
+import { loadDoctrine } from "./engine/doctrine.ts";
 import { runMsgPlans } from "./msgplans.ts";
 import { syncNotion, notionConfigured } from "./notion.ts";
 import { getSetting, setSetting } from "./db/db.ts";
@@ -309,6 +311,23 @@ export function startWorkers(
       // writes error rows to sync_run.
       if (notionConfigured(db, secrets)) {
         announce(await runSync(db, secrets, llm, "notion"));
+      }
+      // Morning digest: once per day, from doctrine wake_time + 15 min on, gated on
+      // digest_enabled. Errors are contained here — a failed send never stops the tick.
+      try {
+        if (getSetting(db, "digest_enabled") === "1") {
+          const wake = loadDoctrine(resolveDoctrineDir()).chronotype.wake_time;
+          if (shouldSendDigest(db, wake)) {
+            const res = await sendMorningDigest(db, secrets);
+            if (res.sent) {
+              notify?.(`Morning digest sent — ${res.items} item${res.items === 1 ? "" : "s"} to confirm`);
+            } else if (res.reason === "automation_denied" || res.reason === "send_failed") {
+              console.warn(`workers: morning digest failed: ${res.reason}${res.detail ? ` (${res.detail})` : ""}`);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn(`workers: morning digest failed: ${(e as Error).message}`);
       }
       // Weekly worklog distillation: from Friday on, once per ISO week (the setting
       // key makes re-checks free; skipped silently without an LLM).
