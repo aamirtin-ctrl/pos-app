@@ -93,6 +93,7 @@ contextBridge.exposeInMainWorld("pos", {
   },
   msgplans: { run: call("msgplans.run"), list: call("msgplans.list") },
   digest: { send: call("digest.send"), preview: call("digest.preview") },
+  capture: { senders: call("capture.senders") },
   undo: { do: call("undo.do"), redo: call("undo.redo") },
   worklog: { list: call("worklog.list"), add: call("worklog.add"), catchUp: call("worklog.catchUp") },
   context: {

@@ -38,6 +38,7 @@ declare global {
       };
       msgplans: { run: Call; list: Call };
       digest: { send: Call; preview: Call };
+      capture: { senders: Call };
       undo: { do: Call; redo: Call };
       worklog: { list: Call; add: Call; catchUp: Call };
       context: { list: Call; set: Call; delete: Call; resolveDate: Call };

@@ -69,6 +69,7 @@ import {
 import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learning.ts";
 import { runSync, syncStatus } from "./workers.ts";
 import { composeDigest, sendMorningDigest } from "./digest.ts";
+import { recentInboxSenders } from "./capture.ts";
 import { listMsgPlans } from "./msgplans.ts";
 import { listMailAccounts, addMailAccount, removeMailAccount, addOAuthMailAccount, mailOAuthKey, type MailProvider } from "./connectors/gmail.ts";
 import { saveDoctrine } from "./engine/doctrine.ts";
@@ -403,6 +404,11 @@ export function registerIpc(deps: IpcDeps) {
   // digest_enabled gate) + a compose-only preview. The scheduled path lives in workers.ts.
   h("digest.send", () => sendMorningDigest(db, secrets, { force: true }));
   h("digest.preview", () => composeDigest(db));
+
+  // ── morning capture: third-party senders ──
+  // Discovery for the Settings allowlist ("which address does my Alexa routine mail from?").
+  // The allowlist itself is a plain setting — settings.get/set on `capture_allowed_senders`.
+  h("capture.senders", (limit?: number) => recentInboxSenders(db, secrets, limit ?? 15));
 
   // ── unified inbox ──
   h("inbox.list", (opts?: { limit?: number }) => listInbox(db, opts ?? {}));

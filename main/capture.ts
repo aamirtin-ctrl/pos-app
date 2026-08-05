@@ -6,7 +6,9 @@
 //
 // Sources:
 //   - Email: for every configured mail account, INBOX messages whose From address is the
-//     account's own address (self-addressed). Cursor = sync_state `capture:mail:<user>`
+//     account's own address (self-addressed) OR is listed in the setting
+//     `capture_allowed_senders` (third-party relays — an Alexa routine or IFTTT applet
+//     mailing a connected address). Cursor = sync_state `capture:mail:<user>`
 //     (ISO of the newest processed message). First run looks back 24h only.
 //   - iMessage: setting `capture_self_handles` (comma-separated phones/emails the user says
 //     are his own). Copy-first read of chat.db (same safety pattern as the imessage
@@ -17,6 +19,15 @@
 // Cursors advance ONLY after handleCommand succeeds for a message, so a failed run retries
 // the unprocessed tail next time and nothing is ever processed twice (strict > comparisons
 // on both cursors).
+//
+// Allowlisted senders (`capture_allowed_senders`) deliberately BYPASS the automated-sender
+// denylist (connectors/email-utils.isAutomatedSender): an Alexa/IFTTT relay mails from
+// exactly the kind of address that denylist exists to drop (no-reply@amazon.com,
+// action@ifttt.com). Nothing else about the pipeline changes for them — the "POS — " digest
+// skip, the confirm/drop reply routing, content-hash dedupe and cursor advancement all still
+// apply. Relay mail also gets one extra extraction rule: these senders put the spoken text
+// in the SUBJECT with an empty or boilerplate-only body, so an empty/near-empty body falls
+// back to the subject (see captureText).
 //
 // Cursors are not enough on their own (owner report 2026-08-05 (a): two self-texts landed
 // about four times). The same text genuinely arrives more than once — iMessage echoes the
@@ -65,6 +76,12 @@ interface SqliteModule {
 export const CAPTURE_MAX_CHARS = 1500;
 /** First-run lookback: last 24 hours only. */
 export const FIRST_RUN_MS = 24 * 60 * 60 * 1000;
+/** Setting key: comma-separated third-party senders allowed to feed capture. Empty by default. */
+export const ALLOWED_SENDERS_KEY = "capture_allowed_senders";
+/** Relay mail with a body shorter than this falls back to the subject line. */
+export const RELAY_BODY_MIN_CHARS = 5;
+/** Discovery helper lookback. */
+export const RECENT_SENDERS_DAYS = 3;
 
 const APPLE_EPOCH_MS = 978307200000; // 2001-01-01T00:00:00Z in Unix ms
 
@@ -76,6 +93,39 @@ export function isSelfAddress(addr: string | null | undefined, own: string | nul
   const a = normalizeEmail(addr);
   const b = normalizeEmail(own);
   return !!a && !!b && a.norm === b.norm;
+}
+
+/**
+ * Comma-separated `capture_allowed_senders` → set of normalized email addresses.
+ * Non-addresses are dropped silently (the field is free text in Settings).
+ */
+export function parseAllowedSenders(csv: string | null | undefined): Set<string> {
+  const out = new Set<string>();
+  for (const part of (csv ?? "").split(/[,\n]/)) {
+    const norm = normalizeEmail(part.trim())?.norm;
+    if (norm) out.add(norm);
+  }
+  return out;
+}
+
+/** How a message earned its way into capture — "allowed" senders get the relay treatment. */
+export type CaptureSenderKind = "self" | "allowed";
+
+/**
+ * Does this FROM address qualify the message as a capture, and how?
+ * "self" = the account's own address (the original rule). "allowed" = a third-party relay
+ * listed in `capture_allowed_senders`; that list intentionally OUTRANKS the automated-sender
+ * denylist, because Alexa/IFTTT mail is automated by design. null = ignore the message.
+ */
+export function captureSenderKind(
+  addr: string | null | undefined,
+  own: string | null | undefined,
+  allowed: Set<string>
+): CaptureSenderKind | null {
+  if (isSelfAddress(addr, own)) return "self";
+  const norm = normalizeEmail(addr)?.norm;
+  if (norm && allowed.has(norm)) return "allowed";
+  return null;
 }
 
 /** Comma-separated self handles → set of normalized forms (emails + E.164 phones). */
@@ -109,17 +159,61 @@ export function unixMsToAppleNs(unixMs: number): bigint {
   return BigInt(Math.max(0, Math.round(unixMs - APPLE_EPOCH_MS))) * 1_000_000n;
 }
 
+// Relay/signature boilerplate, matched against a TRIMMED line. Deliberately anchored and
+// narrow: dropping a line of the owner's actual braindump is far worse than leaving a
+// footer in, so only unambiguous machine-written lines are listed.
+const RELAY_BOILERPLATE: RegExp[] = [
+  /^sent from\b/i, // "Sent from my iPhone" / "Sent from your Alexa device"
+  /^sent (via|with|using)\b/i,
+  /^this (e-?mail|message) was sent by ifttt\b/i,
+  /^ifttt$/i,
+  /^https?:\/\/ifttt\.com\b/i,
+  /^this (e-?mail|message) was sent (from|to) an? (unmonitored|notification-only|no-?reply)/i,
+  /^(please )?do ?not ?reply\b/i,
+  /^(you are|you're) receiving this (e-?mail|message)\b/i,
+  /^to (unsubscribe|stop receiving|manage)\b/i,
+  /^unsubscribe\b/i,
+  /^amazon\.com,?\s+inc\b/i,
+  /^©/,
+  /^\(c\)\s*\d{4}/i,
+];
+
+/**
+ * Drop relay/signature boilerplate lines from a mail body. A line of only dashes is the
+ * conventional signature delimiter — it and everything after it go. Returns "" when nothing
+ * of substance survives.
+ */
+export function stripRelayBoilerplate(body: string | null | undefined): string {
+  const kept: string[] = [];
+  for (const line of (body ?? "").split(/\r?\n/)) {
+    const t = line.trim();
+    if (/^-{2,}$/.test(t)) break; // "-- " signature delimiter
+    if (RELAY_BOILERPLATE.some((re) => re.test(t))) continue;
+    kept.push(line);
+  }
+  return kept.join("\n").trim();
+}
+
 /**
  * Subject + body → the text handed to the assistant, capped at CAPTURE_MAX_CHARS.
- * Null when the body is empty (empty self-messages are skipped).
+ * Boilerplate lines are stripped first. Null when nothing usable is left.
+ *
+ * `subjectFallback` (relay mail only — see captureSenderKind "allowed"): Alexa routines and
+ * IFTTT applets carry the spoken text in the SUBJECT and leave the body empty or pure
+ * boilerplate, so a body under RELAY_BODY_MIN_CHARS yields the subject alone. Self-addressed
+ * mail keeps the original rule: an empty body means an empty message, which is skipped.
  */
 export function captureText(
   subject: string | null | undefined,
-  body: string | null | undefined
+  body: string | null | undefined,
+  opts: { subjectFallback?: boolean } = {}
 ): string | null {
-  const b = (body ?? "").trim();
-  if (!b) return null;
+  const b = stripRelayBoilerplate(body);
   const s = (subject ?? "").trim();
+  if (opts.subjectFallback && b.length < RELAY_BODY_MIN_CHARS) {
+    return s ? s.slice(0, CAPTURE_MAX_CHARS) : null;
+  }
+  if (!b) return null;
   return (s ? `${s}\n${b}` : b).slice(0, CAPTURE_MAX_CHARS);
 }
 
@@ -143,8 +237,91 @@ export interface CaptureBatch {
 
 const emptyBatch = (): CaptureBatch => ({ messages: [], skipped: 0, notes: [], errors: [] });
 
-/** One account's INBOX: self-addressed mail newer than the cursor. Appends into `batch`. */
-async function captureFromAccount(db: Db, account: MailAccount, batch: CaptureBatch): Promise<void> {
+/** An INBOX message reduced to what capture needs. */
+export interface RawMailMessage {
+  /** FROM address, unnormalized. */
+  from: string | null;
+  subject: string | null;
+  body: string | null;
+  /** internalDate (or the Date header) in Unix ms. */
+  timeMs: number;
+}
+
+export interface CaptureMailOpts {
+  /**
+   * Test seam (no network): return this account's INBOX messages at/after `since` sent by
+   * any of `senders`. Defaults to the IMAP reader below.
+   */
+  readInbox?: (account: MailAccount, since: Date, senders: string[]) => Promise<RawMailMessage[]>;
+}
+
+/** The real reader: one IMAP session per account, one SEARCH per candidate sender. */
+async function readInboxViaImap(
+  account: MailAccount,
+  since: Date,
+  senders: string[]
+): Promise<RawMailMessage[]> {
+  const client = new ImapFlow({
+    host: account.host,
+    port: account.port,
+    secure: true,
+    auth: { user: account.user.trim(), pass: account.password },
+    logger: false,
+    tls: imapTlsOptions(),
+  });
+
+  const out: RawMailMessage[] = [];
+  await client.connect();
+  try {
+    const lock = await client.getMailboxLock("INBOX");
+    try {
+      // IMAP FROM is a substring match and SINCE is day-granular — both are re-checked
+      // precisely per message by the caller. One SEARCH per sender (instead of fetching the
+      // whole window) keeps an allowlist from turning this into a full-inbox scan.
+      const uids = new Set<number>();
+      for (const from of senders) {
+        for (const uid of (await client.search({ since, from }, { uid: true })) || []) uids.add(uid);
+      }
+      if (uids.size) {
+        for await (const msg of client.fetch(
+          [...uids],
+          { uid: true, source: true, internalDate: true },
+          { uid: true }
+        )) {
+          const parsed = await simpleParser(msg.source as Buffer);
+          const fromAddr = Array.isArray(parsed.from)
+            ? parsed.from[0]?.value?.[0]
+            : parsed.from?.value?.[0];
+          out.push({
+            from: fromAddr?.address ?? null,
+            subject: parsed.subject ?? null,
+            body:
+              parsed.text ||
+              (typeof parsed.html === "string" ? parsed.html.replace(/<[^>]+>/g, " ") : ""),
+            timeMs: (msg.internalDate ? new Date(msg.internalDate) : parsed.date ?? new Date()).getTime(),
+          });
+        }
+      }
+    } finally {
+      lock.release();
+    }
+  } finally {
+    await client.logout();
+  }
+  return out;
+}
+
+/**
+ * One account's INBOX: self-addressed mail plus allowlisted relay mail, newer than the
+ * cursor. Appends into `batch`.
+ */
+async function captureFromAccount(
+  db: Db,
+  account: MailAccount,
+  allowed: Set<string>,
+  batch: CaptureBatch,
+  opts: CaptureMailOpts
+): Promise<void> {
   const user = account.user.trim();
   if (!user || !account.password) return;
 
@@ -153,61 +330,27 @@ async function captureFromAccount(db: Db, account: MailAccount, batch: CaptureBa
   const since = captureWindowStart(cursor);
   const cursorMs = cursor && !Number.isNaN(Date.parse(cursor)) ? Date.parse(cursor) : null;
 
-  const client = new ImapFlow({
-    host: account.host,
-    port: account.port,
-    secure: true,
-    auth: { user, pass: account.password },
-    logger: false,
-    tls: imapTlsOptions(),
-  });
+  const messages = await (opts.readInbox ?? readInboxViaImap)(account, since, [user, ...allowed]);
 
   const collected: { text: string; timeMs: number }[] = [];
-
-  await client.connect();
-  try {
-    const lock = await client.getMailboxLock("INBOX");
-    try {
-      // IMAP FROM is a substring match and SINCE is day-granular — both are re-checked
-      // precisely per message below.
-      const uids = (await client.search({ since, from: user }, { uid: true })) || [];
-      if (uids.length) {
-        for await (const msg of client.fetch(
-          uids,
-          { uid: true, source: true, internalDate: true },
-          { uid: true }
-        )) {
-          const parsed = await simpleParser(msg.source as Buffer);
-          const fromAddr = Array.isArray(parsed.from)
-            ? parsed.from[0]?.value?.[0]
-            : parsed.from?.value?.[0];
-          if (!isSelfAddress(fromAddr?.address, user)) {
-            batch.skipped++;
-            continue;
-          }
-          const timeMs = (msg.internalDate ? new Date(msg.internalDate) : parsed.date ?? new Date()).getTime();
-          // Strictly newer than the cursor (never process the same message twice) and
-          // inside the first-run window.
-          if ((cursorMs != null && timeMs <= cursorMs) || timeMs < since.getTime()) {
-            batch.skipped++;
-            continue;
-          }
-          const body =
-            parsed.text ||
-            (typeof parsed.html === "string" ? parsed.html.replace(/<[^>]+>/g, " ") : "");
-          const text = captureText(parsed.subject, body);
-          if (!text) {
-            batch.skipped++; // empty body — nothing to route
-            continue;
-          }
-          collected.push({ text, timeMs });
-        }
-      }
-    } finally {
-      lock.release();
+  for (const msg of messages) {
+    const kind = captureSenderKind(msg.from, user, allowed);
+    if (!kind) {
+      batch.skipped++; // neither self-addressed nor allowlisted
+      continue;
     }
-  } finally {
-    await client.logout();
+    // Strictly newer than the cursor (never process the same message twice) and
+    // inside the first-run window.
+    if ((cursorMs != null && msg.timeMs <= cursorMs) || msg.timeMs < since.getTime()) {
+      batch.skipped++;
+      continue;
+    }
+    const text = captureText(msg.subject, msg.body, { subjectFallback: kind === "allowed" });
+    if (!text) {
+      batch.skipped++; // nothing to route
+      continue;
+    }
+    collected.push({ text, timeMs: msg.timeMs });
   }
 
   collected.sort((a, b) => a.timeMs - b.timeMs);
@@ -220,22 +363,154 @@ async function captureFromAccount(db: Db, account: MailAccount, batch: CaptureBa
   }
 }
 
-/** Self-addressed INBOX mail across every configured account (per-account failures noted). */
-export async function captureFromEmail(deps: Pick<ConnectorDeps, "db" | "secrets">): Promise<CaptureBatch> {
+/**
+ * Self-addressed + allowlisted INBOX mail across every configured account (per-account
+ * failures noted).
+ */
+export async function captureFromEmail(
+  deps: Pick<ConnectorDeps, "db" | "secrets">,
+  opts: CaptureMailOpts = {}
+): Promise<CaptureBatch> {
   const batch = emptyBatch();
   const accounts = listMailAccounts(deps.secrets);
   if (accounts.length === 0) {
     batch.notes.push("mail: no accounts configured");
     return batch;
   }
+  const allowed = parseAllowedSenders(getSetting(deps.db, ALLOWED_SENDERS_KEY));
   for (const account of accounts) {
     try {
-      await captureFromAccount(deps.db, account, batch);
+      await captureFromAccount(deps.db, account, allowed, batch, opts);
     } catch (e) {
       batch.errors.push(`mail ${account.user}: ${(e as Error).message}`);
     }
   }
   return batch;
+}
+
+// ── discovery: who has been mailing this inbox lately ────────────────────────
+
+/** A distinct FROM address seen in a connected account's INBOX, for the Settings picker. */
+export interface InboxSender {
+  /** Normalized (lowercased, +tag stripped) — this is what goes in the allowlist. */
+  address: string;
+  /** Display name from the From header, when the sender set one. */
+  name: string | null;
+  /** One subject line from that sender, so the owner can recognize it. */
+  subject: string | null;
+  /** Messages seen from this address in the window. */
+  count: number;
+  /** Which connected account received them. */
+  account: string;
+}
+
+/** The whole scan runs on a UI click — it must never wedge the window. */
+const RECENT_SENDERS_TIMEOUT_MS = 15_000;
+/** Envelope fetches are cheap, but a busy inbox is still bounded. */
+const RECENT_SENDERS_MAX_SCAN = 300;
+
+/** Reject-after-timeout wrapper (the IMAP session is abandoned, nothing is written). */
+function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(message)), ms);
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
+/** One account's recent INBOX envelopes → one entry per message (aggregated by the caller). */
+async function accountInboxSenders(account: MailAccount, since: Date): Promise<InboxSender[]> {
+  const user = account.user.trim();
+  const client = new ImapFlow({
+    host: account.host,
+    port: account.port,
+    secure: true,
+    auth: { user, pass: account.password },
+    logger: false,
+    tls: imapTlsOptions(),
+  });
+
+  const out: InboxSender[] = [];
+  await client.connect();
+  try {
+    const lock = await client.getMailboxLock("INBOX");
+    try {
+      const uids = (await client.search({ since }, { uid: true })) || [];
+      const recent = uids.slice(-RECENT_SENDERS_MAX_SCAN);
+      if (recent.length) {
+        // Envelopes only — the discovery list never needs (or reads) message bodies.
+        for await (const msg of client.fetch(recent, { uid: true, envelope: true }, { uid: true })) {
+          const from = msg.envelope?.from?.[0];
+          const address = normalizeEmail(from?.address)?.norm;
+          if (!address) continue;
+          out.push({
+            address,
+            name: from?.name?.trim() || null,
+            subject: msg.envelope?.subject?.trim() || null,
+            count: 1,
+            account: user,
+          });
+        }
+      }
+    } finally {
+      lock.release();
+    }
+  } finally {
+    await client.logout();
+  }
+  return out;
+}
+
+/**
+ * Distinct FROM addresses seen in the connected accounts' INBOX over the last
+ * RECENT_SENDERS_DAYS days, most frequent first — the "which address does my Alexa routine
+ * actually mail from?" answer, so Settings can offer a one-click add.
+ *
+ * Addresses that are already handled are left out: an account's own address (self-capture
+ * covers it) and anything already in `capture_allowed_senders`. Each account is time-boxed
+ * and its failures are skipped, so one unreachable mailbox can't blank the list.
+ */
+export async function recentInboxSenders(
+  db: Db,
+  secrets: ConnectorDeps["secrets"],
+  limit = 15
+): Promise<InboxSender[]> {
+  const accounts = listMailAccounts(secrets).filter((a) => a.user.trim() && a.password);
+  if (accounts.length === 0) return [];
+
+  const since = new Date(Date.now() - RECENT_SENDERS_DAYS * 24 * 60 * 60 * 1000);
+  const own = new Set(
+    accounts.map((a) => normalizeEmail(a.user)?.norm).filter((x): x is string => !!x)
+  );
+  const already = parseAllowedSenders(getSetting(db, ALLOWED_SENDERS_KEY));
+
+  const byAddress = new Map<string, InboxSender>();
+  for (const account of accounts) {
+    let rows: InboxSender[];
+    try {
+      rows = await withTimeout(
+        accountInboxSenders(account, since),
+        RECENT_SENDERS_TIMEOUT_MS,
+        `mail ${account.user}: timed out`
+      );
+    } catch {
+      continue; // one unreachable/slow account must not blank the whole list
+    }
+    for (const row of rows) {
+      if (own.has(row.address) || already.has(row.address)) continue;
+      const prior = byAddress.get(row.address);
+      if (prior) {
+        prior.count++;
+        prior.name ??= row.name;
+        prior.subject ??= row.subject;
+      } else {
+        byAddress.set(row.address, { ...row });
+      }
+    }
+  }
+
+  return [...byAddress.values()]
+    .sort((a, b) => b.count - a.count || a.address.localeCompare(b.address))
+    .slice(0, Math.max(1, limit));
 }
 
 /** EPERM/EACCES/SQLite authorization failures → the Full Disk Access failure mode. */

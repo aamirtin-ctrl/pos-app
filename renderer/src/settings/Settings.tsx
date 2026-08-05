@@ -297,6 +297,25 @@ function Integrations() {
   );
 }
 
+/** A distinct recent INBOX sender offered as a one-click allowlist add (main/capture.ts). */
+type InboxSenderRow = {
+  address: string;
+  name: string | null;
+  subject: string | null;
+  count: number;
+  account: string;
+};
+
+/** `capture_allowed_senders` is stored as free text — parse leniently, save normalized. */
+const parseSenderCsv = (csv: string): string[] => {
+  const out: string[] = [];
+  for (const part of csv.split(",")) {
+    const a = part.trim().toLowerCase();
+    if (a.includes("@") && !out.includes(a)) out.push(a);
+  }
+  return out;
+};
+
 /** Morning capture: self-messages (note-to-self email / iMessage) → the unified assistant. */
 function MorningCaptureCard({
   row,
@@ -320,6 +339,11 @@ function MorningCaptureCard({
   const [digestBusy, setDigestBusy] = useState<"send" | "preview" | null>(null);
   const [digestMsg, setDigestMsg] = useState<string | null>(null);
   const [digestPreview, setDigestPreview] = useState<string | null>(null);
+  const [allowed, setAllowed] = useState<string[]>([]);
+  const [newSender, setNewSender] = useState("");
+  const [candidates, setCandidates] = useState<InboxSenderRow[] | null>(null);
+  const [sendersBusy, setSendersBusy] = useState(false);
+  const [sendersMsg, setSendersMsg] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -328,6 +352,8 @@ function MorningCaptureCard({
         setHandles(r.data);
         setSavedHandles(r.data);
       }
+      const s = await window.pos.settings.get("capture_allowed_senders");
+      if (s.ok && typeof s.data === "string") setAllowed(parseSenderCsv(s.data));
       const d = await window.pos.settings.get("digest_enabled");
       if (d.ok) setDigestEnabled(d.data === "1");
       const a = await window.pos.mail.list();
@@ -356,6 +382,45 @@ function MorningCaptureCard({
     else setMsg(str(d?.summary) ?? `Scanned — ${num(d?.ingested) ?? 0} new.`);
     setBusy(false);
     refetchSync();
+  };
+
+  // Allowlist of third-party senders (Alexa routines, IFTTT applets) whose mail also feeds
+  // capture. Stored as one comma-separated setting; every edit writes the whole list.
+  const saveAllowed = async (next: string[]) => {
+    setSendersMsg(null);
+    const r = await window.pos.settings.set("capture_allowed_senders", next.join(", "));
+    if (r.ok) setAllowed(next);
+    else setSendersMsg(r.error ?? "could not save");
+  };
+
+  const addSender = async (raw: string) => {
+    const addr = raw.trim().toLowerCase();
+    if (!addr.includes("@")) {
+      setSendersMsg("Enter an email address.");
+      return;
+    }
+    if (allowed.includes(addr)) {
+      setNewSender("");
+      return;
+    }
+    await saveAllowed([...allowed, addr]);
+    setNewSender("");
+  };
+
+  const removeSender = (addr: string) => saveAllowed(allowed.filter((a) => a !== addr));
+
+  const loadSenders = async () => {
+    setSendersBusy(true);
+    setSendersMsg(null);
+    const r = await window.pos.capture.senders();
+    if (r.ok && Array.isArray(r.data)) {
+      const rows = r.data as InboxSenderRow[];
+      setCandidates(rows);
+      if (rows.length === 0) setSendersMsg("No other senders in the last 3 days.");
+    } else {
+      setSendersMsg(r.error ?? "could not read recent senders");
+    }
+    setSendersBusy(false);
   };
 
   const AUTOMATION_HINT =
@@ -442,6 +507,97 @@ function MorningCaptureCard({
       </button>
       <LastRunLine row={row} />
       {msg && <p className="text-xs mt-1" style={{ color: "var(--muted)" }}>{msg}</p>}
+      <div className="mt-4 pt-3 border-t" style={{ borderColor: "var(--line)" }}>
+        <div className="text-sm font-medium mb-1" style={{ color: "var(--ink)" }}>
+          Capture from these senders
+        </div>
+        <p className="text-xs mb-2" style={{ color: "var(--muted)" }}>
+          Voice assistants: point an Alexa routine (or IFTTT applet) at one of your connected
+          email addresses, then add the sender it arrives from here. What you say becomes tasks,
+          events, and notes.
+        </p>
+        {allowed.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mb-2">
+            {allowed.map((a) => (
+              <span
+                key={a}
+                className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border"
+                style={{ borderColor: "var(--line)", color: "var(--ink)" }}
+              >
+                {a}
+                <button
+                  onClick={() => removeSender(a)}
+                  aria-label={`Remove ${a}`}
+                  className="leading-none"
+                  style={{ color: "var(--muted)" }}
+                >
+                  &times;
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
+        <div className="flex gap-2 mb-2">
+          <input
+            type="text"
+            value={newSender}
+            onChange={(e) => setNewSender(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") addSender(newSender); }}
+            disabled={!loaded}
+            placeholder="alexa@amazon.com"
+            className="flex-1 border rounded-md px-2 py-1 text-sm bg-white"
+            style={{ borderColor: "var(--line)" }}
+          />
+          <button
+            onClick={() => addSender(newSender)}
+            disabled={!loaded || !newSender.trim()}
+            className="px-3 py-1 rounded-md text-sm border bg-white disabled:opacity-40"
+            style={{ borderColor: "var(--line)" }}
+          >
+            Add
+          </button>
+        </div>
+        <button
+          onClick={loadSenders}
+          disabled={sendersBusy}
+          className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-40"
+          style={{ borderColor: "var(--line)" }}
+        >
+          {sendersBusy ? "Reading…" : "Show recent senders"}
+        </button>
+        {candidates && candidates.length > 0 && (
+          <ul className="mt-2 space-y-1">
+            {candidates
+              .filter((c) => !allowed.includes(c.address))
+              .map((c) => (
+                <li
+                  key={`${c.account}:${c.address}`}
+                  className="flex items-center gap-2 text-xs border rounded-md px-2 py-1"
+                  style={{ borderColor: "var(--line)" }}
+                >
+                  <span className="flex-1 min-w-0">
+                    <span className="block truncate" style={{ color: "var(--ink)" }}>
+                      {c.name ? `${c.name} — ${c.address}` : c.address}
+                    </span>
+                    {c.subject && (
+                      <span className="block truncate" style={{ color: "var(--muted)" }}>
+                        {c.subject}
+                      </span>
+                    )}
+                  </span>
+                  <button
+                    onClick={() => addSender(c.address)}
+                    className="px-2 py-0.5 rounded-md border bg-white shrink-0"
+                    style={{ borderColor: "var(--line)" }}
+                  >
+                    Add
+                  </button>
+                </li>
+              ))}
+          </ul>
+        )}
+        {sendersMsg && <p className="text-xs mt-2" style={{ color: "var(--muted)" }}>{sendersMsg}</p>}
+      </div>
       <div className="mt-4 pt-3 border-t" style={{ borderColor: "var(--line)" }}>
         <div className="text-sm font-medium mb-1" style={{ color: "var(--ink)" }}>Morning digest</div>
         <p className="text-xs mb-2" style={{ color: "var(--muted)" }}>
