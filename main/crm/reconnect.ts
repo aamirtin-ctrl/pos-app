@@ -82,3 +82,50 @@ export function reconnectDue(db: Db, now: Date = new Date()): ReconnectRow[] {
     groups: group_names ? group_names.split(GROUP_SEP).sort() : [],
   }));
 }
+
+// ── Dismiss / snooze (gap #22; PersonalCRM2 app/api/dismiss + lib/dashboard addDismissal) ──
+
+export type DismissKind = "stale" | "followup" | "linkedin" | "datagap";
+
+export interface Dismissal {
+  id: number;
+  person_id: number;
+  kind: DismissKind;
+  /** NULL = dismissed indefinitely; otherwise the moment the row stops suppressing. */
+  snooze_until: string | null;
+}
+
+/**
+ * Hide one person from a suggestion list. `snoozeDays` omitted/null → dismissed
+ * indefinitely; a positive number snoozes until now + N days, after which
+ * reconnectDue surfaces them again. One live dismissal per (person, kind): an
+ * earlier one is replaced, so "Snooze 30d" after "Dismiss" really does un-bury them.
+ */
+export function dismissPerson(
+  db: Db,
+  personId: number,
+  kind: DismissKind = "stale",
+  snoozeDays?: number | null,
+  now: Date = new Date()
+): Dismissal {
+  const days = typeof snoozeDays === "number" && snoozeDays > 0 ? snoozeDays : null;
+  const snoozeUntil =
+    days === null
+      ? null
+      : new Date(now.getTime() + days * 86_400_000).toISOString().replace("T", " ").slice(0, 19);
+
+  const run = db.transaction(() => {
+    db.prepare("DELETE FROM dismissal WHERE person_id = ? AND kind = ?").run(personId, kind);
+    const res = db
+      .prepare("INSERT INTO dismissal (person_id, kind, snooze_until) VALUES (?, ?, ?)")
+      .run(personId, kind, snoozeUntil);
+    return Number(res.lastInsertRowid);
+  });
+  const id = run();
+  return { id, person_id: personId, kind, snooze_until: snoozeUntil };
+}
+
+/** Clear any dismissal of this kind — the "un-snooze" path. Returns rows removed. */
+export function undismissPerson(db: Db, personId: number, kind: DismissKind = "stale"): number {
+  return db.prepare("DELETE FROM dismissal WHERE person_id = ? AND kind = ?").run(personId, kind).changes;
+}

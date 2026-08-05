@@ -1,8 +1,36 @@
 import { useCallback, useEffect, useState } from "react";
 
-// Contact detail: identity header (tier is editable in place), profile text the
-// user owns (bio / relationship summary), sidecars (tags, groups, aliases),
-// interaction timeline, and this person's open commitments.
+// Contact detail: identity header (tier is editable in place), reach-out buttons,
+// profile text the user owns (bio / relationship summary), sidecars (tags, groups,
+// aliases), interaction timeline, and this person's open commitments.
+//
+// Saving the profile text goes through people.patchWithExtract: an "I just met them"
+// checkbox bumps last contact to now, and a changed bio is mined for a next action
+// (LLM fast tier, deterministic fallback) that surfaces here as a follow-up banner.
+
+type ReachLink = {
+  kind: "email" | "call" | "sms" | "linkedin";
+  label: string;
+  value: string;
+  href: string;
+};
+
+type DetectedFollowUp = {
+  commitment_id: number;
+  description: string;
+  due_at: string | null;
+  source: "llm" | "deterministic";
+  created: boolean;
+};
+
+type SaveOutcome = {
+  patched: boolean;
+  metToday: boolean;
+  roleFilled: string | null;
+  tagsAdded: string[];
+  lastDiscussed: string | null;
+  detectedFollowUp: DetectedFollowUp | null;
+};
 
 type PersonDetail = {
   id: number;
@@ -21,6 +49,7 @@ type PersonDetail = {
   tags: string[];
   groups: string[];
   aliases: { id: number; kind: string; value: string; is_primary: number }[];
+  reachout: ReachLink[];
   interactions: {
     id: number;
     channel: string;
@@ -57,6 +86,9 @@ export default function ContactDetail({ id }: { id: number }) {
   const [saving, setSaving] = useState(false);
   const [newGroup, setNewGroup] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // "I just met them" (gap #10) + the post-save extraction banner (gap #11).
+  const [metToday, setMetToday] = useState(false);
+  const [saveOutcome, setSaveOutcome] = useState<SaveOutcome | null>(null);
   // "Catch-up update": worklog-backed "since we last talked" paragraph, in the
   // user's own channel voice (deterministic bullet fallback without an LLM key).
   const [catchUp, setCatchUp] = useState<string | null>(null);
@@ -83,9 +115,30 @@ export default function ContactDetail({ id }: { id: number }) {
     await refetch();
   };
 
+  /**
+   * Save the profile text. The bio change drives the extraction (role / tags / next
+   * action); "I just met them" bumps last contact. Anything the backend derived comes
+   * back in one payload and is shown as a banner instead of silently happening.
+   */
   const saveText = async () => {
     setSaving(true);
-    await patch({ bio: bio || null, relationship_summary: summary || null });
+    setError(null);
+    setSaveOutcome(null);
+    const r = await window.pos.people.patchWithExtract(
+      id,
+      { bio: bio || null, relationship_summary: summary || null },
+      { metToday }
+    );
+    if (r.ok) {
+      const out = r.data as SaveOutcome;
+      if (out.detectedFollowUp || out.roleFilled || out.tagsAdded.length > 0 || out.metToday) {
+        setSaveOutcome(out);
+      }
+      setMetToday(false);
+    } else {
+      setError(r.error ?? "save failed");
+    }
+    await refetch();
     setSaving(false);
   };
 
@@ -169,6 +222,24 @@ export default function ContactDetail({ id }: { id: number }) {
           {catchUpBusy ? "Writing…" : "Catch-up update"}
         </button>
       </div>
+      {/* ── Reach-out (gap #17): mailto / tel / sms / LinkedIn from the aliases ── */}
+      {person.reachout.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 mb-4">
+          {person.reachout.map((l) => (
+            <a
+              key={l.href}
+              href={l.href}
+              title={l.value}
+              {...(l.kind === "linkedin" ? { target: "_blank", rel: "noreferrer" } : {})}
+              className="text-[11px] px-2 py-0.5 rounded-full border bg-white hover:shadow-sm transition-[background-color,transform] duration-[120ms] active:scale-95"
+              style={{ borderColor: "var(--line)", color: "var(--accent)" }}
+            >
+              {l.label}
+            </a>
+          ))}
+        </div>
+      )}
+
       {catchUp !== null && (
         <div className="mb-5 rounded-lg border p-3" style={{ borderColor: "var(--accent-soft)", background: "var(--wash)" }}>
           <div className="flex items-center justify-between mb-1.5">
@@ -266,15 +337,65 @@ export default function ContactDetail({ id }: { id: number }) {
           />
         </label>
       </div>
-      {dirty && (
+      <div className="flex items-center gap-3 mb-5">
         <button
           onClick={saveText}
-          disabled={saving}
-          className="mb-5 px-3 py-1.5 rounded-md text-sm text-white disabled:opacity-50"
+          disabled={saving || (!dirty && !metToday)}
+          className="px-3 py-1.5 rounded-md text-sm text-white disabled:opacity-50"
           style={{ background: "var(--accent)" }}
         >
           {saving ? "Saving…" : "Save"}
         </button>
+        <label className="flex items-center gap-1.5 text-xs cursor-pointer" style={{ color: "var(--muted)" }}>
+          <input
+            type="checkbox"
+            checked={metToday}
+            onChange={(e) => setMetToday(e.target.checked)}
+            className="accent-[var(--accent)]"
+          />
+          I just met them
+        </label>
+      </div>
+
+      {/* ── What the save derived (gap #11): follow-up, role, tags, contact bump ── */}
+      {saveOutcome && (
+        <div
+          className="mb-5 rounded-lg border p-3 text-sm"
+          style={{ borderColor: "var(--accent-soft)", background: "var(--wash)" }}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              {saveOutcome.detectedFollowUp && (
+                <div className="leading-snug">
+                  <span className="font-medium">
+                    {saveOutcome.detectedFollowUp.created ? "Follow-up tracked" : "Already tracked"}:
+                  </span>{" "}
+                  {saveOutcome.detectedFollowUp.description}
+                  {saveOutcome.detectedFollowUp.due_at && (
+                    <span style={{ color: "var(--muted)" }}> · due {saveOutcome.detectedFollowUp.due_at}</span>
+                  )}
+                </div>
+              )}
+              <div className="text-xs mt-0.5" style={{ color: "var(--muted)" }}>
+                {[
+                  saveOutcome.metToday ? "Last contact set to today" : null,
+                  saveOutcome.roleFilled ? `Role set to "${saveOutcome.roleFilled}"` : null,
+                  saveOutcome.tagsAdded.length ? `Tags added: ${saveOutcome.tagsAdded.join(", ")}` : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </div>
+            </div>
+            <button
+              onClick={() => setSaveOutcome(null)}
+              title="Dismiss"
+              className="text-xs leading-none hover:opacity-70 shrink-0"
+              style={{ color: "var(--muted)" }}
+            >
+              ×
+            </button>
+          </div>
+        </div>
       )}
 
       {/* ── Open commitments ── */}

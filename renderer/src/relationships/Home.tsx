@@ -39,6 +39,8 @@ type CommitmentRow = {
 
 type PersonLite = { id: number; display_name: string; freshness_days: number | null };
 
+type GroupRow = { id: number; name: string; suppress_follow_ups: number };
+
 const TIER_LABELS = ["Inner", "Active", "Network", "Archive"] as const;
 const tierLabel = (t: number) => TIER_LABELS[t] ?? `Tier ${t}`;
 
@@ -60,32 +62,62 @@ function SectionHead({ title, count }: { title: string; count?: number }) {
   );
 }
 
-/** Horizontal chip row for group filtering. `null` value = the "All" chip. */
+/**
+ * Horizontal chip row for group filtering. `null` value = the "All" chip.
+ *
+ * When `onToggleMute` is supplied (the Reconnect panel), each named chip also carries a
+ * follow-up mute control: muted groups show a persistent "muted" pill, unmuted ones reveal
+ * "mute" on hover. Callers that only filter (Contacts) pass neither prop and see no change.
+ */
 export function GroupChips({
   groups,
   active,
   onPick,
+  muted,
+  onToggleMute,
 }: {
   groups: string[];
   active: string | null;
   onPick: (g: string | null) => void;
+  muted?: Set<string>;
+  onToggleMute?: (group: string, next: boolean) => void;
 }) {
   if (groups.length === 0) return null;
   const chip = (label: string, value: string | null) => {
     const selected = active === value;
+    const isMuted = value !== null && !!muted?.has(value);
+    const skin = selected
+      ? { background: "var(--accent)", borderColor: "var(--accent)", color: "white" }
+      : { background: "white", borderColor: "var(--line)", color: "var(--muted)" };
     return (
-      <button
+      <span
         key={value ?? "__all"}
-        onClick={() => onPick(value)}
-        className="px-2.5 py-0.5 rounded-full border text-[11px] whitespace-nowrap shrink-0 transition-[background-color,color,transform] duration-[120ms] hover:scale-105 active:scale-95"
-        style={
-          selected
-            ? { background: "var(--accent)", borderColor: "var(--accent)", color: "white" }
-            : { background: "white", borderColor: "var(--line)", color: "var(--muted)" }
-        }
+        className="group inline-flex items-center gap-1 pl-2.5 pr-2 py-0.5 rounded-full border text-[11px] whitespace-nowrap shrink-0 transition-[background-color,color,transform] duration-[120ms] hover:scale-105"
+        style={{ ...skin, opacity: isMuted && !selected ? 0.7 : 1 }}
       >
-        {label}
-      </button>
+        <button onClick={() => onPick(value)} className="active:scale-95" style={{ color: "inherit" }}>
+          {label}
+        </button>
+        {onToggleMute && value !== null && (
+          <button
+            onClick={() => onToggleMute(value, !isMuted)}
+            title={
+              isMuted
+                ? `Follow-ups are muted for ${value} — click to re-enable`
+                : `Mute follow-ups for ${value}`
+            }
+            className={`text-[10px] leading-none px-1 py-0.5 rounded-full border ${
+              isMuted ? "" : "opacity-0 group-hover:opacity-100 transition-opacity duration-[120ms]"
+            }`}
+            style={{
+              borderColor: selected ? "rgba(255,255,255,0.6)" : "var(--line)",
+              color: selected ? "white" : isMuted ? "var(--danger)" : "var(--muted)",
+            }}
+          >
+            {isMuted ? "muted" : "mute"}
+          </button>
+        )}
+      </span>
     );
   };
   return (
@@ -106,18 +138,28 @@ export default function Home() {
   const [commitments, setCommitments] = useState<CommitmentRow[]>([]);
   const [peopleById, setPeopleById] = useState<Map<number, PersonLite>>(new Map());
   const [groupFilter, setGroupFilter] = useState<string | null>(null);
+  // Groups whose follow-ups are muted (grp.suppress_follow_ups) — their members never
+  // appear in `reconnect`, so the chips have to come from the group list itself.
+  const [mutedGroups, setMutedGroups] = useState<string[]>([]);
+  const [snoozeFor, setSnoozeFor] = useState<number | null>(null);
 
   const refetch = useCallback(async () => {
-    const [rec, com, ppl] = await Promise.all([
+    const [rec, com, ppl, grp] = await Promise.all([
       window.pos.people.reconnect(),
       window.pos.commitments.list("open"),
       window.pos.people.list(),
+      window.pos.groups.list(),
     ]);
     setReconnect(rec.ok ? (rec.data as ReconnectRow[]) : []);
     setCommitments(com.ok ? (com.data as CommitmentRow[]) : []);
     if (ppl.ok) {
       setPeopleById(new Map((ppl.data as PersonLite[]).map((p) => [p.id, p])));
     }
+    setMutedGroups(
+      grp.ok
+        ? (grp.data as GroupRow[]).filter((g) => g.suppress_follow_ups === 1).map((g) => g.name)
+        : []
+    );
   }, []);
   useEffect(() => { refetch(); }, [refetch]);
 
@@ -155,15 +197,29 @@ export default function Home() {
     }
   };
 
-  // group chips over the reconnect list — names come from the rows themselves
+  // Group chips over the reconnect list: names from the rows themselves, plus the muted
+  // groups (whose members are filtered out upstream) so they can be un-muted from here.
+  const mutedSet = useMemo(() => new Set(mutedGroups), [mutedGroups]);
   const reconnectGroups = useMemo(
-    () => Array.from(new Set(reconnect.flatMap((r) => r.groups ?? []))).sort(),
-    [reconnect]
+    () => Array.from(new Set([...reconnect.flatMap((r) => r.groups ?? []), ...mutedGroups])).sort(),
+    [reconnect, mutedGroups]
   );
   const activeFilter = groupFilter && reconnectGroups.includes(groupFilter) ? groupFilter : null;
   const reconnectShown = activeFilter
     ? reconnect.filter((r) => (r.groups ?? []).includes(activeFilter))
     : reconnect;
+
+  const toggleMute = async (group: string, next: boolean) => {
+    await window.pos.groups.suppressFollowUps(group, next);
+    await refetch();
+  };
+
+  /** days = null → dismissed indefinitely. */
+  const snooze = async (personId: number, days: number | null) => {
+    setSnoozeFor(null);
+    await window.pos.people.dismissReconnect(personId, days);
+    await refetch();
+  };
 
   return (
     <div className="p-6 max-w-4xl mx-auto">
@@ -177,21 +233,32 @@ export default function Home() {
         {/* ── Reconnect ── */}
         <section>
           <SectionHead title="Reconnect" count={reconnectShown.length} />
-          <GroupChips groups={reconnectGroups} active={activeFilter} onPick={setGroupFilter} />
+          <GroupChips
+            groups={reconnectGroups}
+            active={activeFilter}
+            onPick={setGroupFilter}
+            muted={mutedSet}
+            onToggleMute={toggleMute}
+          />
           {reconnectShown.length === 0 ? (
             <p className="text-sm py-2" style={{ color: "var(--muted)" }}>
-              {activeFilter ? "Nobody overdue in this group." : "Nobody is overdue. Nice."}
+              {activeFilter && mutedSet.has(activeFilter)
+                ? "Follow-ups are muted for this group."
+                : activeFilter
+                  ? "Nobody overdue in this group."
+                  : "Nobody is overdue. Nice."}
             </p>
           ) : (
             <div className="space-y-0.5">
               {reconnectShown.map((r) => (
-                <a
+                <div
                   key={r.id}
-                  href={`#/contact/${r.id}`}
-                  className="flex items-center gap-3 rounded-md px-2 py-1.5 text-sm hover:bg-white transition-[background-color,transform] duration-[120ms] hover:scale-[1.01] active:scale-[0.99]"
+                  className="group flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-white transition-[background-color] duration-[120ms]"
                   style={{ color: "var(--ink)" }}
                 >
-                  <span className="flex-1 truncate">{r.display_name}</span>
+                  <a href={`#/contact/${r.id}`} className="flex-1 truncate" style={{ color: "var(--ink)" }}>
+                    {r.display_name}
+                  </a>
                   <span
                     className="text-[11px] px-1.5 py-0.5 rounded-full border shrink-0"
                     style={{ borderColor: "var(--line)", color: "var(--muted)" }}
@@ -201,7 +268,55 @@ export default function Home() {
                   <span className="text-xs tabular-nums shrink-0" style={{ color: "var(--danger)" }}>
                     {r.overdue_days}d over
                   </span>
-                </a>
+                  {/* Snooze / dismiss (gap #22): hidden until the row is hovered or opened. */}
+                  <span
+                    className={`flex gap-1 shrink-0 ${
+                      snoozeFor === r.id ? "" : "opacity-0 group-hover:opacity-100 transition-opacity duration-[120ms]"
+                    }`}
+                  >
+                    {snoozeFor === r.id ? (
+                      <>
+                        <button
+                          onClick={() => snooze(r.id, 30)}
+                          className="text-[11px] px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
+                          style={{ borderColor: "var(--line)", color: "var(--accent)" }}
+                        >
+                          30d
+                        </button>
+                        <button
+                          onClick={() => snooze(r.id, 90)}
+                          className="text-[11px] px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
+                          style={{ borderColor: "var(--line)", color: "var(--accent)" }}
+                        >
+                          90d
+                        </button>
+                        <button
+                          onClick={() => snooze(r.id, null)}
+                          title="Hide indefinitely"
+                          className="text-[11px] px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
+                          style={{ borderColor: "var(--line)", color: "var(--danger)" }}
+                        >
+                          Dismiss
+                        </button>
+                        <button
+                          onClick={() => setSnoozeFor(null)}
+                          className="text-[11px] px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
+                          style={{ borderColor: "var(--line)", color: "var(--muted)" }}
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        onClick={() => setSnoozeFor(r.id)}
+                        className="text-[11px] px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
+                        style={{ borderColor: "var(--line)", color: "var(--muted)" }}
+                      >
+                        Snooze
+                      </button>
+                    )}
+                  </span>
+                </div>
               ))}
             </div>
           )}

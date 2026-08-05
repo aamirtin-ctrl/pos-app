@@ -7,9 +7,36 @@ import { getSetting, setSetting, hasVec } from "./db/db.ts";
 import { SecretStore, SECRET_NAMES } from "./secrets.ts";
 import { LlmClient } from "./llm/provider.ts";
 import { monthSpend, getCeiling, setCeiling } from "./llm/meter.ts";
-import { listPeople, getPerson, patchPerson, mergePeople, deletePerson } from "./crm/people.ts";
+import {
+  listPeople,
+  getPerson,
+  patchPerson,
+  patchPersonWithExtract,
+  mergePeople,
+  deletePerson,
+  type PatchExtractOpts,
+} from "./crm/people.ts";
+import {
+  listGroups,
+  createGroup,
+  renameGroup,
+  deleteGroup,
+  setHidden,
+  setHideContacts,
+  setSuppressFollowUps,
+  assignToGroup,
+  removeFromGroup,
+  hiddenPersonIds,
+} from "./crm/groups.ts";
+import { exportContactsCsv, defaultCsvFilename } from "./crm/export.ts";
 import { rank } from "./crm/ranking.ts";
-import { reconnectDue, refreshNextTouch } from "./crm/reconnect.ts";
+import {
+  reconnectDue,
+  refreshNextTouch,
+  dismissPerson,
+  undismissPerson,
+  type DismissKind,
+} from "./crm/reconnect.ts";
 import { listCommitments, confirmCommitment } from "./crm/commitments.ts";
 import {
   journal,
@@ -87,9 +114,23 @@ export function registerIpc(deps: IpcDeps) {
     });
 
   // ── people / relationships ──
-  h("people.list", (q?: string) => listPeople(db, q));
+  // Hide-with-contacts (#5) is enforced HERE rather than inside listPeople: crm/people.ts
+  // stays a pure query layer with no knowledge of group policy, and crm/groups.ts stays
+  // free of a people.ts dependency. The composition lives at the one boundary both cross.
+  h("people.list", (q?: string) => {
+    const archived = hiddenPersonIds(db);
+    const rows = listPeople(db, q);
+    return archived.size === 0 ? rows : rows.filter((p) => !archived.has(p.id));
+  });
   h("people.get", (id: number) => getPerson(db, id));
   h("people.patch", (id: number, fields: Record<string, unknown>) => patchPerson(db, id, fields));
+  // About-save with intelligence (#10/#11): same whitelist patch, plus the "I just met
+  // them" contact bump and — when the bio changed — a fast-tier extraction (role / tags /
+  // next action) that degrades to the deterministic cue scan. The detected follow-up comes
+  // back as a real commitment for the ContactDetail banner.
+  h("people.patchWithExtract", (id: number, fields: Record<string, unknown>, opts?: PatchExtractOpts) =>
+    patchPersonWithExtract(db, deps.llm(), id, fields, opts ?? {})
+  );
   h("people.merge", (ids: number[]) => mergePeople(db, ids));
   // Quick-delete from Messaging/Contacts: hard-removes the person; aliases,
   // interactions and drafts cascade, commitments/tasks keep rows with refs nulled.
@@ -98,31 +139,47 @@ export function registerIpc(deps: IpcDeps) {
     refreshNextTouch(db);
     return reconnectDue(db);
   });
+  // Reconnect row → Snooze 30d / 90d / Dismiss (#22). snoozeDays omitted = indefinite;
+  // reconnectDue already skips anyone with a live dismissal of this kind.
+  h("people.dismissReconnect", (personId: number, snoozeDays?: number | null, kind?: DismissKind) =>
+    dismissPerson(db, personId, kind ?? "stale", snoozeDays ?? null)
+  );
+  h("people.undismissReconnect", (personId: number, kind?: DismissKind) => ({
+    cleared: undismissPerson(db, personId, kind ?? "stale"),
+  }));
   h("query.rank", async (inquiry: string) =>
     rank(db, deps.llm(), inquiry, { embedQuery: (hasVec() && makeQueryEmbedder(db, secrets)) || undefined })
   );
 
   // ── groups / tags (sidecars) ──
-  h("groups.list", () =>
-    db.prepare(
-      `SELECT g.*, COUNT(pg.person_id) AS members FROM grp g
-       LEFT JOIN person_group pg ON pg.group_id = g.id GROUP BY g.id ORDER BY g.name`
-    ).all()
-  );
-  h("groups.create", (name: string) => db.prepare("INSERT OR IGNORE INTO grp (name) VALUES (?)").run(name));
-  h("groups.assign", (personId: number, name: string) => {
-    db.prepare("INSERT OR IGNORE INTO grp (name) VALUES (?)").run(name);
-    const g = db.prepare("SELECT id FROM grp WHERE name = ?").get(name) as { id: number };
-    return db.prepare("INSERT OR IGNORE INTO person_group (person_id, group_id) VALUES (?, ?)").run(personId, g.id);
+  // Bodies live in crm/groups.ts so they are testable without electron.
+  h("groups.list", () => listGroups(db));
+  h("groups.create", (name: string) => createGroup(db, name));
+  h("groups.rename", (from: string, to: string) => ({ renamed: renameGroup(db, from, to) }));
+  h("groups.delete", (name: string) => ({ deleted: deleteGroup(db, name) }));
+  h("groups.assign", (personId: number, name: string) => ({ added: assignToGroup(db, [personId], name) }));
+  // Bulk assign from the Contacts multi-select bar (#3 gap: bulk group assignment).
+  h("groups.assignMany", (personIds: number[], name: string) => ({
+    added: assignToGroup(db, personIds ?? [], name),
+  }));
+  h("groups.remove", (personId: number, name: string) => ({ removed: removeFromGroup(db, [personId], name) }));
+  // hide = chip only; hideContacts = chip AND members drop out of contact lists.
+  h("groups.hide", (name: string, hidden: boolean) => ({ ok: setHidden(db, name, hidden) }));
+  h("groups.hideContacts", (name: string, on: boolean) => ({ ok: setHideContacts(db, name, on) }));
+  h("groups.suppressFollowUps", (name: string, on: boolean) => ({ ok: setSuppressFollowUps(db, name, on) }));
+
+  // ── CSV export (#20) ──
+  // Body is pure (crm/export.ts); the dialog + write live here.
+  h("people.exportCsv", async () => {
+    const res = await dialog.showSaveDialog({
+      title: "Export contacts as CSV",
+      defaultPath: defaultCsvFilename(),
+      filters: [{ name: "CSV", extensions: ["csv"] }],
+    });
+    if (res.canceled || !res.filePath) return { canceled: true };
+    fs.writeFileSync(res.filePath, exportContactsCsv(db), "utf8");
+    return { saved: true, path: res.filePath };
   });
-  h("groups.remove", (personId: number, name: string) =>
-    db.prepare(
-      "DELETE FROM person_group WHERE person_id = ? AND group_id = (SELECT id FROM grp WHERE name = ?)"
-    ).run(personId, name)
-  );
-  h("groups.hide", (name: string, hidden: boolean) =>
-    db.prepare("UPDATE grp SET hidden = ? WHERE name = ?").run(hidden ? 1 : 0, name)
-  );
 
   // ── commitments ──
   // User-initiated mutations record their inverse in the undo journal (⌘Z).

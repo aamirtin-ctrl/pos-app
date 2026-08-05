@@ -8,19 +8,180 @@ import type { LlmClient } from "./llm/provider.ts";
 import { extractJson } from "./llm/provider.ts";
 import { rank } from "./crm/ranking.ts";
 import { makeQueryEmbedder } from "./llm/embeddings.ts";
-import { patchPerson } from "./crm/people.ts";
+import { patchPersonWithExtract } from "./crm/people.ts";
 import { reconnectDue, refreshNextTouch } from "./crm/reconnect.ts";
 import * as planner from "./planner.ts";
 import { addManual } from "./worklog.ts";
 
 export interface AssistantResult {
-  kind: "plan" | "people" | "note" | "answer" | "search" | "event" | "error";
+  kind: "plan" | "people" | "note" | "answer" | "search" | "event" | "rule" | "error";
   reply: string;
   results?: { id: number; name: string; reason: string }[];
   hits?: { type: string; label: string; sub: string; href: string }[];
 }
 
 const today = () => new Date().toISOString().slice(0, 10);
+
+// ── NL rules engine (gap #19; ported from PersonalCRM2 lib/llm.ts parseRuleRequest) ──
+// The user configures the CRM in prose: "my family group shouldn't show as follow-ups",
+// "re-enable follow-ups for investors", "delete the recruiters group". Deterministic
+// patterns run first (free, offline, predictable); the LLM only covers phrasings they miss.
+
+export type RuleAction = "suppress_followups" | "unsuppress_followups" | "delete_group" | "none";
+
+export interface RuleRequest {
+  action: RuleAction;
+  group: string | null;
+}
+
+/** Strip articles, the trailing word "group", quotes and "people in …" scaffolding. */
+export function cleanGroupName(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  let g = raw.trim().toLowerCase();
+  g = g.replace(/[."'“”!?]+$/g, "").replace(/^["'“”]+/g, "");
+  g = g.replace(/^(?:all\s+)?(?:the\s+|my\s+|our\s+)?(?:people|persons|contacts|everyone|anyone|folks)\s+(?:in|from|of)\s+/, "");
+  g = g.replace(/^(?:the|my|our)\s+/, "");
+  g = g.replace(/\s+group$/, "");
+  g = g.replace(/^["'“”]+|["'“”]+$/g, "").trim();
+  return g || null;
+}
+
+const RULE_PATTERNS: { re: RegExp; action: RuleAction }[] = [
+  // delete: "delete the family group" / "remove my recruiters group" / "delete group family"
+  { re: /\b(?:delete|remove|drop|get rid of)\s+(?:the\s+|my\s+|our\s+)?(.+?)\s+group\b/i, action: "delete_group" },
+  { re: /\b(?:delete|remove|drop)\s+(?:the\s+|my\s+|our\s+)?group\s+(.+)$/i, action: "delete_group" },
+  // negative "show" phrasings first, so they never read as an un-suppress
+  {
+    re: /\b(?:don'?t|do not|never|no longer|stop)\s+show(?:ing)?\s+(?:me\s+)?follow-?ups?\s+(?:for|from|in|on)\s+(.+)$/i,
+    action: "suppress_followups",
+  },
+  {
+    re: /\b(?:re-?enable|re-?activate|resume|restart|turn\s+on|unmute|unsuppress|unhide|allow|start\s+showing|show)\s+(?:the\s+)?follow-?ups?\s+(?:for|on|in|from)\s+(.+)$/i,
+    action: "unsuppress_followups",
+  },
+  {
+    re: /\b(?:stop|mute|suppress|disable|hide|silence|pause|turn\s+off)\s+(?:the\s+)?follow-?ups?\s+(?:for|on|from|in)\s+(.+)$/i,
+    action: "suppress_followups",
+  },
+  // "<group> shouldn't show as follow-ups" / "<group> should stop appearing in follow-ups"
+  {
+    re: /^(.+?)\s+(?:should\s*n[o']?t|shouldn'?t|do\s*n[o']?t|don'?t|does\s*n[o']?t|doesn'?t|no longer|should stop)\s+(?:ever\s+)?(?:show|showing|appear|appearing|surface|surfacing)(?:\s+up)?\s*(?:as|in|for|under)?\s*(?:my\s+|the\s+)?follow-?ups?/i,
+    action: "suppress_followups",
+  },
+  // "<group> should show as follow-ups again"
+  {
+    re: /^(.+?)\s+(?:should|can|may)\s+(?:show|appear|surface)(?:\s+up)?\s*(?:as|in|for|under)?\s*(?:my\s+|the\s+)?follow-?ups?\s+again/i,
+    action: "unsuppress_followups",
+  },
+];
+
+/** Regex-only rule parsing. Returns null when nothing matches (caller may try the LLM). */
+export function parseRuleDeterministic(text: string): RuleRequest | null {
+  const t = (text ?? "").trim();
+  if (!t) return null;
+  for (const { re, action } of RULE_PATTERNS) {
+    const m = t.match(re);
+    if (!m) continue;
+    const group = cleanGroupName(m[1]);
+    if (!group) continue;
+    return { action, group };
+  }
+  return null;
+}
+
+/** LLM mapping of a free-form rule request → a supported action. Null on no key / error. */
+export async function parseRuleRequest(llm: LlmClient | null, message: string): Promise<RuleRequest | null> {
+  if (!llm || !message.trim()) return null;
+  const res = await llm.call(
+    "assistant_rule",
+    "fast",
+    `You configure a personal CRM through natural-language rules. Map the user's request to exactly ONE supported action.
+Supported actions:
+- "suppress_followups": stop surfacing follow-ups for members of a named group (e.g. "people in my family group shouldn't show as follow-ups").
+- "unsuppress_followups": re-enable follow-ups for a named group.
+- "delete_group": delete a named group entirely (e.g. "delete the family group", "remove my recruiters group").
+- "none": the request doesn't match a supported action.
+
+For the group name, return just the name itself (e.g. "Family"), without the word "group" or articles like "the"/"my".
+
+User request:
+"""${message.slice(0, 300)}"""
+
+Return STRICT JSON ONLY — no prose: { "action": "suppress_followups" | "unsuppress_followups" | "delete_group" | "none", "group": "<group name, or null>" }`,
+    { json: true }
+  );
+  if (!res) return null;
+  try {
+    const p = extractJson(res.text) as Record<string, unknown>;
+    const action = p.action;
+    const group = cleanGroupName(typeof p.group === "string" ? p.group : null);
+    if (action === "suppress_followups" || action === "unsuppress_followups" || action === "delete_group") {
+      return { action, group };
+    }
+    return { action: "none", group };
+  } catch {
+    return null;
+  }
+}
+
+interface GroupRow {
+  id: number;
+  name: string;
+  suppress_follow_ups: number;
+}
+
+/** Case-insensitive exact name match, then a unique substring match. */
+function findGroup(db: Db, name: string): GroupRow | null {
+  const exact = db
+    .prepare("SELECT id, name, suppress_follow_ups FROM grp WHERE LOWER(name) = LOWER(?)")
+    .get(name) as GroupRow | undefined;
+  if (exact) return exact;
+  const like = db
+    .prepare("SELECT id, name, suppress_follow_ups FROM grp WHERE LOWER(name) LIKE LOWER(?) LIMIT 2")
+    .all(`%${name}%`) as GroupRow[];
+  return like.length === 1 ? like[0] : null;
+}
+
+const memberCount = (db: Db, groupId: number): number =>
+  (db.prepare("SELECT COUNT(*) AS n FROM person_group WHERE group_id = ?").get(groupId) as { n: number }).n;
+
+const CANT = "I can't do that one yet. I can mute or re-enable follow-ups for a group, or delete a group.";
+
+/** Execute a parsed rule against the DB and describe what changed. */
+export function applyRule(db: Db, req: RuleRequest): AssistantResult {
+  if (req.action === "none") return { kind: "error", reply: CANT };
+  if (!req.group) return { kind: "error", reply: "Which group? Try: \"stop follow-ups for family\"." };
+
+  const grp = findGroup(db, req.group);
+  if (!grp) return { kind: "error", reply: `I don't have a group called "${req.group}".` };
+  const members = memberCount(db, grp.id);
+
+  if (req.action === "delete_group") {
+    // person_group rows cascade (ON DELETE CASCADE); the people themselves are untouched.
+    db.prepare("DELETE FROM grp WHERE id = ?").run(grp.id);
+    return {
+      kind: "rule",
+      reply: `Deleted the "${grp.name}" group. ${members} ${members === 1 ? "person keeps their" : "people keep their"} record — only the grouping is gone.`,
+    };
+  }
+
+  const on = req.action === "suppress_followups" ? 1 : 0;
+  db.prepare("UPDATE grp SET suppress_follow_ups = ? WHERE id = ?").run(on, grp.id);
+  if (grp.suppress_follow_ups === on) {
+    return {
+      kind: "rule",
+      reply: on
+        ? `Follow-ups were already off for "${grp.name}".`
+        : `Follow-ups were already on for "${grp.name}".`,
+    };
+  }
+  return {
+    kind: "rule",
+    reply: on
+      ? `Follow-ups are off for "${grp.name}" — ${members} ${members === 1 ? "person" : "people"} will stop showing in Reconnect.`
+      : `Follow-ups are back on for "${grp.name}" — ${members} ${members === 1 ? "person" : "people"} can surface in Reconnect again.`,
+  };
+}
 
 export async function handleCommand(
   deps: { db: Db; doctrineDir: string; secrets: SecretStore; llm: LlmClient | null },
@@ -39,12 +200,13 @@ export async function handleCommand(
       "assistant_route",
       "fast",
       `Classify this personal-assistant command. STRICT JSON only:
-{"intent":"plan_day"|"add_event"|"find_people"|"add_note"|"log_work"|"search"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>"}
+{"intent":"plan_day"|"add_event"|"find_people"|"add_note"|"log_work"|"search"|"rule"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>"}
 "plan_day" = a braindump of tasks to schedule, or asking to plan the day.
 "add_event" = ONE specific commitment at a stated time ("lunch with Raj Thursday 1pm", "dentist tomorrow at 9"). A time must be stated or clearly implied.
 "find_people" = who should I talk to / reach out to / intro ideas.
 "add_note" = remember/save a fact about a person in the network.
 "log_work" = record something the USER did into their worklog ("log: shipped the deck", "log closed the Series A intro").
+"rule" = change how the CRM behaves for a GROUP of people ("my family group shouldn't show as follow-ups", "stop follow-ups for recruiters", "re-enable follow-ups for investors", "delete the mentors group").
 "search" = find/look up specific info they saved (a person, message, commitment, task, note).
 "question" = anything else about their calendar, commitments, or contacts.
 Command: """${t.slice(0, 600)}"""`,
@@ -69,8 +231,16 @@ Command: """${t.slice(0, 600)}"""`,
   }
   // Deterministic worklog prefix wins over everything (incl. the add_note "log" regex).
   if (/^log[:\s]/i.test(t)) intent = "log_work";
+  // Group rules are unambiguous when a pattern matches, so they win over the classifier.
+  const ruleReq = parseRuleDeterministic(t);
+  if (ruleReq) intent = "rule";
 
   try {
+    if (intent === "rule") {
+      const req = ruleReq ?? (await parseRuleRequest(llm, t)) ?? { action: "none" as const, group: null };
+      return applyRule(db, req);
+    }
+
     if (intent === "log_work") {
       const line = t.replace(/^log[:\s]+/i, "").trim();
       if (!line) return { kind: "error", reply: "What should I log? Try: 'log: shipped the deck'." };
@@ -123,9 +293,25 @@ Command: """${t.slice(0, 600)}"""`,
         .get(`%${name}%`) as { id: number; display_name: string; bio: string | null } | undefined;
       if (!hit) return { kind: "error", reply: `No contact matching "${name}".` };
       const line = content.replace(new RegExp(`^(note|remember|met|log)\\b[^:]*:?\\s*`, "i"), "").trim() || content;
-      patchPerson(db, hit.id, { bio: `${hit.bio ? hit.bio + "\n" : ""}${line}` });
-      db.prepare("UPDATE person SET last_contact_at = COALESCE(last_contact_at, datetime('now')) WHERE id = ?").run(hit.id);
-      return { kind: "note", reply: `Noted on ${hit.display_name}: "${line}"`, results: [{ id: hit.id, name: hit.display_name, reason: "updated" }] };
+      // "met X …" / "just met them" is the QuickNote "I just met them" checkbox in prose:
+      // it bumps last_contact_at for real. A plain note only fills a never-contacted blank.
+      const metToday = /^met\b/i.test(t) || /\bjust met\b/i.test(t);
+      const res = await patchPersonWithExtract(
+        db,
+        llm,
+        hit.id,
+        { bio: `${hit.bio ? hit.bio + "\n" : ""}${line}` },
+        { metToday }
+      );
+      if (!metToday) {
+        db.prepare("UPDATE person SET last_contact_at = COALESCE(last_contact_at, datetime('now')) WHERE id = ?").run(hit.id);
+      }
+      const followUp = res.detectedFollowUp ? ` Follow-up tracked: "${res.detectedFollowUp.description}".` : "";
+      return {
+        kind: "note",
+        reply: `Noted on ${hit.display_name}: "${line}"${metToday ? " — last contact set to today." : ""}${followUp}`,
+        results: [{ id: hit.id, name: hit.display_name, reason: "updated" }],
+      };
     }
 
     if (intent === "search") {

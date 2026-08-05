@@ -12,9 +12,16 @@ type Call<T = unknown> = (...args: unknown[]) => Promise<IpcResult<T>>;
 declare global {
   interface Window {
     pos: {
-      people: { list: Call; get: Call; patch: Call; merge: Call; delete: Call; reconnect: Call };
+      people: {
+        list: Call; get: Call; patch: Call; patchWithExtract: Call; merge: Call; delete: Call;
+        reconnect: Call; dismissReconnect: Call; undismissReconnect: Call; exportCsv: Call;
+      };
       query: { rank: Call };
-      groups: { list: Call; create: Call; assign: Call; remove: Call; hide: Call };
+      groups: {
+        list: Call; create: Call; rename: Call; delete: Call;
+        assign: Call; assignMany: Call; remove: Call;
+        hide: Call; hideContacts: Call; suppressFollowUps: Call;
+      };
       commitments: { list: Call; confirm: Call; drop: Call; schedule: Call; toTask: Call; toEvent: Call; updateText: Call };
       tasks: { braindump: Call; list: Call; setStatus: Call };
       plan: { generate: Call; get: Call; accept: Call; push: Call };
