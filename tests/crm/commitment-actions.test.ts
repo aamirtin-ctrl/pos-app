@@ -51,7 +51,10 @@ describe("commitmentToTask", () => {
     expect(task.title).toBe("Send the deck to Sarah");
     expect(task.status).toBe("inbox");
     expect(task.block_type).toBe("admin");
-    expect(task.plan_date).toBe(new Date().toISOString().slice(0, 10));
+    // 2026-08-05: only explicit dates schedule things — an undated commitment
+    // becomes an inbox item with NO plan date, never today's list.
+    expect(task.plan_date).toBeNull();
+    expect(task.hard_deadline_at).toBeNull();
 
     const c = db.prepare("SELECT status, confirmed_by_user FROM commitment WHERE id = ?").get(id) as any;
     expect(c.status).toBe("scheduled");

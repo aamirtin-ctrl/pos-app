@@ -37,6 +37,7 @@ import { listMailAccounts, addMailAccount, removeMailAccount, type MailProvider 
 import { saveDoctrine } from "./engine/doctrine.ts";
 import { runLoopbackAuth, cancelLoopbackAuth, isGoogleConnected, hasGoogleCreds } from "./gcal/auth.ts";
 import { pushPlan, pushTasks, reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent, dropCommitmentCascade } from "./gcal/sync.ts";
+import { listSubscriptions, addSubscription, removeSubscription, eventsForDate as icsEventsForDate, icsBlockType } from "./icscal.ts";
 import { notionAvailable, searchTargets, syncNotion, PARENT_PAGE_KEY } from "./notion.ts";
 import {
   appleCalendarAvailable,
@@ -231,7 +232,37 @@ export function registerIpc(deps: IpcDeps) {
   });
   h("gcal.connected", () => ({ connected: isGoogleConnected(secrets), hasCreds: hasGoogleCreds(secrets) }));
   h("gcal.reconcile", () => reconcileMovedEvents(db, secrets));
-  h("gcal.events", (dateISO: string) => readAnchors(db, secrets, dateISO));
+  // Day-view events: Google anchors + subscribed webcal/ICS feeds, one list.
+  // Appending here means the renderer needs zero changes to show ICS events.
+  // Dedupe by RFC 5545 UID — a feed event Google also knows appears once.
+  h("gcal.events", async (dateISO: string) => {
+    const anchors = await readAnchors(db, secrets, dateISO);
+    const out: unknown[] = [...anchors];
+    try {
+      const haveUids = new Set(anchors.map((a) => a.iCalUID).filter(Boolean));
+      for (const ev of await icsEventsForDate(db, dateISO)) {
+        if (ev.allDay || (ev.uid && haveUids.has(ev.uid))) continue;
+        out.push({
+          startMin: ev.startMin,
+          endMin: ev.endMin,
+          title: ev.title,
+          blockType: icsBlockType(ev.title),
+          gcalEventId: "",
+          iCalUID: ev.uid,
+          source: "ics",
+        });
+      }
+    } catch (e) {
+      // feeds are best-effort — the Google list must render regardless
+      console.warn(`ics events unavailable: ${(e as Error).message}`);
+    }
+    return out;
+  });
+
+  // ── subscribed calendars (webcal/ICS) ──
+  h("ics.list", () => listSubscriptions(db));
+  h("ics.add", (url: string, name?: string) => addSubscription(db, url, name));
+  h("ics.remove", (id: string) => removeSubscription(db, id));
 
   // ── notion ──
   h("notion.available", () => notionAvailable(secrets));

@@ -6,7 +6,7 @@ import { openDb, type Db } from "./db/db.ts";
 import { SecretStore } from "./secrets.ts";
 import { LlmClient } from "./llm/provider.ts";
 import { registerIpc } from "./ipc.ts";
-import { startWorkers, cleanupTentativeTasks } from "./workers.ts";
+import { startWorkers, cleanupTentativeTasksV2 } from "./workers.ts";
 import { loadDoctrine } from "./engine/doctrine.ts";
 
 let db: Db | null = null;
@@ -58,12 +58,15 @@ app.whenReady().then(() => {
     win?.webContents.send("pos:notify", msg);
   });
 
-  // One-time repair (keyed on setting cleanup_tentative_v1): delete the junk
-  // "Tentative:" tasks the old any-confidence auto-convert created on 2026-08-04,
+  // One-time full reset (keyed on setting cleanup_tentative_v2, superseding the v1
+  // junk-only repair): delete ALL auto-created commitment-linked tasks from the
+  // 2026-08-04+ incident window — even the v1 "legitimate" survivors, whose
+  // descriptions and dates came from the context-blind, today-defaulting pipeline —
   // close their Google counterparts best-effort, and return the underlying
-  // commitments to the review queue. Async and non-blocking; never fails startup.
-  void cleanupTentativeTasks(db, secrets).catch((e: Error) =>
-    console.warn(`cleanup_tentative_v1 failed (will retry next launch): ${e.message}`)
+  // commitments to the review queue for the fixed pipeline. Async and non-blocking;
+  // never fails startup.
+  void cleanupTentativeTasksV2(db, secrets).catch((e: Error) =>
+    console.warn(`cleanup_tentative_v2 failed (will retry next launch): ${e.message}`)
   );
 
   const isMac = process.platform === "darwin";

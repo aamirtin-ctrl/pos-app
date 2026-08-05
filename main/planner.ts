@@ -12,6 +12,7 @@ import { narrate } from "./engine/narrate.ts";
 import { readAnchors, mergeCalendarSources, type MergeableGoogleAnchor, type MergeableAppleEvent } from "./gcal/sync.ts";
 import { isGoogleConnected } from "./gcal/auth.ts";
 import { readAppleEvents, appleBlockType, excludedCalendarNames } from "./applecal.ts";
+import { eventsForDate as icsEventsForDate, icsBlockType } from "./icscal.ts";
 
 const toIso = (dateISO: string, min: number) =>
   `${dateISO}T${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}:00`;
@@ -87,10 +88,29 @@ export async function generatePlan(
     console.warn(`apple calendar anchors unavailable: ${(e as Error).message}`);
   }
 
+  // Subscribed webcal/ICS feeds anchor the day too. Same shape as Apple events —
+  // their RFC 5545 UID rides along so the merge can recognise an event that also
+  // reaches us through Google or Apple. Best-effort: a dead feed never breaks planning.
+  const icsEvents: MergeableAppleEvent[] = [];
+  try {
+    for (const ev of await icsEventsForDate(db, dateISO)) {
+      if (ev.allDay) continue; // same rule as the Google/Apple paths — all-day never blocks
+      icsEvents.push({
+        uid: ev.uid,
+        title: ev.title,
+        startMin: ev.startMin,
+        endMin: ev.endMin,
+        blockType: icsBlockType(ev.title),
+      });
+    }
+  } catch (e) {
+    console.warn(`ics anchors unavailable: ${(e as Error).message}`);
+  }
+
   // One event living in two systems must block the day exactly once. The join is the
   // RFC 5545 UID, which survives cross-system sync — so a renamed or rescheduled event
   // is still recognised as the same event.
-  const merged = mergeCalendarSources(googleAnchors, appleEvents);
+  const merged = mergeCalendarSources(googleAnchors, [...appleEvents, ...icsEvents]);
   for (const a of merged.anchors) {
     anchors.push({ startMin: a.startMin, endMin: a.endMin, blockType: a.blockType, title: a.title });
   }

@@ -223,6 +223,10 @@ function Integrations() {
           open={openCard === "applecal"}
           onToggle={() => toggle("applecal")}
         />
+        <SubscribedCalendarsCard
+          open={openCard === "ics"}
+          onToggle={() => toggle("ics")}
+        />
         <NotionCard
           present={present}
           row={syncRow("notion")}
@@ -741,6 +745,141 @@ function AppleCalendarCard({ open, onToggle }: { open: boolean; onToggle: () => 
       </p>
       {msg && (
         <p className="text-xs mt-1" style={{ color: err ? "var(--danger)" : "var(--muted)" }}>
+          {msg}
+        </p>
+      )}
+    </IntegrationCard>
+  );
+}
+
+// ── Subscribed calendars (webcal / ICS) ──────────────────────────────────────
+
+type IcsSubscriptionRow = { id: string; url: string; name: string };
+
+/**
+ * Subscribed calendars: read-only webcal/ICS feeds whose events join the day
+ * view and anchor the planner. Add by URL; a feed is validated by fetching it.
+ */
+function SubscribedCalendarsCard({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+  const [feeds, setFeeds] = useState<IcsSubscriptionRow[] | null>(null);
+  const [url, setUrl] = useState("");
+  const [name, setName] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState(false);
+
+  const refetch = useCallback(async () => {
+    const r = await window.pos.ics.list();
+    if (r.ok && Array.isArray(r.data)) setFeeds(r.data as IcsSubscriptionRow[]);
+    else if (!r.ok) { setErr(true); setMsg(r.error ?? "could not load feeds"); }
+  }, []);
+  useEffect(() => { refetch(); }, [refetch]);
+
+  const add = async () => {
+    if (!url.trim() || adding) return;
+    setAdding(true);
+    setMsg(null);
+    setErr(false);
+    const r = await window.pos.ics.add(url.trim(), name.trim() || undefined);
+    if (r.ok) {
+      const added = r.data as IcsSubscriptionRow | undefined;
+      setUrl("");
+      setName("");
+      setMsg(added ? `Added "${added.name}".` : "Added.");
+    } else {
+      setErr(true);
+      setMsg(r.error ?? "could not add the feed");
+    }
+    setAdding(false);
+    refetch();
+  };
+
+  const remove = async (id: string) => {
+    setMsg(null);
+    setErr(false);
+    const r = await window.pos.ics.remove(id);
+    if (!r.ok) { setErr(true); setMsg(r.error ?? "could not remove the feed"); }
+    refetch();
+  };
+
+  const status: IntegrationStatus = (feeds?.length ?? 0) > 0 ? "connected" : "needs-setup";
+
+  const inputCls = "border rounded-md px-2 py-1 text-sm bg-white";
+  const inputStyle = { borderColor: "var(--line)" } as const;
+
+  return (
+    <IntegrationCard
+      name="Subscribed calendars"
+      description="webcal/ICS feeds (published iCloud, class schedules, team calendars) become anchors"
+      status={status}
+      open={open}
+      onToggle={onToggle}
+      steps={[
+        "Copy any webcal:// or .ics link.",
+        "Paste below — events appear on the calendar and block planning time within 15 minutes.",
+      ]}
+    >
+      {feeds == null ? (
+        <p className="text-sm" style={{ color: "var(--muted)" }}>Loading…</p>
+      ) : feeds.length === 0 ? (
+        <p className="text-sm mb-2" style={{ color: "var(--muted)" }}>No feeds yet — add one below.</p>
+      ) : (
+        <div className="space-y-1.5 mb-3">
+          {feeds.map((f) => (
+            <div
+              key={f.id}
+              className="flex items-center gap-2 rounded-lg border bg-white px-3 py-1.5"
+              style={inputStyle}
+            >
+              <span className="flex-1 min-w-0">
+                <span className="block text-sm truncate" style={{ color: "var(--ink)" }}>{f.name}</span>
+                <span className="block text-[11px] truncate" style={{ color: "var(--muted)" }}>{f.url}</span>
+              </span>
+              <button
+                onClick={() => remove(f.id)}
+                className="text-xs px-2 py-0.5 rounded-md border bg-white shrink-0"
+                style={{ borderColor: "var(--line)", color: "var(--danger)" }}
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="rounded-lg border bg-white px-3 py-2 space-y-1.5" style={inputStyle}>
+        <div className="text-xs font-medium" style={{ color: "var(--muted)" }}>Add a feed</div>
+        <div className="flex gap-2 flex-wrap">
+          <input
+            type="text"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") add(); }}
+            placeholder="webcal://… or https://….ics"
+            className={`flex-1 min-w-[200px] ${inputCls}`}
+            style={inputStyle}
+          />
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") add(); }}
+            placeholder="name (optional)"
+            className={`w-40 ${inputCls}`}
+            style={inputStyle}
+          />
+          <button
+            onClick={add}
+            disabled={adding || !url.trim()}
+            className="px-3 py-1 rounded-md text-sm border bg-white disabled:opacity-40"
+            style={inputStyle}
+          >
+            {adding ? "Checking…" : "Add"}
+          </button>
+        </div>
+      </div>
+      {msg && (
+        <p className="text-xs mt-2" style={{ color: err ? "var(--danger)" : "var(--muted)" }}>
           {msg}
         </p>
       )}

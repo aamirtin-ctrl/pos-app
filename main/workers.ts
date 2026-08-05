@@ -191,7 +191,11 @@ export async function autoTentativeTasks(db: Db, secrets: SecretStore, beforeMax
     // Below-threshold or gate-failing rows are left untouched for human review.
     if (c.confidence < AUTO_CONVERT_CONFIDENCE || !passesCommitmentGate(c.description)) continue;
     if (db.prepare("SELECT 1 FROM task WHERE commitment_id = ?").get(c.id)) continue; // idempotent
-    const dateISO = c.due_at ? c.due_at.slice(0, 10) : new Date().toISOString().slice(0, 10);
+    // Only explicit dates schedule things (owner directive 2026-08-05): no due_at →
+    // no dateISO → commitmentToTask creates an inbox task with plan_date NULL and a
+    // Google task with NO due date. The old today-default put months-away and undated
+    // commitments on today's list.
+    const dateISO = c.due_at ? c.due_at.slice(0, 10) : undefined;
     try {
       const res = await commitmentToTask(db, secrets, c.id, dateISO, { tentative: true });
       if (!res.duplicate) created++;
@@ -245,6 +249,52 @@ export async function cleanupTentativeTasks(
   setSetting(db, CLEANUP_TENTATIVE_KEY, new Date().toISOString());
   console.log(
     `workers: ${CLEANUP_TENTATIVE_KEY} removed ${deletedTasks} junk task(s), returned ${reopened.size} commitment(s) to review (${rows.length} candidate(s) examined)`
+  );
+  return { deletedTasks, reopenedCommitments: reopened.size };
+}
+
+/** One-shot flag: the 2026-08-05 full reset onto the fixed extraction pipeline. */
+export const CLEANUP_TENTATIVE_V2_KEY = "cleanup_tentative_v2";
+
+/**
+ * Second-pass full reset (owner report 2026-08-05). The v1 cleanup kept tasks whose
+ * commitments were high-confidence AND gate-passing — but everything created since
+ * 2026-08-04 came out of the context-blind, today-defaulting pipeline, so even the
+ * "legitimate" survivors carry unresolved references ("add a boot tray to my list")
+ * and wrong dates (everything undated landed on TODAY). Remove ALL remaining
+ * commitment-linked tasks in the incident window (created_at >= 2026-08-04, status
+ * inbox/planned), best-effort complete their Google counterparts, and return every
+ * affected commitment to status 'open' / confirmed_by_user 0 so it re-enters review
+ * through the fixed pipeline. Keyed on setting CLEANUP_TENTATIVE_V2_KEY, set only
+ * after the pass completes.
+ */
+export async function cleanupTentativeTasksV2(
+  db: Db,
+  secrets: SecretStore
+): Promise<{ deletedTasks: number; reopenedCommitments: number }> {
+  if (getSetting(db, CLEANUP_TENTATIVE_V2_KEY)) return { deletedTasks: 0, reopenedCommitments: 0 };
+
+  const rows = db
+    .prepare(
+      `SELECT t.id AS task_id, t.gtasks_id, t.commitment_id
+       FROM task t
+       WHERE t.commitment_id IS NOT NULL AND t.status IN ('inbox','planned') AND t.created_at >= '2026-08-04'`
+    )
+    .all() as { task_id: number; gtasks_id: string | null; commitment_id: number }[];
+
+  let deletedTasks = 0;
+  const reopened = new Set<number>();
+  for (const r of rows) {
+    db.prepare("DELETE FROM task WHERE id = ?").run(r.task_id);
+    deletedTasks++;
+    if (r.gtasks_id) await closeGoogleTask(db, secrets, r.gtasks_id); // best-effort, time-boxed
+    db.prepare("UPDATE commitment SET status = 'open', confirmed_by_user = 0 WHERE id = ?").run(r.commitment_id);
+    reopened.add(r.commitment_id);
+  }
+
+  setSetting(db, CLEANUP_TENTATIVE_V2_KEY, new Date().toISOString());
+  console.log(
+    `workers: ${CLEANUP_TENTATIVE_V2_KEY} reset ${deletedTasks} auto-created task(s), returned ${reopened.size} commitment(s) to review`
   );
   return { deletedTasks, reopenedCommitments: reopened.size };
 }

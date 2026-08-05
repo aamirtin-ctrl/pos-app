@@ -6,16 +6,27 @@
 // Quality layers (each catches what the previous one misses):
 //   1. The prompt demands REWRITING into imperative tasks and carries real failure
 //      examples as few-shot negatives — most junk never comes back from the model.
+//      Second pass (owner report 2026-08-05): the prompt now also carries
+//        a. per-person THREAD CONTEXT (last 6 interactions, direction-labeled, the
+//           drafts.ts pattern) so references resolve ("my list" → the Stanford dorm
+//           packing list the thread is about) — unresolvable references are DROPPED;
+//        b. a precomputed DATE REFERENCE table anchored on each message's sent date
+//           (the msgplans technique) so stated timeframes ("late September") become
+//           real due_at dates — and a missing timeframe stays null, never "today".
 //   2. passesCommitmentGate() — a deterministic sanity check applied to BOTH the LLM
 //      and fallback paths before any insert. Questions, quote fragments, FYIs, bare
-//      URLs/addresses never reach the table no matter what the model says.
-//   3. Deterministic-fallback rows are capped at confidence 0.5 (they are raw message
+//      URLs/addresses, first-person narration, and contentless verb+pronoun stubs
+//      ("find something") never reach the table no matter what the model says.
+//   3. parseWhen (crm/when.ts) runs as a deterministic cross-check: when the LLM gave
+//      no due date but the message states a future one, it is attached.
+//   4. Deterministic-fallback rows are capped at confidence 0.5 (they are raw message
 //      fragments, not rewrites), so they can never clear the autonomy threshold in
 //      workers.autoTentativeTasks — they land in the review queue instead.
 
 import type { Db } from "../db/db.ts";
 import { extractJson, type LlmClient } from "../llm/provider.ts";
 import { extractFollowups } from "./followups.ts";
+import { parseWhen } from "./when.ts";
 
 export const REVIEW_CONFIDENCE = 0.7;
 /** Deterministic-fallback rows are raw message fragments, never rewrites — cap them here. */
@@ -29,31 +40,52 @@ const INTERROGATIVE_START =
   /^(what|whats|what's|who|whom|whose|when|where|why|how|which|do you|did you|are you|can i|can you|could you|would you|will you|should i|is this|is that|is it)\b/i;
 
 // First words that can never head an imperative task phrase (FYIs, fragments, gerund
-// status updates like "looking at 345 Westwood Court on Google Maps").
+// status updates like "looking at 345 Westwood Court on Google Maps", first-person
+// narration like "I wanna be back here at 5:30 latest", explanatory chatter opening on
+// a preposition like "for our school it's a little different…").
 const NON_VERB_START = new Set([
   "this", "that", "these", "those", "there", "it", "its", "it's", "the", "a", "an",
   "fyi", "ok", "okay", "yes", "no", "maybe", "also", "just", "so", "and", "but", "or", "if",
+  "i", "i'm", "i'll", "i'd", "i've", // first-person narration, not an imperative
+  "for", "at", "by", "of", "with", "from", "about", "because", // prepositional/explanatory openers
+  "my", "our", "their", "his", "her", // possessive openers ("my flight is…")
 ]);
 
 // -ing first words are gerunds (status updates), except these genuine imperative verbs.
 const ING_VERBS = new Set(["bring", "ping", "ring", "sing", "swing", "string", "spring"]);
 
+// Contentless objects: a verb followed only by these is not an actionable task
+// ("find something", "handle it", "do that thing" — the owner's "find something" case).
+const VAGUE_WORDS = new Set([
+  "something", "anything", "everything", "nothing", "stuff", "thing", "things",
+  "it", "that", "this", "them", "those", "these", "someone", "somebody", "anyone", "whatever",
+]);
+// Grammatical filler that carries no content on its own (articles, possessives, particles).
+const FILLER_WORDS = new Set([
+  "the", "a", "an", "some", "any", "my", "your", "our", "their", "his", "her",
+  "up", "out", "on", "in", "to", "for", "with", "about", "of", "at", "and", "or",
+]);
+
 /**
  * Deterministic sanity gate for a commitment description, applied to BOTH the LLM and
  * deterministic extraction paths before any insert (and again by the autonomy layer in
  * workers.ts and the startup cleanup). Rejects:
- *   - empty / over-140-char strings,
+ *   - empty / over-120-char strings (tightened from 140 — the prompt already demands
+ *     under 120; anything longer is explanatory chatter, not a task),
  *   - questions ("…?" or an interrogative opener: what/who/when/where/why/how/do you/…),
  *   - descriptions with no verb-ish head (FYI openers like "This is…", gerund openers
- *     like "looking at…", bare nouns, digit-leading address fragments),
+ *     like "looking at…", first-person narration "I wanna…", prepositional chatter
+ *     "for our school…", bare nouns, digit-leading address fragments),
  *   - bare URLs,
+ *   - contentless objects: a verb whose every following word is a vague pronoun or
+ *     filler ("find something", "handle it") names nothing anyone can act on,
  *   - unrewritten quote fragments: second-person pronouns ("call you", "you can upload")
  *     and the anonymous "to/for contact" placeholder ("Give cash to contact").
  */
 export function passesCommitmentGate(description: string): boolean {
   const d = (description ?? "").replace(/\s+/g, " ").trim();
   if (!d) return false;
-  if (d.length > 140) return false;
+  if (d.length > 120) return false;
   if (/\?$/.test(d)) return false;
   if (INTERROGATIVE_START.test(d)) return false;
   if (/^(https?:\/\/|www\.)\S+$/i.test(d)) return false; // a bare URL is not a task
@@ -63,6 +95,9 @@ export function passesCommitmentGate(description: string): boolean {
   if (!first) return false; // leading digit/symbol — address or URL fragment
   if (NON_VERB_START.has(first)) return false;
   if (/[a-z]ing$/.test(first) && !ING_VERBS.has(first)) return false; // gerund head
+  // Vagueness: everything after the verb head must include at least one content word.
+  const rest = words.slice(1).map((w) => w.toLowerCase().replace(/[^a-z']/g, "")).filter(Boolean);
+  if (rest.length > 0 && rest.every((w) => VAGUE_WORDS.has(w) || FILLER_WORDS.has(w))) return false;
   if (/\b(to|for|with|from)\s+(the\s+)?contact\b/i.test(d)) return false; // anonymous placeholder
   if (/\byou\b|\byour\b/i.test(d)) return false; // second-person = unrewritten message quote
   return true;
@@ -93,15 +128,79 @@ interface InteractionRow {
   body_summary: string | null;
 }
 
-function buildPrompt(rows: InteractionRow[]): string {
+/** Per-person thread context fed to the prompt (the drafts.ts pattern). */
+interface PersonContext {
+  name: string | null;
+  recent: { direction: string | null; occurred_at: string | null; subject: string | null; body_summary: string | null }[];
+}
+
+/** Recent interactions per person in the batch, direction-labeled, newest first. */
+export const CONTEXT_INTERACTIONS = 6;
+
+const DOW_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+/**
+ * The msgplans technique (msgplans.buildDateReference), anchored on a message's SENT
+ * date: a precomputed weekday map for the following week plus early/mid/late anchors
+ * for the next six months, so the model NEVER does calendar math itself.
+ */
+export function buildAnchoredDateReference(anchor: Date): string {
+  const base = Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), anchor.getUTCDate());
+  const days: string[] = [];
+  for (let i = 0; i < 8; i++) {
+    const d = new Date(base + i * 86_400_000);
+    const tag = i === 0 ? " (sent day)" : i === 1 ? " (day after)" : "";
+    days.push(`${DOW_SHORT[d.getUTCDay()]}=${d.toISOString().slice(0, 10)}${tag}`);
+  }
+  const months: string[] = [];
+  for (let i = 0; i < 6; i++) {
+    const m = new Date(Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth() + i, 1));
+    const y = m.getUTCFullYear();
+    const mo = pad2(m.getUTCMonth() + 1);
+    months.push(`${MONTH_NAMES[m.getUTCMonth()]} ${y}: early=${y}-${mo}-05, mid=${y}-${mo}-15, late=${y}-${mo}-25`);
+  }
+  return `weekdays after send: ${days.join(", ")} | month anchors: ${months.join("; ")}`;
+}
+
+const clip = (s: string | null | undefined, n: number) => (s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+
+function buildPrompt(rows: InteractionRow[], contexts: Map<number, PersonContext>): string {
   const records = rows.map((r) => ({
     interaction_id: r.id,
+    person_id: r.person_id,
     direction: r.direction,
     occurred_at: r.occurred_at,
     subject: r.subject,
     body: r.body_summary,
   }));
-  return `Extract real commitments from these interactions between the user and their contacts, and REWRITE each one as a clean imperative task.
+
+  // One date-reference line per distinct sent DATE in the batch (msgplans technique).
+  const seenDates = new Set<string>();
+  const dateRefLines: string[] = [];
+  for (const r of rows) {
+    const iso = (r.occurred_at ?? "").slice(0, 10);
+    if (!iso || seenDates.has(iso)) continue;
+    seenDates.add(iso);
+    const anchor = new Date(r.occurred_at!);
+    if (Number.isNaN(anchor.getTime())) continue;
+    dateRefLines.push(`- messages sent ${iso}: ${buildAnchoredDateReference(anchor)}`);
+  }
+
+  // Per-person thread context, drafts.ts-style: last few interactions, direction-labeled.
+  const contextBlocks: string[] = [];
+  for (const [personId, ctx] of contexts) {
+    const lines = ctx.recent.map((h) =>
+      `  [${h.direction ?? "?"} ${clip(h.occurred_at, 10)}] ${clip([h.subject, h.body_summary].filter(Boolean).join(" — "), 160)}`
+    );
+    contextBlocks.push(`${ctx.name ?? "Unknown contact"} (person_id ${personId}):\n${lines.join("\n")}`);
+  }
+
+  return `Extract real commitments from these interactions between the user and their contacts, and REWRITE each one as a clean imperative task, resolving references and dates from the context below.
 
 WHAT COUNTS AS A COMMITMENT — every one of these must hold:
 - A concrete action the USER owes a contact ("i_owe_them") or a contact owes the user ("they_owe_me").
@@ -112,7 +211,19 @@ NEVER commitments — extract nothing for these:
 - Questions of any kind ("do you want…", "what time…", "can you…?" that was never answered).
 - Offers and invitations that were not accepted.
 - Status updates, FYIs, opinions, links, screenshots, addresses, or things merely being discussed.
+- Explanatory chatter about how something works ("for our school it's a little different because…").
+- Old logistics fragments about a moment already past ("I wanna be back here at 5:30 latest").
 - Other people's plans or chatter that create no obligation involving the user.
+
+RESOLVE REFERENCES — use THREAD CONTEXT below:
+- Each contact's recent messages (newest first, direction-labeled) are given. Use them to resolve "my list", "that place", "the doc" into what the thread is actually about.
+- Example: "add a boot tray to my list" in a thread about Stanford dorm packing → "Add boot tray to the Stanford dorm packing list".
+- If a reference CANNOT be resolved from the thread context ("find something" with nothing to anchor it), DROP the item entirely. A task nobody can act on is worse than no task.
+
+RESOLVE DATES — use the DATE REFERENCE table below; never invent:
+- The table is precomputed from each message's SENT date — take dates from it EXACTLY; never do weekday or month math yourself.
+- A stated timeframe becomes due_at: "in <month>" → that month's mid anchor (the 15th); "early <month>" → the 05 anchor; "late <month>" → the 25 anchor; "next week" / a weekday → the exact date from the table.
+- If the message states or implies NO timeframe, due_at MUST be null. NEVER default to the sent date or to today — a null due_at is correct and common.
 
 REWRITE — never quote:
 - "description" MUST be a rewritten imperative task phrase, NOT a copied message fragment.
@@ -123,19 +234,30 @@ REAL FAILURES — these exact snippets were wrongly turned into tasks before. Th
 - "do you want eggs?" (a question/offer)
 - "Give cash to contact" (verbatim fragment; no named person, no agreement)
 - "find something, call you" (chatter fragment; no concrete obligation)
+- "find something" (unresolvable reference — nothing anyone can act on)
 - "This is the health plan you can upload for approval. There are high chances they will decline the first time around" (an FYI about a document)
 - "what do you wanna inquire about?" (a question)
 - "looking at 345 Westwood Court on Google Maps" (a link/screenshot being discussed)
+- "for our school it's a little different because for girls to come to our helco they have to have one of us take them…" (explanatory chatter)
+- "I wanna be back here at 5:30 latest" (old logistics fragment)
 
 POSITIVE EXAMPLES (message → rewritten task):
-- Sarah: "can you send me the deck by fri?" — user: "yep will do" → { "description": "Send Sarah the pitch deck", "direction": "i_owe_them", "due_at": "<that Friday>" }
-- User to Omar: "I'll bring the cash for the tickets tomorrow" → { "description": "Bring Omar cash for the tickets", "direction": "i_owe_them", "due_at": "<tomorrow>" }
-- Dev: "I'll send over the signed lease on Monday" → { "description": "Collect the signed lease from Dev", "direction": "they_owe_me", "due_at": "<that Monday>" }
+- Sarah: "can you send me the deck by fri?" — user: "yep will do" → { "description": "Send Sarah the pitch deck", "direction": "i_owe_them", "due_at": "<that Friday from the table>" }
+- User to Omar: "I'll bring the cash for the tickets tomorrow" → { "description": "Bring Omar cash for the tickets", "direction": "i_owe_them", "due_at": "<the day after send>" }
+- Dev: "I'll send over the signed lease on Monday" → { "description": "Collect the signed lease from Dev", "direction": "they_owe_me", "due_at": "<that Monday from the table>" }
+- Mom-thread about Stanford dorm packing — user: "add a boot tray to my list" → { "description": "Add boot tray to the Stanford dorm packing list", "direction": "i_owe_them", "due_at": null }
+- Thread agrees on a meetup "in late September" → due_at = that September's late anchor (the 25th) from the table.
 
 CONFIDENCE — be honest:
 - 0.9+ only when the obligation is explicit and unambiguous in the text.
 - Anything below 0.8 is held for human review instead of acted on — do not inflate.
 - When unsure whether something is a commitment at all, OMIT it entirely. An empty array is a good and common answer.
+
+DATE REFERENCE (precomputed — use these exact dates):
+${dateRefLines.join("\n") || "- (no dated messages in this batch)"}
+
+THREAD CONTEXT (per contact, newest first):
+${contextBlocks.join("\n") || "(none)"}
 
 INTERACTIONS (JSON):
 ${JSON.stringify(records, null, 2)}
@@ -176,6 +298,11 @@ export async function extractCommitmentsLlm(
   if (rows.length === 0) return { inserted: 0, needsReview: 0, processed: 0 };
 
   const ins = insertCommitment(db);
+  const nameStmt = db.prepare("SELECT display_name FROM person WHERE id = ?");
+  const recentStmt = db.prepare(
+    `SELECT direction, occurred_at, subject, body_summary FROM interaction
+     WHERE person_id = ? ORDER BY occurred_at DESC LIMIT ${CONTEXT_INTERACTIONS}`
+  );
   let inserted = 0;
   let needsReview = 0;
 
@@ -184,7 +311,17 @@ export async function extractCommitmentsLlm(
     let extracted = false;
 
     if (llm) {
-      const res = await llm.call("commitments", "fast", buildPrompt(batch), { json: true });
+      // Per-person thread context (drafts.ts pattern) so references resolve.
+      const contexts = new Map<number, PersonContext>();
+      for (const r of batch) {
+        if (r.person_id == null || contexts.has(r.person_id)) continue;
+        const person = nameStmt.get(r.person_id) as { display_name: string | null } | undefined;
+        contexts.set(r.person_id, {
+          name: person?.display_name ?? null,
+          recent: recentStmt.all(r.person_id) as PersonContext["recent"],
+        });
+      }
+      const res = await llm.call("commitments", "fast", buildPrompt(batch, contexts), { json: true });
       if (res) {
         extracted = true;
         try {
@@ -197,11 +334,21 @@ export async function extractCommitmentsLlm(
               const src = byId.get(Number(o.interaction_id));
               const description = typeof o.description === "string" ? o.description.trim() : "";
               const direction = o.direction === "they_owe_me" ? "they_owe_me" : "i_owe_them";
-              const dueAt = typeof o.due_at === "string" && o.due_at ? o.due_at : null;
+              let dueAt = typeof o.due_at === "string" && o.due_at ? o.due_at : null;
               const confRaw = Number(o.confidence);
               const confidence = Number.isFinite(confRaw) ? Math.min(1, Math.max(0, confRaw)) : 0.5;
               if (!src || !description) continue;
               if (!passesCommitmentGate(description)) continue; // questions/quotes/FYIs never land
+              // Deterministic cross-check (crm/when.ts): the model gave no due date, but
+              // the message itself states one, anchored to its SENT date. Only a date
+              // still in the future is attached — a stale "next Friday" from months ago
+              // must not schedule anything.
+              if (!dueAt && src.occurred_at) {
+                const text = [src.subject, src.body_summary].filter(Boolean).join(" — ");
+                const anchor = new Date(src.occurred_at);
+                const when = text && !Number.isNaN(anchor.getTime()) ? parseWhen(text, anchor) : null;
+                if (when && when.getTime() > Date.now()) dueAt = when.toISOString().slice(0, 10);
+              }
               ins.run(src.person_id, direction, description, dueAt, src.id, confidence);
               inserted++;
               if (confidence < REVIEW_CONFIDENCE) needsReview++;

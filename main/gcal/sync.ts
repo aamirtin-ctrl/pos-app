@@ -625,9 +625,11 @@ export async function commitmentToTask(
   if (existing) {
     duplicate = true;
   } else {
-    const today = new Date().toISOString().slice(0, 10);
+    // Only explicit dates schedule things (owner directive 2026-08-05): a commitment
+    // with no due date and no picked date becomes an INBOX item — plan_date NULL,
+    // hard_deadline_at NULL, Google task with no due date. Never default to today.
     const due = c.due_at ? c.due_at.slice(0, 10) : null;
-    const planDate = pickedDate ?? (due && due > today ? due : today);
+    const planDate = pickedDate ?? due; // may be NULL → inbox, not on today's list
     const deadline = pickedDate ? `${pickedDate}T00:00:00` : c.due_at;
     const r = db.prepare(
       `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,

@@ -22,6 +22,7 @@ declare global {
       sync: { run: Call; status: Call; embed: Call; pickAndRun: Call };
       mail: { list: Call; add: Call; remove: Call };
       gcal: { connect: Call; cancel: Call; connected: Call; reconcile: Call; events: Call };
+      ics: { list: Call; add: Call; remove: Call };
       notion: { available: Call; targets: Call; setParent: Call; sync: Call };
       applecal: { available: Call; calendars: Call; events: Call; mirror: Call };
       settings: {

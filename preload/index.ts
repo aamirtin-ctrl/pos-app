@@ -57,6 +57,7 @@ contextBridge.exposeInMainWorld("pos", {
     remove: call("mail.accounts.remove"),
   },
   gcal: { connect: call("gcal.connect"), cancel: call("gcal.cancel"), connected: call("gcal.connected"), reconcile: call("gcal.reconcile"), events: call("gcal.events") },
+  ics: { list: call("ics.list"), add: call("ics.add"), remove: call("ics.remove") },
   notion: {
     available: call("notion.available"),
     targets: call("notion.targets"),
