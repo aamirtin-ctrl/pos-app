@@ -41,6 +41,7 @@ import {
 // depend on experimental typings (same approach as the source connector).
 interface SqliteStatement {
   safeIntegers(enabled: boolean): void;
+  get(...params: unknown[]): unknown;
   all(...params: unknown[]): unknown[];
 }
 interface SqliteDatabase {
@@ -228,22 +229,35 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
       }
       if (dateFloor > windowFloor) windowFloor = dateFloor;
 
-      // 1:1 conversations only (chats with exactly one handle). Group chats are noisy.
+      // 1:1 AND group chats (owner spec 2026-08-05). For 1:1 the counterpart is the
+      // chat's single handle; for groups it's the message SENDER, and the chat guid
+      // rides along as thread_external_id so Messaging threads by conversation.
       const stmt = chat.prepare(`
         SELECT m.ROWID AS rowid, m.guid AS guid, m.text AS text, m.attributedBody AS body,
-               m.date AS date, m.is_from_me AS is_from_me, ch.id AS counterpart
+               m.date AS date, m.is_from_me AS is_from_me,
+               CASE WHEN pc.n = 1 THEN ch1.id ELSE sh.id END AS counterpart,
+               CASE WHEN pc.n > 1 THEN c.guid END AS chat_guid,
+               CASE WHEN pc.n > 1 THEN NULLIF(c.display_name, '') END AS chat_name,
+               c.ROWID AS chat_rowid, pc.n AS participants
         FROM message m
         JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
         JOIN chat c ON c.ROWID = cmj.chat_id
-        JOIN chat_handle_join chj ON chj.chat_id = c.ROWID
-        JOIN handle ch ON ch.ROWID = chj.handle_id
-        WHERE c.ROWID IN (
-          SELECT chat_id FROM chat_handle_join GROUP BY chat_id HAVING COUNT(*) = 1
-        )
-        AND m.ROWID > ?
+        JOIN (SELECT chat_id, COUNT(*) AS n FROM chat_handle_join GROUP BY chat_id) pc
+          ON pc.chat_id = c.ROWID
+        LEFT JOIN chat_handle_join chj1 ON chj1.chat_id = c.ROWID AND pc.n = 1
+        LEFT JOIN handle ch1 ON ch1.ROWID = chj1.handle_id
+        LEFT JOIN handle sh ON sh.ROWID = m.handle_id
+        WHERE m.ROWID > ?
         AND m.date > ?
         ORDER BY m.ROWID ASC
       `);
+      // Group outbound messages have no sender handle — anchor them to the chat's
+      // first participant so the thread stays whole. Documented attribution choice.
+      const firstParticipant = chat.prepare(`
+        SELECT h.id AS id FROM chat_handle_join j JOIN handle h ON h.ROWID = j.handle_id
+        WHERE j.chat_id = ? ORDER BY j.handle_id LIMIT 1
+      `);
+      firstParticipant.safeIntegers(true);
       stmt.safeIntegers(true);
       const rows = stmt.all(sinceRowid, windowFloor) as Array<{
         rowid: bigint;
@@ -253,6 +267,10 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
         date: bigint;
         is_from_me: bigint;
         counterpart: string | null;
+        chat_guid: string | null;
+        chat_name: string | null;
+        chat_rowid: bigint;
+        participants: bigint;
       }>;
 
       // AddressBook name index — best-effort. sources === 0 → unreadable → create nothing.
@@ -264,7 +282,11 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
 
       for (const row of rows) {
         if (row.rowid > maxRowid) maxRowid = row.rowid;
-        const counterpart = (row.counterpart ?? "").trim();
+        let counterpart = (row.counterpart ?? "").trim();
+        if (!counterpart && row.participants > 1n && row.is_from_me === 1n) {
+          const fp = firstParticipant.get(row.chat_rowid) as { id: string } | undefined;
+          counterpart = (fp?.id ?? "").trim();
+        }
         if (!counterpart) {
           report.skipped++;
           report.skippedUnmatched++;
@@ -336,6 +358,8 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
           occurredAt: appleDateToDate(row.date).toISOString(),
           bodySummary: rawText ? rawText.replace(/\s+/g, " ").trim().slice(0, SNIPPET_MAX) || null : null,
           externalId: row.guid ?? `imessage:${row.rowid}`,
+          threadExternalId: row.chat_guid ?? undefined,
+          subject: row.chat_name ?? undefined,
         });
         if (inserted) report.ingested++;
         else {

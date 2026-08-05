@@ -61,11 +61,11 @@ function buildChatDb(messages: { rowid: number; guid: string; text: string; atMs
   const chat = new Database(chatDbPath);
   chat.exec(`
     CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
-    CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, guid TEXT);
+    CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, guid TEXT, display_name TEXT);
     CREATE TABLE chat_handle_join (chat_id INTEGER, handle_id INTEGER);
     CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
     CREATE TABLE message (ROWID INTEGER PRIMARY KEY, guid TEXT, text TEXT,
-      attributedBody BLOB, date INTEGER, is_from_me INTEGER);
+      attributedBody BLOB, date INTEGER, is_from_me INTEGER, handle_id INTEGER);
   `);
   chat.prepare("INSERT INTO handle (ROWID, id) VALUES (1, ?)").run(HANDLE);
   chat.prepare("INSERT INTO chat (ROWID, guid) VALUES (1, 'iMessage;-;+14155550123')").run();
