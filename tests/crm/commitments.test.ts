@@ -36,18 +36,19 @@ function addInteraction(subject: string | null, body: string | null, occurredAt:
 const yesterday = new Date(Date.now() - 86_400_000).toISOString();
 
 describe("extractCommitmentsLlm (llm = null → deterministic fallback)", () => {
-  it("extracts a follow-up as an unconfirmed commitment (confidence 0.9, i_owe_them)", async () => {
-    const id = addInteraction("Catching up", "we should catch up soon!", yesterday);
+  it("extracts a follow-up as an unconfirmed commitment (confidence capped at 0.5, i_owe_them)", async () => {
+    const id = addInteraction(null, "we should catch up soon!", yesterday);
     const res = await extractCommitmentsLlm(db, null, [id]);
     expect(res.processed).toBe(1);
     expect(res.inserted).toBe(1);
+    expect(res.needsReview).toBe(1); // 0.5 < REVIEW_CONFIDENCE — always queued for review
 
     const rows = listCommitments(db, "open");
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
       person_id: 1,
       direction: "i_owe_them",
-      confidence: 0.9,
+      confidence: 0.5, // deterministic fragments never clear the autonomy threshold
       confirmed_by_user: 0,
       status: "open",
       source_interaction_id: id,
@@ -77,6 +78,16 @@ describe("extractCommitmentsLlm (llm = null → deterministic fallback)", () => 
     expect(rerun.processed).toBe(0);
     expect(rerun.inserted).toBe(0);
     expect(listCommitments(db)).toHaveLength(1); // no duplicates
+  });
+
+  it("gerund-headed fragments (subject-line status updates) are gated out", async () => {
+    // Subject + body join to "Catching up — we should catch up soon!" — a status-update
+    // head, not an imperative task, so the sanity gate rejects it before insert.
+    const id = addInteraction("Catching up", "we should catch up soon!", yesterday);
+    const res = await extractCommitmentsLlm(db, null, [id]);
+    expect(res.processed).toBe(1);
+    expect(res.inserted).toBe(0);
+    expect(listCommitments(db)).toHaveLength(0);
   });
 
   it("automated/OTP interactions never produce commitments", async () => {

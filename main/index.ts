@@ -6,7 +6,7 @@ import { openDb, type Db } from "./db/db.ts";
 import { SecretStore } from "./secrets.ts";
 import { LlmClient } from "./llm/provider.ts";
 import { registerIpc } from "./ipc.ts";
-import { startWorkers } from "./workers.ts";
+import { startWorkers, cleanupTentativeTasks } from "./workers.ts";
 import { loadDoctrine } from "./engine/doctrine.ts";
 
 let db: Db | null = null;
@@ -57,6 +57,14 @@ app.whenReady().then(() => {
   startWorkers(db, secrets, llm(), (msg: string) => {
     win?.webContents.send("pos:notify", msg);
   });
+
+  // One-time repair (keyed on setting cleanup_tentative_v1): delete the junk
+  // "Tentative:" tasks the old any-confidence auto-convert created on 2026-08-04,
+  // close their Google counterparts best-effort, and return the underlying
+  // commitments to the review queue. Async and non-blocking; never fails startup.
+  void cleanupTentativeTasks(db, secrets).catch((e: Error) =>
+    console.warn(`cleanup_tentative_v1 failed (will retry next launch): ${e.message}`)
+  );
 
   const isMac = process.platform === "darwin";
   Menu.setApplicationMenu(

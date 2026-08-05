@@ -134,8 +134,26 @@ export default function Home() {
 
   const act = async (fn: () => Promise<unknown>) => { await fn(); await refetch(); };
 
-  const needsReview = commitments.filter((c) => c.confidence < 0.7);
-  const solid = commitments.filter((c) => c.confidence >= 0.7);
+  // Anything the autonomy layer did NOT convert stays unconfirmed — that whole set is
+  // the review queue, regardless of confidence. Confirmed rows are the solid list.
+  const needsReview = commitments.filter((c) => c.confirmed_by_user === 0);
+  const solid = commitments.filter((c) => c.confirmed_by_user !== 0);
+
+  // Approve all: confirm + convert each review row through the same toTask flow the
+  // per-row button uses (no date picker in batch — toTask falls back to due date/today).
+  const [approvingAll, setApprovingAll] = useState(false);
+  const approveAll = async () => {
+    if (approvingAll || needsReview.length === 0) return;
+    setApprovingAll(true);
+    try {
+      for (const c of needsReview) {
+        await window.pos.commitments.toTask(c.id);
+      }
+    } finally {
+      setApprovingAll(false);
+      await refetch();
+    }
+  };
 
   // group chips over the reconnect list — names come from the rows themselves
   const reconnectGroups = useMemo(
@@ -200,10 +218,26 @@ export default function Home() {
               {needsReview.length > 0 && (
                 <>
                   <div
-                    className="text-xs font-medium mt-3 mb-1 pt-2 border-t"
-                    style={{ color: "var(--muted)", borderColor: "var(--line)" }}
+                    className="flex items-center gap-2 mt-3 mb-1 pt-2 border-t"
+                    style={{ borderColor: "var(--line)" }}
                   >
-                    Needs review
+                    <span className="text-xs font-medium" style={{ color: "var(--muted)" }}>
+                      Needs review
+                    </span>
+                    <span
+                      className="text-[11px] tabular-nums px-1.5 py-0.5 rounded-full"
+                      style={{ background: "var(--accent)", color: "white" }}
+                    >
+                      {needsReview.length}
+                    </span>
+                    <button
+                      onClick={approveAll}
+                      disabled={approvingAll}
+                      className="ml-auto text-[11px] px-1.5 py-0.5 rounded border hover:bg-white disabled:opacity-60 transition-[background-color,transform] duration-[120ms] active:scale-95"
+                      style={{ borderColor: "var(--line)", color: "var(--accent)" }}
+                    >
+                      {approvingAll ? "Approving…" : "Approve all"}
+                    </button>
                   </div>
                   <CommitmentList rows={needsReview} peopleById={peopleById} act={act} />
                 </>

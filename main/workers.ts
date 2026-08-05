@@ -9,9 +9,9 @@ import { createRequire } from "node:module";
 import type { Db } from "./db/db.ts";
 import type { SecretStore } from "./secrets.ts";
 import type { LlmClient } from "./llm/provider.ts";
-import { extractCommitmentsLlm } from "./crm/commitments.ts";
+import { extractCommitmentsLlm, passesCommitmentGate } from "./crm/commitments.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
-import { commitmentToTask } from "./gcal/sync.ts";
+import { commitmentToTask, closeGoogleTask } from "./gcal/sync.ts";
 import { distillWeek, distillWeekKey } from "./worklog.ts";
 import type { ConnectorDeps, SyncReport } from "./connectors/common.ts";
 import { syncAllMail, gmailConfigured } from "./connectors/gmail.ts";
@@ -22,7 +22,7 @@ import { syncMailfile } from "./connectors/mailfile.ts";
 import { runCapture } from "./capture.ts";
 import { runMsgPlans } from "./msgplans.ts";
 import { syncNotion, notionConfigured } from "./notion.ts";
-import { getSetting } from "./db/db.ts";
+import { getSetting, setSetting } from "./db/db.ts";
 
 // node-cron ships no type declarations — minimal local surface via createRequire.
 interface CronTask {
@@ -166,20 +166,28 @@ export async function runSync(
   return report;
 }
 
+/** Autonomy threshold: only commitments at or above this confidence auto-convert. */
+export const AUTO_CONVERT_CONFIDENCE = 0.8;
+
 /**
- * Full autonomy: every NEWLY extracted commitment (id > `beforeMaxId`, any
- * confidence) immediately becomes a local task + a Google task titled
- * "Tentative: …" (local title stays clean). Idempotent: a commitment with ANY
+ * Scoped autonomy (owner directive 2026-08-04, refining the earlier full-autonomy one):
+ * a NEWLY extracted commitment (id > `beforeMaxId`) becomes a local task + a Google task
+ * titled "Tentative: …" (local title stays clean) ONLY when its confidence is >=
+ * AUTO_CONVERT_CONFIDENCE AND its description passes passesCommitmentGate. Everything
+ * else stays status 'open' / confirmed_by_user 0 — visible in the dashboard's
+ * "Needs review" section, never in tasks or Google. Idempotent: a commitment with ANY
  * existing task — open or done — is skipped. This is an automatic action, so it
  * records NO undo entries; dropping the commitment later cleans the task up
  * (dropCommitmentCascade). Failures are logged and never propagate.
  */
 export async function autoTentativeTasks(db: Db, secrets: SecretStore, beforeMaxId: number): Promise<number> {
   const fresh = db
-    .prepare("SELECT id, due_at FROM commitment WHERE id > ? AND status = 'open'")
-    .all(beforeMaxId) as { id: number; due_at: string | null }[];
+    .prepare("SELECT id, description, due_at, confidence FROM commitment WHERE id > ? AND status = 'open'")
+    .all(beforeMaxId) as { id: number; description: string; due_at: string | null; confidence: number }[];
   let created = 0;
   for (const c of fresh) {
+    // Below-threshold or gate-failing rows are left untouched for human review.
+    if (c.confidence < AUTO_CONVERT_CONFIDENCE || !passesCommitmentGate(c.description)) continue;
     if (db.prepare("SELECT 1 FROM task WHERE commitment_id = ?").get(c.id)) continue; // idempotent
     const dateISO = c.due_at ? c.due_at.slice(0, 10) : new Date().toISOString().slice(0, 10);
     try {
@@ -190,6 +198,53 @@ export async function autoTentativeTasks(db: Db, secrets: SecretStore, beforeMax
     }
   }
   return created;
+}
+
+/** One-shot flag: the 2026-08-04 junk-task cleanup runs exactly once per database. */
+export const CLEANUP_TENTATIVE_KEY = "cleanup_tentative_v1";
+
+/**
+ * One-time repair for the morning the old any-confidence pipeline shipped junk
+ * ("do you want eggs?" et al.) straight to Google Tasks. For every still-open task
+ * (status inbox/planned, created_at >= 2026-08-04) whose linked commitment has
+ * confidence < AUTO_CONVERT_CONFIDENCE OR fails passesCommitmentGate:
+ *   - delete the local task,
+ *   - best-effort complete its Google counterpart (closeGoogleTask is time-boxed and
+ *     swallows errors),
+ *   - return the commitment to status 'open' / confirmed_by_user 0 so it lands in the
+ *     "Needs review" section instead of vanishing.
+ * Keyed on setting CLEANUP_TENTATIVE_KEY, set only after the pass completes.
+ */
+export async function cleanupTentativeTasks(
+  db: Db,
+  secrets: SecretStore
+): Promise<{ deletedTasks: number; reopenedCommitments: number }> {
+  if (getSetting(db, CLEANUP_TENTATIVE_KEY)) return { deletedTasks: 0, reopenedCommitments: 0 };
+
+  const rows = db
+    .prepare(
+      `SELECT t.id AS task_id, t.gtasks_id, c.id AS commitment_id, c.confidence, c.description
+       FROM task t JOIN commitment c ON c.id = t.commitment_id
+       WHERE t.commitment_id IS NOT NULL AND t.status IN ('inbox','planned') AND t.created_at >= '2026-08-04'`
+    )
+    .all() as { task_id: number; gtasks_id: string | null; commitment_id: number; confidence: number; description: string }[];
+
+  let deletedTasks = 0;
+  const reopened = new Set<number>();
+  for (const r of rows) {
+    if (r.confidence >= AUTO_CONVERT_CONFIDENCE && passesCommitmentGate(r.description)) continue; // legitimate — keep
+    db.prepare("DELETE FROM task WHERE id = ?").run(r.task_id);
+    deletedTasks++;
+    if (r.gtasks_id) await closeGoogleTask(db, secrets, r.gtasks_id); // best-effort, time-boxed
+    db.prepare("UPDATE commitment SET status = 'open', confirmed_by_user = 0 WHERE id = ?").run(r.commitment_id);
+    reopened.add(r.commitment_id);
+  }
+
+  setSetting(db, CLEANUP_TENTATIVE_KEY, new Date().toISOString());
+  console.log(
+    `workers: ${CLEANUP_TENTATIVE_KEY} removed ${deletedTasks} junk task(s), returned ${reopened.size} commitment(s) to review (${rows.length} candidate(s) examined)`
+  );
+  return { deletedTasks, reopenedCommitments: reopened.size };
 }
 
 export interface WorkersHandle {
