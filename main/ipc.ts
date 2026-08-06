@@ -81,6 +81,7 @@ import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learnin
 import { runSync, syncStatus } from "./workers.ts";
 import { composeDigest, sendMorningDigest } from "./digest.ts";
 import { recentInboxSenders } from "./capture.ts";
+import { screenTimeAvailable, screenTimeDiagnostics, blockUsage, autoCaptureOutcomes } from "./screentime.ts";
 import { listMsgPlans } from "./msgplans.ts";
 import { listMailAccounts, addMailAccount, removeMailAccount, addOAuthMailAccount, mailOAuthKey, type MailProvider } from "./connectors/gmail.ts";
 import { saveDoctrine } from "./engine/doctrine.ts";
@@ -109,6 +110,14 @@ import {
 } from "./applecal.ts";
 import fs from "node:fs";
 import path from "node:path";
+import {
+  openPanel,
+  closePanel,
+  resizePanel,
+  currentPanel,
+  SERVICES,
+} from "./webpanel.ts";
+import type { Rectangle } from "electron";
 
 export interface IpcDeps {
   db: Db;
@@ -123,6 +132,21 @@ export function registerIpc(deps: IpcDeps) {
     ipcMain.handle(channel, async (_e, ...args) => {
       try {
         return { ok: true, data: await fn(...args) };
+      } catch (err) {
+        console.error(`ipc ${channel}:`, err);
+        return { ok: false, error: (err as Error).message };
+      }
+    });
+
+  // Same contract as h(), plus the calling window. Docked web panels are children
+  // of a specific window, so the handler needs to know which one asked — and the
+  // sender is the only trustworthy answer (the renderer cannot name a window).
+  const hWin = (channel: string, fn: (win: BrowserWindow, ...args: any[]) => unknown) =>
+    ipcMain.handle(channel, async (e, ...args) => {
+      try {
+        const win = BrowserWindow.fromWebContents(e.sender);
+        if (!win) throw new Error("no_window");
+        return { ok: true, data: await fn(win, ...args) };
       } catch (err) {
         console.error(`ipc ${channel}:`, err);
         return { ok: false, error: (err as Error).message };
@@ -303,6 +327,19 @@ export function registerIpc(deps: IpcDeps) {
     return { captured: n, doctrineUpdated: changed };
   });
   h("outcomes.adherence", () => adherenceStats(db));
+
+  // ── screen time (objective outcomes) ──
+  h("screentime.available", () => screenTimeAvailable());
+  h("screentime.diagnostics", () => screenTimeDiagnostics());
+  h("screentime.block", (blockId: number) => blockUsage(db, blockId));
+  h("screentime.autoCapture", (dateISO: string) => {
+    const res = autoCaptureOutcomes(db, dateISO);
+    if (res.captured === 0) return { ...res, doctrineUpdated: false };
+    const file = path.join(doctrineDir, "doctrine.yaml");
+    const { yaml, changed } = applyLearning(fs.readFileSync(file, "utf8"), db);
+    if (changed) fs.writeFileSync(file, yaml, "utf8");
+    return { ...res, doctrineUpdated: changed };
+  });
 
   // ── sync / integrations ──
   h("sync.run", (source: string, extra?: string) => runSync(db, secrets, deps.llm(), source, extra));
@@ -538,14 +575,24 @@ export function registerIpc(deps: IpcDeps) {
   h("settings.get", (key: string) => getSetting(db, key));
   h("settings.set", (key: string, value: string) => setSetting(db, key, value));
   h("stt.transcribe", (wav: Uint8Array) => transcribe(doctrineDir, wav));
-  // In-app LinkedIn messaging: your own login in a persistent child window. Read +
-  // send directly on linkedin.com — no scraping, no third-party session service.
-  h("app.openLinkedIn", () => {
-    const w = new BrowserWindow({
-      width: 1050, height: 760, title: "LinkedIn — POS",
-      webPreferences: { partition: "persist:linkedin", nodeIntegration: false, contextIsolation: true },
-    });
-    w.loadURL("https://www.linkedin.com/messaging/");
+  // ── docked in-app web panels (main/webpanel.ts) ──
+  // Snapchat and Instagram DMs exist only on the web; these dock the real site in
+  // a right-hand column of the Messaging screen, each in its own persistent session.
+  // The renderer owns the layout and reports the rect it reserved.
+  hWin("panel.open", (win, serviceId: string, bounds?: Rectangle) => openPanel(win, serviceId, bounds));
+  hWin("panel.close", (win) => {
+    closePanel(win);
+    return { closed: true };
+  });
+  hWin("panel.bounds", (win, bounds: Rectangle) => resizePanel(win, bounds));
+  h("panel.current", () => currentPanel());
+  h("panel.services", () =>
+    Object.values(SERVICES).map((s) => ({ id: s.id, label: s.label, dmOnly: !!s.allowPathPrefixes }))
+  );
+  // Back-compat: the old separate-window LinkedIn opener. Same login, same
+  // persist:linkedin partition — now it just opens the docked panel instead.
+  hWin("app.openLinkedIn", (win) => {
+    openPanel(win, "linkedin");
     return { opened: true };
   });
   h("app.openFullDiskAccess", () =>

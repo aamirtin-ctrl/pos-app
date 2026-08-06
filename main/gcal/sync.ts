@@ -17,6 +17,7 @@ import type { SecretStore } from "../secrets.ts";
 import { isGoogleConnected, needsReconsent, oauthClient, RECONSENT_REQUIRED } from "./auth.ts";
 import { confirmCommitment, dropCommitment } from "../crm/commitments.ts";
 import { resolveNamedDate } from "../context.ts";
+import type { Flexibility } from "../engine/grid.ts";
 
 export const POS_CALENDAR_NAME = "POS — Planned";
 export const POS_TASKLIST_NAME = "POS";
@@ -264,6 +265,100 @@ export async function deleteMessagesEvent(db: Db, secrets: SecretStore, eventId:
   }
 }
 
+// ── three-tier flexibility inference (owner ask 2026-08-05) ──────────────────
+//
+// "Sometimes I add Google Calendar events after the fact — typically that means it's
+// something I have to go to, and my calendar should adjust around it. The app should know
+// which events can be moved, which shouldn't be, and which it should try not to."
+//
+// One function decides the tier for EVERY external source (Google, Apple, ICS), so the
+// answer cannot drift between them. The tiers are defined in engine/grid.ts.
+
+/**
+ * Obligation words. A title containing any of these describes something the owner has to
+ * SHOW UP for, whoever put it on the calendar — which is exactly the after-the-fact case:
+ * he types "Dentist appointment" into Google himself, with no attendees and no invitation,
+ * and the day must bend around it rather than treat it as a soft intention.
+ *
+ * Word-bounded so "classroom", "overdue" and friends do not false-positive.
+ */
+export const OBLIGATION_PATTERNS: readonly RegExp[] = [
+  /\bclass(es)?\b/i,
+  /\blectures?\b/i,
+  /\bexams?\b/i,
+  /\binterviews?\b/i,
+  /\bflights?\b/i,
+  /\bappointments?\b/i,
+  /\bdoctor\b/i,
+  /\bdentist\b/i,
+  /\bmeeting with\b/i,
+  /\b1:1\b/i,
+  /\bcall with\b/i,
+  /\bdeadlines?\b/i,
+  /\bdue\b/i,
+];
+
+/** True when a title reads like something the owner has to attend. */
+export function looksLikeObligation(title: string | null | undefined): boolean {
+  const t = (title ?? "").trim();
+  if (!t) return false;
+  return OBLIGATION_PATTERNS.some((re) => re.test(t));
+}
+
+/** Calendars POS itself writes. Anything living here is planner output, not an obligation. */
+const POS_AUTHORED_CALENDAR_PREFIX = "POS — ";
+
+/**
+ * What `inferFlexibility` needs to know. Every field is optional: the Apple and ICS paths
+ * only ever have a title, a calendar name and a block-type guess, and must still get an
+ * answer. Absent evidence is read conservatively (see below).
+ */
+export interface FlexibilityEvent {
+  title?: string | null;
+  /** Attendees as Google returns them; the owner's own row carries `self: true`. */
+  attendees?: readonly { self?: boolean | null; responseStatus?: string | null }[] | null;
+  /** Owner's own response on the invitation, when the caller already extracted it. */
+  responseStatus?: string | null;
+  /** Name of the calendar the event came from ("POS — Planned", "Work", …). */
+  calendarName?: string | null;
+  /** Caller-resolved anchor type; "meeting" means other people are involved. */
+  blockType?: "meeting" | "personal" | null;
+}
+
+/**
+ * Which tier an external event belongs to.
+ *
+ *   fixed     — has OTHER attendees, OR is an accepted invitation, OR its title reads like
+ *               an obligation, OR the source already classified it as a meeting.
+ *   preferred — a solo event the owner created himself: a self-scheduled work block, a
+ *               reminder, "Reading". Real, but movable under pressure.
+ *   flexible  — lives on a POS-authored calendar. The planner wrote it; the planner owns it.
+ *
+ * NOTE (the owner's stated case): a solo event he adds AFTER THE FACT still comes back
+ * `fixed` whenever its title reads like an obligation — "Dentist appointment", "Flight to
+ * SFO", "CS229 lecture" — precisely because that is the signal he described. Only a solo
+ * event with a neutral title ("Reading", "Write draft") falls through to `preferred`.
+ */
+export function inferFlexibility(ev: FlexibilityEvent): Flexibility {
+  const calendar = (ev.calendarName ?? "").trim();
+  if (calendar === POS_CALENDAR_NAME || calendar.startsWith(POS_AUTHORED_CALENDAR_PREFIX)) {
+    return "flexible";
+  }
+  const others = (ev.attendees ?? []).filter((a) => a?.self !== true);
+  if (others.length > 0) return "fixed";
+  if ((ev.responseStatus ?? "").toLowerCase() === "accepted") return "fixed";
+  const selfAccepted = (ev.attendees ?? []).some(
+    (a) => a?.self === true && (a.responseStatus ?? "").toLowerCase() === "accepted"
+  );
+  if (selfAccepted) return "fixed";
+  // The Apple/ICS paths carry no attendee data at all; their meeting heuristic is the only
+  // "other people are involved" signal we get, and reading it as `fixed` keeps those
+  // sources at today's behavior rather than quietly making them displaceable.
+  if (ev.blockType === "meeting") return "fixed";
+  if (looksLikeObligation(ev.title)) return "fixed";
+  return "preferred";
+}
+
 export interface ExternalAnchor {
   startMin: number;
   endMin: number;
@@ -276,9 +371,17 @@ export interface ExternalAnchor {
    * Calendar.app knows it". Empty string when Google did not return one.
    */
   iCalUID: string;
+  /**
+   * Tier from `inferFlexibility`. Absent on snapshots persisted before this shipped —
+   * consumers apply the `fixed` default (grid.flexibilityOf), i.e. the old behavior.
+   */
+  flexibility?: Flexibility;
 }
 
-/** Only ask for what we read — and crucially, ask for iCalUID. */
+/**
+ * Only ask for what we read — and crucially, ask for iCalUID. `attendees` carries the
+ * self/responseStatus pair the flexibility inference needs.
+ */
 const EVENT_FIELDS = "items(id,status,summary,start,end,attendees,iCalUID),nextPageToken";
 
 // ── persisted last-known day caches (setting table) ──────────────────────────
@@ -398,13 +501,20 @@ async function readAnchorsLive(db: Db, secrets: SecretStore, dateISO: string): P
       if (e.status === "cancelled" || !e.start?.dateTime || !e.end?.dateTime) continue; // skip all-day
       const s = new Date(e.start.dateTime);
       const en = new Date(e.end.dateTime);
+      const blockType: "meeting" | "personal" = (e.attendees?.length ?? 0) > 0 ? "meeting" : "personal";
       anchors.push({
         startMin: s.getHours() * 60 + s.getMinutes(),
         endMin: en.getHours() * 60 + en.getMinutes(),
         title: e.summary ?? "(busy)",
-        blockType: (e.attendees?.length ?? 0) > 0 ? "meeting" : "personal",
+        blockType,
         gcalEventId: e.id!,
         iCalUID: e.iCalUID ?? "",
+        flexibility: inferFlexibility({
+          title: e.summary,
+          attendees: e.attendees,
+          calendarName: c.summary,
+          blockType,
+        }),
       });
     }
   }
@@ -474,6 +584,8 @@ export interface MergeableGoogleAnchor {
   title: string;
   blockType: "meeting" | "personal";
   iCalUID?: string | null;
+  /** Tier from inferFlexibility; absent → the engine's `fixed` default. */
+  flexibility?: Flexibility;
 }
 
 /**
@@ -486,6 +598,8 @@ export interface MergeableAppleEvent {
   startMin: number;
   endMin: number;
   blockType?: "meeting" | "personal";
+  /** Tier from inferFlexibility; absent → the merge infers it from title + blockType. */
+  flexibility?: Flexibility;
 }
 
 export interface MergedAnchor {
@@ -496,7 +610,17 @@ export interface MergedAnchor {
   source: "google" | "apple";
   /** iCalUID (Google) or Apple UID; empty when the source gave us none. */
   uid: string;
+  /**
+   * Which tier the surviving side of the join belongs to — and, as everywhere else in the
+   * flexibility model (Anchor, ExternalAnchor, PlacedBlock), ABSENT MEANS `fixed`. The
+   * merge therefore emits this key only when the answer is not the default, so a merged
+   * anchor says something new or says nothing at all.
+   */
+  flexibility?: Flexibility;
 }
+
+/** Spread helper: emit `flexibility` only when it is not the implied `fixed` default. */
+const tier = (f: Flexibility): { flexibility?: Flexibility } => (f === "fixed" ? {} : { flexibility: f });
 
 export interface SkippedAppleEvent {
   uid: string;
@@ -537,6 +661,10 @@ export function mergeCalendarSources(
       blockType: g.blockType,
       source: "google",
       uid,
+      // Google anchors are tiered at read time (readAnchorsLive), where the attendee list
+      // is still in hand. A snapshot persisted before flexibility shipped has none — infer
+      // from what survived, which lands on the same conservative answer.
+      ...tier(g.flexibility ?? inferFlexibility({ title: g.title, blockType: g.blockType })),
     });
   }
 
@@ -556,13 +684,17 @@ export function mergeCalendarSources(
       skipped.push({ uid, reason: "same-time-title" });
       continue;
     }
+    const blockType = ev.blockType ?? "personal";
     anchors.push({
       startMin: ev.startMin,
       endMin: ev.endMin,
       title: ev.title,
-      blockType: ev.blockType ?? "personal",
+      blockType,
       source: "apple",
       uid,
+      // Apple/ICS carry no attendee data, so the title and the meeting heuristic are the
+      // whole evidence set.
+      ...tier(ev.flexibility ?? inferFlexibility({ title: ev.title, blockType })),
     });
   }
 

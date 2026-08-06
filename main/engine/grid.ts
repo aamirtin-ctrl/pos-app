@@ -10,6 +10,30 @@ import {
 
 export const SLOT_MIN = 15;
 
+/**
+ * How hard a block's placement is (owner ask 2026-08-05: "the app should know which events
+ * can be moved, which shouldn't be, and which it should try not to").
+ *
+ *   fixed     — external obligation. Its slots are occupied, nothing may overlap it, and the
+ *               planner never moves it. This is what an anchor has always been.
+ *   preferred — real, but the owner's own. Occupies its slots by default; may be displaced
+ *               and re-placed when a `fixed` anchor or a hard-deadline task has nowhere else
+ *               to go (see solver.ts).
+ *   flexible  — POS-generated. The planner owns the minutes outright and re-places freely.
+ *
+ * The default is `fixed` EVERYWHERE it is absent, so every anchor written before this
+ * existed keeps behaving exactly as it did.
+ */
+export type Flexibility = "fixed" | "preferred" | "flexible";
+
+/** The tier an anchor gets when it does not declare one — backward compatibility. */
+export const DEFAULT_FLEXIBILITY: Flexibility = "fixed";
+
+/** Read an anchor's tier, applying the backward-compatible default. */
+export function flexibilityOf(a: { flexibility?: Flexibility }): Flexibility {
+  return a.flexibility ?? DEFAULT_FLEXIBILITY;
+}
+
 export interface Anchor {
   startMin: number; // minutes since midnight
   endMin: number;
@@ -17,6 +41,8 @@ export interface Anchor {
   title: string;
   /** true = external/gcal/user-locked; the planner may never move it */
   movable?: boolean;
+  /** How hard this placement is. Absent = "fixed" (the pre-flexibility behavior). */
+  flexibility?: Flexibility;
 }
 
 export interface Slot {

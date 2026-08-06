@@ -5,7 +5,7 @@
 // of score. Never silently drops a task — everything unplaced carries a reason.
 
 import { BLOCK_DEFAULTS, WORK_TYPES, hhmmToMin, type BlockType, type Doctrine } from "./doctrine.ts";
-import { buildGrid, SLOT_MIN, type Anchor, type Slot } from "./grid.ts";
+import { buildGrid, flexibilityOf, SLOT_MIN, type Anchor, type Flexibility, type Slot } from "./grid.ts";
 
 export interface PlannerTask {
   id: number;
@@ -34,6 +34,12 @@ export interface PlacedBlock {
   capacityAtPlacement?: number;
   isAnchor: boolean;
   isLocked?: boolean;
+  /**
+   * How hard this placement is. Anchors carry their own tier; everything the solver sited
+   * itself is `flexible` — the planner chose those minutes and may choose again tomorrow.
+   * Always set by the solver; optional only so older constructions still typecheck.
+   */
+  flexibility?: Flexibility;
 }
 
 export interface SolveResult {
@@ -48,10 +54,98 @@ const slotsFor = (minutes: number) => Math.max(1, Math.ceil(minutes / SLOT_MIN))
 const fmtMin = (min: number) =>
   `${String(Math.floor(min / 60) % 24).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}`;
 
+/**
+ * One anchor the pass must NOT occupy up front, and must re-place after everything else.
+ * `displacedBy` names whatever took its minutes, for the note; null means nobody did (a
+ * `flexible` block is planner output — moving it is not news worth a note).
+ */
+interface ReleasedAnchor {
+  anchor: Anchor;
+  displacedBy: string | null;
+}
+
+interface PassOptions {
+  /** Anchors whose minutes are occupied from the start of the pass. */
+  occupying: Anchor[];
+  /** Anchors re-placed by the scoring pass at the end, after every task has had its turn. */
+  released: ReleasedAnchor[];
+}
+
+/**
+ * The three-tier entry point (owner ask 2026-08-05).
+ *
+ *   fixed     — occupies its minutes; nothing overlaps it; never moved. Unchanged behavior,
+ *               and the default for any anchor that declares no tier, so every existing
+ *               call site is byte-identical to before.
+ *   preferred — occupies its minutes by default. Displaced only when it has to be: either a
+ *               `fixed` anchor literally overlaps it, or the day could not seat something
+ *               that must be seated. Then it is re-placed and the move is explained.
+ *   flexible  — never occupies. Planner output; re-placed freely by the scoring pass.
+ *
+ * Displacement is a SECOND PASS, not a backtrack: pass 1 solves with `preferred` occupied;
+ * if that leaves work stranded, pass 2 solves the identical input with every `preferred`
+ * block released and re-placed last, and the better of the two is returned. Two full
+ * deterministic passes and an explicit comparison — same input twice, same output.
+ */
 export function solve(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[]): SolveResult {
+  const byStart = (a: Anchor, b: Anchor) => a.startMin - b.startMin || a.title.localeCompare(b.title);
+  const immovable = anchors.filter((a) => !a.movable);
+  const fixedAnchors = immovable.filter((a) => flexibilityOf(a) === "fixed");
+  const preferredAnchors = immovable.filter((a) => flexibilityOf(a) === "preferred").sort(byStart);
+  const flexibleAnchors = immovable.filter((a) => flexibilityOf(a) === "flexible").sort(byStart);
+
+  // `flexible` anchors are the planner's own blocks handed back to it. They never hold a
+  // slot hostage; they are simply re-placed.
+  const released: ReleasedAnchor[] = flexibleAnchors.map((a) => ({ anchor: a, displacedBy: null }));
+
+  // A `preferred` block whose minutes a `fixed` anchor claims cannot stay where it is —
+  // the two would paint on top of each other. It loses, unconditionally, in pass 1. This is
+  // the owner's literal case: the dentist appointment lands on top of the reading block.
+  const keptPreferred: Anchor[] = [];
+  for (const p of preferredAnchors) {
+    const clash = fixedAnchors.find((f) => f.startMin < p.endMin && f.endMin > p.startMin);
+    if (clash) released.push({ anchor: p, displacedBy: clash.title });
+    else keptPreferred.push(p);
+  }
+
+  const first = solvePass(tasks, doctrine, anchors, {
+    occupying: [...fixedAnchors, ...keptPreferred],
+    released,
+  });
+  if (keptPreferred.length === 0) return first;
+
+  // Nothing stranded → nothing to buy with a displacement. `deadline_conflict` joins the
+  // two reasons the owner named because it is the same failure wearing a different label:
+  // the day has room, just not before the deadline, and a preferred block may be sitting in
+  // exactly the window that would work.
+  const pressured = first.unplaced.filter(
+    (u) =>
+      u.reason === "no_eligible_slot" ||
+      u.reason === "insufficient_contiguous_time" ||
+      u.reason === "deadline_conflict"
+  );
+  if (pressured.length === 0) return first;
+
+  const second = solvePass(tasks, doctrine, anchors, {
+    occupying: fixedAnchors,
+    released: [
+      ...released,
+      ...keptPreferred.map((a) => ({ anchor: a, displacedBy: pressured[0].task.title })),
+    ],
+  });
+  // Only worth the churn if it actually seated something. Ties keep pass 1 — the calmer day.
+  return second.unplaced.length < first.unplaced.length ? second : first;
+}
+
+function solvePass(
+  tasks: PlannerTask[],
+  doctrine: Doctrine,
+  anchors: Anchor[],
+  opts: PassOptions
+): SolveResult {
   const hc = doctrine.hard_constraints;
   const w = doctrine.soft_preferences.weights;
-  const fixed = anchors.filter((a) => !a.movable);
+  const fixed = opts.occupying;
   const movableMeetings = anchors
     .filter((a) => a.movable && a.blockType === "meeting")
     .sort((a, b) => a.startMin - b.startMin || a.title.localeCompare(b.title));
@@ -66,6 +160,7 @@ export function solve(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[
     startMin: a.startMin,
     endMin: a.endMin,
     isAnchor: true,
+    flexibility: flexibilityOf(a),
   }));
   const unplaced: SolveResult["unplaced"] = [];
   const notes: string[] = [];
@@ -91,7 +186,14 @@ export function solve(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[
     return true;
   }
 
-  function place(type: BlockType, i0: number, len: number, title: string, taskId?: number): PlacedBlock {
+  function place(
+    type: BlockType,
+    i0: number,
+    len: number,
+    title: string,
+    taskId?: number,
+    as?: { isAnchor?: boolean; flexibility?: Flexibility }
+  ): PlacedBlock {
     for (let i = i0; i < i0 + len; i++) occ[i] = type;
     const avgCap = avgCapacity(i0, len);
     const b: PlacedBlock = {
@@ -101,7 +203,9 @@ export function solve(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[
       endMin: minOf(i0 + len),
       taskId,
       capacityAtPlacement: Math.round(avgCap * 10) / 10,
-      isAnchor: false,
+      isAnchor: as?.isAnchor ?? false,
+      // Everything the solver sites itself is the planner's to move again tomorrow.
+      flexibility: as?.flexibility ?? "flexible",
     };
     blocks.push(b);
     return b;
@@ -412,6 +516,38 @@ export function solve(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[
   for (const t of shallow) {
     take(t);
     placeDeepOrFocused(t, false);
+  }
+
+  // ── 7a. re-place the released blocks — LAST, into what the day has left ──
+  //
+  // A displaced `preferred` block does not get its old minutes back and does not get to
+  // outrank the work it made room for; it competes for whatever remains. The score is
+  // "closest to where it was", the same rule the movable-meeting fallback above uses:
+  // the owner put "Reading" at 14:00 for a reason, so 16:00 beats 08:00.
+  const releasedInOrder = [...opts.released].sort(
+    (x, y) =>
+      x.anchor.startMin - y.anchor.startMin || x.anchor.title.localeCompare(y.anchor.title)
+  );
+  for (const r of releasedInOrder) {
+    const a = r.anchor;
+    const len = slotsFor(a.endMin - a.startMin);
+    const cands = candidates(a.blockType, len);
+    if (cands.length === 0) {
+      notes.push(
+        r.displacedBy
+          ? `"${a.title}" had to give way to "${r.displacedBy}" and the day has no other room for it.`
+          : `"${a.title}" could not be re-placed — the day has no room left for it.`
+      );
+      continue;
+    }
+    const best = bestBy(cands, (i0) => -Math.abs(minOf(i0) - a.startMin))!;
+    const b = place(a.blockType, best, len, a.title, undefined, {
+      isAnchor: true,
+      flexibility: flexibilityOf(a),
+    });
+    if (r.displacedBy && b.startMin !== a.startMin) {
+      notes.push(`Moved "${a.title}" to ${fmtMin(b.startMin)} to make room for "${r.displacedBy}".`);
+    }
   }
 
   // ── 7b. explain the wall, don't just enforce it ──

@@ -112,6 +112,12 @@ contextBridge.exposeInMainWorld("pos", {
   msgplans: { run: call("msgplans.run"), list: call("msgplans.list") },
   digest: { send: call("digest.send"), preview: call("digest.preview") },
   capture: { senders: call("capture.senders") },
+  screentime: {
+    available: call("screentime.available"),
+    diagnostics: call("screentime.diagnostics"),
+    block: call("screentime.block"),
+    autoCapture: call("screentime.autoCapture"),
+  },
   undo: { do: call("undo.do"), redo: call("undo.redo") },
   worklog: { list: call("worklog.list"), add: call("worklog.add"), catchUp: call("worklog.catchUp") },
   context: {
@@ -132,5 +138,14 @@ contextBridge.exposeInMainWorld("pos", {
   },
   drafts: { list: call("drafts.list"), generate: call("drafts.generate"), setStatus: call("drafts.setStatus") },
   voice: { synthesize: call("voice.synthesize"), get: call("voice.get") },
+  // Docked in-app web panels (Snapchat / Instagram DMs / LinkedIn). The renderer
+  // reserves the column and reports its rect; main parks a native view over it.
+  panel: {
+    open: call("panel.open"),
+    close: call("panel.close"),
+    bounds: call("panel.bounds"),
+    current: call("panel.current"),
+    services: call("panel.services"),
+  },
   app: { openFullDiskAccess: call("app.openFullDiskAccess"), openLinkedIn: call("app.openLinkedIn") },
 });

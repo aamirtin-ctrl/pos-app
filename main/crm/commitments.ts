@@ -49,7 +49,11 @@
 //      dropped entirely on BOTH the LLM and fallback paths, never kept undated.
 //   4. Deterministic-fallback rows are capped at confidence 0.5 (they are raw message
 //      fragments, not rewrites), so they can never clear the autonomy threshold in
-//      workers.autoTentativeTasks — they land in the review queue instead.
+//      workers.autoTentativeTasks — they land in the review queue instead. They are ALSO
+//      enqueued (backfill.markDegraded) as unfinished work: when the LLM was unavailable
+//      the title is near-verbatim message text, and backfillDegraded rewrites it once the
+//      quota refills. A successful call that classified everything as not-a-commitment is
+//      a real verdict, not an outage — it inserts nothing and enqueues nothing.
 //   4b. Personal context (main/context.ts): both prompts open with an ABOUT THE USER
 //      block, and any survivor the model left undated gets resolveNamedDate() run over
 //      its title + raw text. That is what turns "meetup at the start of school" into the
@@ -70,6 +74,7 @@ import type { Db } from "../db/db.ts";
 import { contextBlock, resolveNamedDate } from "../context.ts";
 import { preferencesBlock, resolvePreferencesDir } from "../preferences.ts";
 import { extractJson, type LlmClient } from "../llm/provider.ts";
+import { markDegraded } from "../backfill.ts";
 import { extractFollowups } from "./followups.ts";
 import { parseWhen } from "./when.ts";
 
@@ -366,7 +371,8 @@ export interface CommitmentRow {
   start_time: string | null;
 }
 
-interface InteractionRow {
+/** A source message, as both prompt builders see it. Exported for main/backfill.ts. */
+export interface InteractionRow {
   id: number;
   person_id: number;
   direction: string | null;
@@ -376,7 +382,7 @@ interface InteractionRow {
 }
 
 /** Per-person thread context fed to the prompt (the drafts.ts pattern). */
-interface PersonContext {
+export interface PersonContext {
   name: string | null;
   recent: { direction: string | null; occurred_at: string | null; subject: string | null; body_summary: string | null }[];
 }
@@ -420,8 +426,12 @@ export function buildAnchoredDateReference(anchor: Date): string {
 
 const clip = (s: string | null | undefined, n: number) => (s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
 
-/** A numbered candidate: exactly what both queries refer to by its `n`. */
-interface Candidate {
+/**
+ * A numbered candidate: exactly what both queries refer to by its `n`. Exported so the
+ * backfill sweep (main/backfill.ts) can feed buildNormalizePrompt the same shape rather
+ * than duplicating the prompt.
+ */
+export interface Candidate {
   n: number;
   row: InteractionRow;
   /** subject + body_summary, joined — the text that was hashed. */
@@ -661,6 +671,15 @@ interface PendingCommitment {
   sourceId: number;
   confidence: number;
   dedupeKey: string | null;
+  /**
+   * True only for rows written by the deterministic fallback because the LLM was
+   * UNAVAILABLE (no client, a failed call, or unusable JSON from either query) — i.e. the
+   * description is near-verbatim message text instead of a rewritten headline. These are
+   * enqueued for main/backfill.ts to finish once the quota refills. A successful LLM call
+   * that classified everything as not-a-commitment never sets this: nothing is inserted,
+   * and the model's verdict is the answer, not an outage.
+   */
+  degraded?: boolean;
 }
 
 const joinText = (r: InteractionRow): string =>
@@ -902,6 +921,9 @@ export async function extractCommitmentsLlm(
   if (!llmHandled) {
     // Deterministic fallback (unchanged behavior): each candidate's text runs through the
     // follow-up extractor, capped at FALLBACK_CONFIDENCE so it can never auto-convert.
+    // Reaching here means the LLM was UNAVAILABLE (no client, a failed call, or unusable
+    // JSON) — every row written below is unfinished work, flagged `degraded` so it can be
+    // rewritten when credits come back (main/backfill.ts).
     for (const c of candidates) {
       if (!c.row.occurred_at) continue;
       const proposals = extractFollowups(db, c.row.person_id, [
@@ -922,6 +944,7 @@ export async function extractCommitmentsLlm(
           sourceId: c.row.id,
           confidence: FALLBACK_CONFIDENCE,
           dedupeKey: dedupeKeyFor(p.description, c.row.person_id, p.dueAt),
+          degraded: true,
         });
       }
     }
@@ -953,6 +976,7 @@ export async function extractCommitmentsLlm(
     }
     prev.dueAt = prev.dueAt ?? p.dueAt;
     prev.startTime = prev.startTime ?? p.startTime;
+    prev.degraded = prev.degraded || p.degraded; // one degraded source degrades the survivor
   }
 
   // ── insert (cross-run collapse happens in the ON CONFLICT clause) ─────────
@@ -962,8 +986,10 @@ export async function extractCommitmentsLlm(
   let needsReview = 0;
   let merged = 0;
   for (const p of finals) {
-    const isUpdate = !!(p.dedupeKey && existing.get(p.dedupeKey));
-    ins.run(
+    // Captured BEFORE the upsert: on the conflict path lastInsertRowid does not move, so
+    // the pre-existing row's id is the only handle on what the write actually touched.
+    const prior = p.dedupeKey ? (existing.get(p.dedupeKey) as { id: number } | undefined) : undefined;
+    const info = ins.run(
       p.personId,
       p.direction,
       p.description,
@@ -974,7 +1000,13 @@ export async function extractCommitmentsLlm(
       p.kind,
       p.startTime
     );
-    if (isUpdate) {
+    const rowId = prior ? prior.id : Number(info.lastInsertRowid);
+    if (p.degraded && rowId > 0) {
+      // Unfinished work: the description is a raw fragment because the model was down.
+      // Queued for the backfill sweep, which rewrites it the moment quota is back.
+      markDegraded(db, "commitment", rowId, "llm_unavailable");
+    }
+    if (prior) {
       merged++; // an existing commitment absorbed this one — no new row
       continue;
     }

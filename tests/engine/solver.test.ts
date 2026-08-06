@@ -227,6 +227,38 @@ describe("solver — §9 gate", () => {
     }
   });
 
+  // Flexibility (2026-08-05) added a third state to a binary model. An anchor that names
+  // no tier is still an anchor in the old sense — this pins that, so the three-tier work
+  // cannot quietly change what every existing call site already does.
+  it("an anchor with no flexibility behaves exactly as an explicitly fixed one", () => {
+    const bare: Anchor[] = [
+      { startMin: 10 * 60, endMin: 10 * 60 + 30, blockType: "meeting", title: "standup" },
+      { startMin: 13 * 60, endMin: 14 * 60, blockType: "personal", title: "Dentist appointment" },
+      { startMin: 15 * 60, endMin: 15 * 60 + 30, blockType: "meeting", title: "1:1", movable: true },
+    ];
+    const tagged: Anchor[] = bare.map((a) => ({ ...a, flexibility: "fixed" as const }));
+    const ts = [
+      mkTask({ blockType: "deep_work", estimatedMinutes: 90, isMit: true, cognitiveLoad: 5, title: "MIT" }),
+      mkTask({ blockType: "focused_work", estimatedMinutes: 60, title: "focus" }),
+      mkTask({ blockType: "admin", estimatedMinutes: 45, project: "ops", title: "admin" }),
+      mkTask({ blockType: "gym", estimatedMinutes: 60, title: "Gym" }),
+    ];
+    const untagged = solve(ts, doctrine, bare);
+    expect(JSON.stringify(untagged)).toBe(JSON.stringify(solve(ts, doctrine, tagged)));
+
+    // and the untiered anchors are immovable, occupying exactly their own minutes
+    const dentist = untagged.blocks.find((b) => b.title === "Dentist appointment")!;
+    expect(dentist.startMin).toBe(13 * 60);
+    expect(dentist.endMin).toBe(14 * 60);
+    expect(dentist.isAnchor).toBe(true);
+    for (const b of untagged.blocks) {
+      if (b === dentist) continue;
+      expect(b.startMin < dentist.endMin && b.endMin > dentist.startMin, `"${b.title}" overlaps`).toBe(false);
+    }
+    // nothing was displaced — there is nothing displaceable in a fixed-only day
+    expect(untagged.notes.some((n) => /^Moved /.test(n))).toBe(false);
+  });
+
   it("breaks are inserted after deep work blocks", () => {
     const t = mkTask({ blockType: "deep_work", estimatedMinutes: 90, cognitiveLoad: 5 });
     const r = solve([t], doctrine, []);

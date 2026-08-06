@@ -9,6 +9,7 @@ import { registerIpc } from "./ipc.ts";
 import { startWorkers, cleanupTentativeTasksV2, cleanupTentativeTasksV3 } from "./workers.ts";
 import { purgeBulkContactsOnce } from "./crm/review.ts";
 import { loadDoctrine } from "./engine/doctrine.ts";
+import { closePanel } from "./webpanel.ts";
 
 let db: Db | null = null;
 let win: BrowserWindow | null = null;
@@ -47,6 +48,15 @@ function createWindow() {
   win.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: "deny" };
+  });
+  // A docked web panel is a child view of this window — drop it with the window so
+  // its webContents (and the third-party session behind it) never outlives the UI
+  // that was framing it. webpanel.ts also self-cleans, but the module-level handle
+  // to a dead window is exactly the kind of thing worth closing twice.
+  const self = win;
+  self.on("closed", () => {
+    closePanel(self);
+    if (win === self) win = null;
   });
 }
 

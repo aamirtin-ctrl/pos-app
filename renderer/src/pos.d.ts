@@ -43,6 +43,32 @@ export interface GoogleScopeStatus {
   canWrite: boolean;
 }
 
+/** A rect in CSS pixels, relative to the window's content area (main/webpanel.ts). */
+export interface PanelBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * `panel.open` / `panel.bounds` / `panel.current`: the docked in-app browser. Only
+ * one panel exists at a time, so `current` is null or the single open one.
+ */
+export interface PanelInfo {
+  serviceId: string;
+  label: string;
+  url: string;
+  bounds: PanelBounds;
+}
+
+/** `panel.services`: dmOnly means the panel confines that site to its DM surface. */
+export interface PanelServiceInfo {
+  id: string;
+  label: string;
+  dmOnly: boolean;
+}
+
 declare global {
   interface Window {
     pos: {
@@ -80,6 +106,7 @@ declare global {
       msgplans: { run: Call; list: Call };
       digest: { send: Call; preview: Call };
       capture: { senders: Call };
+      screentime: { available: Call; diagnostics: Call; block: Call; autoCapture: Call };
       undo: { do: Call; redo: Call };
       worklog: { list: Call; add: Call; catchUp: Call };
       context: { list: Call; set: Call; delete: Call; resolveDate: Call };
@@ -90,6 +117,17 @@ declare global {
       inbox: { list: Call; sendEmail: Call; sendIMessage: Call; sendIMessageChat: Call; handles: Call };
       drafts: { list: Call; generate: Call; setStatus: Call };
       voice: { synthesize: Call; get: Call };
+      /**
+       * Docked in-app web browser panel. `open` and `bounds` act on the window that
+       * called them; `bounds` returns null when no panel is open.
+       */
+      panel: {
+        open: Call<PanelInfo>;
+        close: Call<{ closed: boolean }>;
+        bounds: Call<PanelInfo | null>;
+        current: Call<PanelInfo | null>;
+        services: Call<PanelServiceInfo[]>;
+      };
       app: { openFullDiskAccess: Call; openLinkedIn: Call };
     };
   }

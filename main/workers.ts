@@ -10,7 +10,8 @@
 import { createRequire } from "node:module";
 import type { Db } from "./db/db.ts";
 import type { SecretStore } from "./secrets.ts";
-import { extractJson, type LlmClient } from "./llm/provider.ts";
+import { extractJson, llmHealth, type LlmClient } from "./llm/provider.ts";
+import { backfillDegraded, listDegraded } from "./backfill.ts";
 import {
   extractCommitmentsLlm,
   passesCommitmentGate,
@@ -28,6 +29,9 @@ import { distillWeek, distillWeekKey } from "./worklog.ts";
 import type { ConnectorDeps, SyncReport } from "./connectors/common.ts";
 import { syncAllMail, gmailConfigured } from "./connectors/gmail.ts";
 import { reconcileGoogleTasks } from "./gtasks-sync.ts";
+import { runNudgeCheck } from "./nudge.ts";
+import { screenTimeAvailable, autoCaptureOutcomes } from "./screentime.ts";
+import { replanIfConflicted } from "./planner.ts";
 import { syncImessage, imessageAvailable } from "./connectors/imessage.ts";
 import { syncLinkedin } from "./connectors/linkedin.ts";
 import { syncLinkedinEmail } from "./connectors/linkedin-email.ts";
@@ -780,6 +784,26 @@ export function startWorkers(
     if (running) return; // never overlap
     running = true;
     try {
+      // Degraded-work backfill FIRST, before anything else that spends the model (owner ask
+      // 2026-08-05: "when my Gemini credits refill it should go back and fix the stuff it
+      // couldn't summarize at the time"). Repairs get first claim on a freshly-refilled
+      // quota — extraction of new mail can wait a tick; the rough titles already on his
+      // screen have been wrong since the outage. Two cheap guards keep this free on the
+      // 15-minute tick when there is nothing to do: an indexed prefix scan of the queue and
+      // the cached health read. At most one pass per tick.
+      try {
+        if (llm && listDegraded(db, "commitment").length > 0 && llmHealth(db, secrets).ok) {
+          const bf = await backfillDegraded(db, secrets, llm);
+          if (bf.repaired > 0) {
+            notify?.(
+              `Rewrote ${bf.repaired} item${bf.repaired === 1 ? "" : "s"} the AI missed while quota was exhausted`
+            );
+          }
+        }
+      } catch (e) {
+        console.warn(`workers: degraded backfill failed: ${(e as Error).message}`);
+      }
+
       // Skip silently only when ZERO mail accounts are configured.
       // Two-way Google Tasks: pull the user's phone-side edits/deletions BEFORE any
       // push, so a task deleted in Google is never resurrected on the same tick.
@@ -805,6 +829,33 @@ export function startWorkers(
         }
       } catch (e) {
         console.warn(`workers: auto-push sweep failed: ${(e as Error).message}`);
+      }
+
+      // Objective outcomes from yesterday, after midday so his own answers win.
+      try {
+        if (getSetting(db, "screentime_enabled") === "1" && new Date().getHours() >= 12) {
+          const target = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+          const key = `screentime_autocapture_${target}`;
+          if (!getSetting(db, key) && screenTimeAvailable().ok) {
+            const res = autoCaptureOutcomes(db, target);
+            if (!res.error) {
+              setSetting(db, key, new Date().toISOString());
+              if (res.captured > 0) notify?.(`Screen Time: filled in ${res.captured} outcome(s) for ${target}`);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn(`screen time auto-capture failed: ${(e as Error).message}`);
+      }
+
+      // A new fixed obligation on an accepted day re-solves it (local only; the
+      // regenerated plan is un-accepted, so nothing reaches Google until he says so).
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        const r = await replanIfConflicted(db, resolveDoctrineDir(), secrets, llm, today);
+        if (r.replanned) notify?.(`Replanned today around: ${r.displaced.join(", ")}`);
+      } catch (e) {
+        console.warn(`replan check failed: ${(e as Error).message}`);
       }
 
       if (gmailConfigured({ secrets })) {
@@ -878,7 +929,13 @@ export function startWorkers(
   };
 
   const task = cron.schedule("*/15 * * * *", tick);
-  return { stop: () => task.stop() };
+  // Nudges run on their own 5-minute cadence: the reality window is 10 minutes, so a
+  // 15-minute tick would leave blind gaps, and a call-out shouldn't queue behind Gmail.
+  const nudgeTask = cron.schedule("*/5 * * * *", async () => {
+    const n = await runNudgeCheck(db, secrets); // never throws
+    if (n.sent) console.log(`nudge: ${n.kind}`);
+  });
+  return { stop: () => { task.stop(); nudgeTask.stop(); } };
 }
 
 export interface SourceStatus {

@@ -336,4 +336,34 @@ CREATE TABLE user_fact (
 CREATE INDEX idx_user_fact_kind ON user_fact(kind);
 `,
   },
+  {
+    version: 8,
+    name: "flexibility",
+    sql: `
+-- Three-tier event flexibility (owner ask 2026-08-05): "sometimes I add Google Calendar
+-- events after the fact — typically that means it's something I have to go to, and my
+-- calendar should adjust around it. The app should know which events can be moved, which
+-- shouldn't be, and which it should try not to."
+--
+-- Until now the model was binary: is_anchor=1 (immovable) vs planner-placed (free). There
+-- was no "prefer not to move". This column is that third state.
+--
+--   'fixed'     — external obligation; occupies its minutes, never moved (what an anchor
+--                 has always been). Inferred from attendees / accepted invitation /
+--                 obligation words in the title (main/gcal/sync.ts inferFlexibility).
+--   'preferred' — the owner's own solo event; real, but displaceable under pressure.
+--   'flexible'  — POS-generated; the planner owns the placement outright.
+--
+-- DEFAULT 'flexible' because every block this migration back-fills was written by the
+-- planner. Anchors are re-stamped 'fixed' on the next plan generation, and the ENGINE
+-- default (grid.ts DEFAULT_FLEXIBILITY) is 'fixed', so an anchor that never declares a
+-- tier still behaves exactly as it did before.
+ALTER TABLE block ADD COLUMN flexibility TEXT NOT NULL DEFAULT 'flexible';
+
+-- Data back-fill only (no further schema change): rows that were ALREADY immovable under
+-- the binary model are 'fixed' by definition — an external anchor, or a placement the owner
+-- pinned himself. Without this the default above would quietly demote them.
+UPDATE block SET flexibility = 'fixed' WHERE is_anchor = 1 OR is_locked = 1;
+`,
+  },
 ];

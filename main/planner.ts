@@ -13,6 +13,7 @@ import { withPreferences } from "./preferences.ts";
 import {
   readAnchors,
   mergeCalendarSources,
+  inferFlexibility,
   pushPlan,
   pushTasks,
   type GcalPushDeps,
@@ -69,6 +70,83 @@ export function listTasks(db: Db, dateISO: string) {
     .all(dateISO) as Record<string, unknown>[];
 }
 
+/**
+ * Every external event for a date, from all three sources, merged and TIERED.
+ *
+ * Extracted from generatePlan so `replanIfConflicted` compares the accepted plan against
+ * exactly the same anchor set the next generation would use — a re-plan triggered by a
+ * different view of the day than the one that re-plans it would be a bug generator.
+ *
+ * Each anchor carries the `flexibility` inferred at its source (gcal/sync.inferFlexibility).
+ * Anything that declares no tier defaults to `fixed` inside the engine, so a source that
+ * has not been taught about flexibility still behaves as it always did.
+ */
+export async function externalAnchors(db: Db, secrets: SecretStore, dateISO: string): Promise<Anchor[]> {
+  const googleAnchors: MergeableGoogleAnchor[] = [];
+  if (isGoogleConnected(secrets)) {
+    try {
+      googleAnchors.push(...(await readAnchors(db, secrets, dateISO)));
+    } catch (e) {
+      console.warn(`gcal anchors unavailable: ${(e as Error).message}`);
+    }
+  }
+
+  // Apple Calendar (Calendar.app) events anchor the day too, so a Mac-only event still
+  // blocks time in POS. Best-effort: a missing permission must never break planning.
+  const appleEvents: MergeableAppleEvent[] = [];
+  try {
+    for (const ev of await readAppleEvents(dateISO, { exclude: excludedCalendarNames(db) })) {
+      if (ev.allDay) continue; // same rule as the Google path — all-day never blocks
+      const blockType = appleBlockType(ev.title, ev.calendar);
+      appleEvents.push({
+        uid: ev.uid,
+        title: ev.title,
+        startMin: ev.startMin,
+        endMin: ev.endMin,
+        blockType,
+        // Apple gives us no attendee list, so the title and the calendar name are the
+        // whole evidence set — the same rules, just less to go on.
+        flexibility: inferFlexibility({ title: ev.title, calendarName: ev.calendar, blockType }),
+      });
+    }
+  } catch (e) {
+    console.warn(`apple calendar anchors unavailable: ${(e as Error).message}`);
+  }
+
+  // Subscribed webcal/ICS feeds anchor the day too. Same shape as Apple events —
+  // their RFC 5545 UID rides along so the merge can recognise an event that also
+  // reaches us through Google or Apple. Best-effort: a dead feed never breaks planning.
+  const icsEvents: MergeableAppleEvent[] = [];
+  try {
+    for (const ev of await icsEventsForDate(db, dateISO)) {
+      if (ev.allDay) continue; // same rule as the Google/Apple paths — all-day never blocks
+      const blockType = icsBlockType(ev.title);
+      icsEvents.push({
+        uid: ev.uid,
+        title: ev.title,
+        startMin: ev.startMin,
+        endMin: ev.endMin,
+        blockType,
+        flexibility: inferFlexibility({ title: ev.title, blockType }),
+      });
+    }
+  } catch (e) {
+    console.warn(`ics anchors unavailable: ${(e as Error).message}`);
+  }
+
+  // One event living in two systems must block the day exactly once. The join is the
+  // RFC 5545 UID, which survives cross-system sync — so a renamed or rescheduled event
+  // is still recognised as the same event.
+  const merged = mergeCalendarSources(googleAnchors, [...appleEvents, ...icsEvents]);
+  return merged.anchors.map((a) => ({
+    startMin: a.startMin,
+    endMin: a.endMin,
+    blockType: a.blockType,
+    title: a.title,
+    flexibility: a.flexibility,
+  }));
+}
+
 export async function generatePlan(
   db: Db,
   doctrineDir: string,
@@ -93,60 +171,7 @@ export async function generatePlan(
       : { ...stored, chronotype: { ...stored.chronotype, wake_time: wakeTime } };
 
   // anchors: external GCal events + locked blocks from prior plans for this date
-  const anchors: Anchor[] = [];
-  const googleAnchors: MergeableGoogleAnchor[] = [];
-  if (isGoogleConnected(secrets)) {
-    try {
-      googleAnchors.push(...(await readAnchors(db, secrets, dateISO)));
-    } catch (e) {
-      console.warn(`gcal anchors unavailable: ${(e as Error).message}`);
-    }
-  }
-
-  // Apple Calendar (Calendar.app) events anchor the day too, so a Mac-only event still
-  // blocks time in POS. Best-effort: a missing permission must never break planning.
-  const appleEvents: MergeableAppleEvent[] = [];
-  try {
-    for (const ev of await readAppleEvents(dateISO, { exclude: excludedCalendarNames(db) })) {
-      if (ev.allDay) continue; // same rule as the Google path — all-day never blocks
-      appleEvents.push({
-        uid: ev.uid,
-        title: ev.title,
-        startMin: ev.startMin,
-        endMin: ev.endMin,
-        blockType: appleBlockType(ev.title, ev.calendar),
-      });
-    }
-  } catch (e) {
-    console.warn(`apple calendar anchors unavailable: ${(e as Error).message}`);
-  }
-
-  // Subscribed webcal/ICS feeds anchor the day too. Same shape as Apple events —
-  // their RFC 5545 UID rides along so the merge can recognise an event that also
-  // reaches us through Google or Apple. Best-effort: a dead feed never breaks planning.
-  const icsEvents: MergeableAppleEvent[] = [];
-  try {
-    for (const ev of await icsEventsForDate(db, dateISO)) {
-      if (ev.allDay) continue; // same rule as the Google/Apple paths — all-day never blocks
-      icsEvents.push({
-        uid: ev.uid,
-        title: ev.title,
-        startMin: ev.startMin,
-        endMin: ev.endMin,
-        blockType: icsBlockType(ev.title),
-      });
-    }
-  } catch (e) {
-    console.warn(`ics anchors unavailable: ${(e as Error).message}`);
-  }
-
-  // One event living in two systems must block the day exactly once. The join is the
-  // RFC 5545 UID, which survives cross-system sync — so a renamed or rescheduled event
-  // is still recognised as the same event.
-  const merged = mergeCalendarSources(googleAnchors, [...appleEvents, ...icsEvents]);
-  for (const a of merged.anchors) {
-    anchors.push({ startMin: a.startMin, endMin: a.endMin, blockType: a.blockType, title: a.title });
-  }
+  const anchors: Anchor[] = await externalAnchors(db, secrets, dateISO);
 
   const lockedRows = db
     .prepare("SELECT block_type, title, starts_at, ends_at FROM block WHERE is_locked = 1 AND date(starts_at) = ?")
@@ -157,6 +182,9 @@ export async function generatePlan(
       endMin: fromIso(b.ends_at),
       blockType: b.block_type as Anchor["blockType"],
       title: b.title ?? "(locked)",
+      // The owner pinned this placement himself. That is the strongest signal there is —
+      // it outranks whatever tier the event carried before he pinned it.
+      flexibility: "fixed",
     });
   }
 
@@ -193,12 +221,15 @@ export async function generatePlan(
         JSON.stringify(result.unplaced.map((u) => ({ taskId: u.task.id, title: u.task.title, reason: u.reason }))));
     const planId = Number(lastInsertRowid);
     const ins = db.prepare(
-      `INSERT INTO block (task_id, block_type, title, starts_at, ends_at, is_anchor, plan_id, capacity_score_at_placement)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO block (task_id, block_type, title, starts_at, ends_at, is_anchor, plan_id,
+         capacity_score_at_placement, flexibility)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     for (const b of result.blocks) {
       ins.run(b.taskId ?? null, b.blockType, b.title, toIso(dateISO, b.startMin), toIso(dateISO, b.endMin),
-        b.isAnchor ? 1 : 0, planId, b.capacityAtPlacement ?? null);
+        b.isAnchor ? 1 : 0, planId, b.capacityAtPlacement ?? null,
+        // The solver stamps every block; the fallback only covers a hand-built PlacedBlock.
+        b.flexibility ?? (b.isAnchor ? "fixed" : "flexible"));
     }
     db.prepare("UPDATE task SET status = 'planned' WHERE plan_date = ? AND status = 'inbox'").run(dateISO);
     return planId;
@@ -218,6 +249,117 @@ export function getPlan(db: Db, dateISO: string, planId?: number) {
     .prepare("SELECT * FROM block WHERE plan_id = ? ORDER BY starts_at")
     .all(plan.id) as Record<string, unknown>[];
   return { plan, blocks, unplaced: JSON.parse((plan.unplaced_tasks as string) ?? "[]") };
+}
+
+// ── re-solve when a new external obligation lands on an accepted day ─────────
+//
+// Owner ask 2026-08-05: "Sometimes I add Google Calendar events after the fact — typically
+// that means it's something I have to go to, and my calendar should adjust around it."
+//
+// The accepted plan is a commitment, not a draft, so this is deliberately narrow: ONLY a
+// `fixed` anchor that (a) the plan does not already know about and (b) actually lands on
+// top of a placed block triggers a regeneration. A `preferred` event appearing does not —
+// the solver can already bend around it, and re-planning an accepted day is a disruption
+// the owner has to re-read.
+
+export interface ReplanResult {
+  /** True when the plan was regenerated. */
+  replanned: boolean;
+  /** Titles of the placed blocks the new obligation landed on, sorted, deduped. */
+  displaced: string[];
+}
+
+/** One block of an accepted plan, reduced to what the conflict scan needs. */
+export interface PlannedSpan {
+  title: string;
+  startMin: number;
+  endMin: number;
+  isAnchor: boolean;
+  isLocked: boolean;
+}
+
+/**
+ * The pure core of `replanIfConflicted`: which placed blocks does a newly-appeared `fixed`
+ * anchor land on? Separated from the I/O so the decision to disturb an accepted day is
+ * testable without a calendar, a network or a database.
+ *
+ * "Newly appeared" = no anchor block in the plan with the same span AND title. A
+ * rescheduled event fails that test deliberately: an obligation that moved is a new
+ * obligation as far as the day is concerned.
+ *
+ * `is_locked` blocks are excluded from the scan. Re-planning cannot move them (generatePlan
+ * re-reads them as anchors), so counting one as displaced would re-plan the day on every
+ * tick, forever, and never resolve.
+ */
+export function displacedByNewAnchors(
+  blocks: readonly PlannedSpan[],
+  anchors: readonly Anchor[]
+): string[] {
+  const known = new Set(
+    blocks.filter((b) => b.isAnchor).map((b) => `${b.startMin}|${b.endMin}|${b.title.trim()}`)
+  );
+  const placed = blocks.filter((b) => !b.isAnchor && !b.isLocked);
+  const displaced = new Set<string>();
+  for (const a of anchors) {
+    if ((a.flexibility ?? "fixed") !== "fixed") continue; // only obligations force a re-plan
+    if (known.has(`${a.startMin}|${a.endMin}|${a.title.trim()}`)) continue; // already planned around
+    for (const b of placed) {
+      if (a.startMin < b.endMin && a.endMin > b.startMin) displaced.add(b.title);
+    }
+  }
+  return [...displaced].sort();
+}
+
+/**
+ * Compare the accepted plan for `dateISO` against the CURRENT external anchors and
+ * regenerate it when a newly-appeared `fixed` anchor overlaps something already placed.
+ * `is_locked` blocks survive the regeneration untouched — generatePlan re-reads them as
+ * anchors, which is also why they are excluded from the conflict scan below: re-planning
+ * cannot move them, so treating them as displaced would re-plan the day on every tick
+ * forever.
+ *
+ * Safe to call repeatedly: after a regeneration the new anchors are part of the plan, so
+ * the next call finds nothing new and does nothing.
+ */
+export async function replanIfConflicted(
+  db: Db,
+  doctrineDir: string,
+  secrets: SecretStore,
+  llm: LlmClient | null,
+  dateISO: string
+): Promise<ReplanResult> {
+  const none: ReplanResult = { replanned: false, displaced: [] };
+
+  const accepted = db
+    .prepare(
+      "SELECT id FROM plan WHERE plan_date = ? AND accepted_at IS NOT NULL ORDER BY generated_at DESC, id DESC LIMIT 1"
+    )
+    .get(dateISO) as { id: number } | undefined;
+  if (!accepted) return none; // nothing accepted for this date — generatePlan is the entry point
+
+  const rows = db
+    .prepare("SELECT title, starts_at, ends_at, is_anchor, is_locked FROM block WHERE plan_id = ?")
+    .all(accepted.id) as {
+    title: string | null;
+    starts_at: string;
+    ends_at: string;
+    is_anchor: number;
+    is_locked: number;
+  }[];
+
+  const spans: PlannedSpan[] = rows.map((b) => ({
+    title: b.title ?? "(untitled)",
+    startMin: fromIso(b.starts_at),
+    endMin: fromIso(b.ends_at),
+    isAnchor: b.is_anchor === 1,
+    isLocked: b.is_locked === 1,
+  }));
+
+  const displaced = displacedByNewAnchors(spans, await externalAnchors(db, secrets, dateISO));
+  if (displaced.length === 0) return none;
+
+  await generatePlan(db, doctrineDir, secrets, llm, dateISO);
+  return { replanned: true, displaced };
 }
 
 // ── accepting a plan pushes it (owner directive 2026-08-05) ──────────────────
