@@ -15,7 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { openDb, type Db } from "../../main/db/db.ts";
-import { moveBlock, unpinBlock, MOVE_SNAP_MIN } from "../../main/planner.ts";
+import { moveBlock, resizeBlock, unpinBlock, MOVE_SNAP_MIN } from "../../main/planner.ts";
 import { SecretStore } from "../../main/secrets.ts";
 
 const DATE = "2026-08-06";
@@ -168,5 +168,91 @@ describe("moveBlock", () => {
     const pinned = db.prepare("SELECT id FROM block WHERE is_locked = 1").get() as { id: number };
     expect(await unpinBlock(db, dir, secrets, null, pinned.id, deps)).toMatchObject({ moved: true });
     expect(pinnedSpans()).toEqual([]);
+  });
+});
+
+// ── dragging an edge: extend or limit the time this takes ────────────────────
+//
+// Owner ask 2026-08-06: "make it so i can easily move the top/bottom of events to
+// extend/limit time."
+//
+// The difference from moveBlock is what it MEANS. Moving says "do this later"; resizing says
+// "this takes longer than you thought" — so the task's estimate is corrected too, or the
+// correction lives in one day's pin and every future plan keeps budgeting the number he just
+// told us was wrong.
+describe("resizeBlock", () => {
+  const taskBacked = (startMin: number, endMin: number) => {
+    const taskId = Number(
+      db.prepare(
+        `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, is_mit, status, plan_date)
+         VALUES ('Deep work', 'deep_work', 4, ?, 0, 'planned', ?)`
+      ).run(endMin - startMin, DATE).lastInsertRowid
+    );
+    const planId = Number(
+      db.prepare(
+        `INSERT INTO plan (plan_date, engine_version, doctrine_snapshot, narration, unplaced_tasks)
+         VALUES (?, 'test', '{}', '', '[]')`
+      ).run(DATE).lastInsertRowid
+    );
+    const hhmm = (m: number) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+    const blockId = Number(
+      db.prepare(
+        `INSERT INTO block (task_id, block_type, title, starts_at, ends_at, is_anchor, plan_id)
+         VALUES (?, 'deep_work', 'Deep work', ?, ?, 0, ?)`
+      ).run(taskId, `${DATE}T${hhmm(startMin)}:00`, `${DATE}T${hhmm(endMin)}:00`, planId).lastInsertRowid
+    );
+    return { taskId, blockId };
+  };
+  const estimateOf = (taskId: number) =>
+    (db.prepare("SELECT estimated_minutes m FROM task WHERE id = ?").get(taskId) as { m: number }).m;
+
+  it("extends the bottom edge, keeping the start where it was", async () => {
+    const { blockId } = taskBacked(10 * 60, 11 * 60);
+    await resizeBlock(db, dir, secrets, null, blockId, 10 * 60, 12 * 60, deps);
+    expect(pinnedSpans()).toContainEqual([10 * 60, 12 * 60]);
+  });
+
+  it("moves the top edge, keeping the end where it was", async () => {
+    const { blockId } = taskBacked(10 * 60, 11 * 60);
+    await resizeBlock(db, dir, secrets, null, blockId, 9 * 60 + 30, 11 * 60, deps);
+    expect(pinnedSpans()).toContainEqual([9 * 60 + 30, 11 * 60]);
+  });
+
+  // The point of resizing rather than moving: the correction has to outlive the day.
+  it("teaches the task its new length", async () => {
+    const { taskId, blockId } = taskBacked(10 * 60, 11 * 60);
+    expect(estimateOf(taskId)).toBe(60);
+    await resizeBlock(db, dir, secrets, null, blockId, 10 * 60, 12 * 60, deps);
+    expect(estimateOf(taskId)).toBe(120);
+  });
+
+  it("never collapses a block below one slot", async () => {
+    const { blockId } = taskBacked(10 * 60, 11 * 60);
+    await resizeBlock(db, dir, secrets, null, blockId, 10 * 60, 10 * 60, deps);
+    const [[start, end]] = pinnedSpans();
+    expect(end - start).toBeGreaterThanOrEqual(MOVE_SNAP_MIN);
+  });
+
+  it("keeps both edges on the solver's grid", async () => {
+    const { blockId } = taskBacked(10 * 60, 11 * 60);
+    await resizeBlock(db, dir, secrets, null, blockId, 10 * 60 + 7, 11 * 60 + 8, deps);
+    const [[start, end]] = pinnedSpans();
+    expect(start % MOVE_SNAP_MIN).toBe(0);
+    expect(end % MOVE_SNAP_MIN).toBe(0);
+  });
+
+  it("keeps the block inside its own day", async () => {
+    const { blockId } = taskBacked(22 * 60, 23 * 60);
+    await resizeBlock(db, dir, secrets, null, blockId, 22 * 60, 25 * 60, deps);
+    const [[, end]] = pinnedSpans();
+    expect(end).toBeLessThan(24 * 60);
+  });
+
+  it("refuses an external calendar event — its length belongs to that calendar", async () => {
+    const id = addPlanWithBlock({ startMin: 16 * 60, endMin: 19 * 60, isAnchor: true, type: "personal" });
+    expect(await resizeBlock(db, dir, secrets, null, id, 16 * 60, 20 * 60, deps)).toMatchObject({
+      moved: false,
+      error: "external_event",
+    });
   });
 });

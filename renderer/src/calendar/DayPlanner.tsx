@@ -223,6 +223,26 @@ export default function DayPlanner() {
   // recovery breaks, meeting transitions and everything else from doctrine.
   const [moving, setMoving] = useState(false);
   const [moveNote, setMoveNote] = useState<string | null>(null);
+  const resizeBlock = useCallback(async (blockId: number, startMin: number, endMin: number) => {
+    setMoving(true);
+    setMoveNote(null);
+    try {
+      const r = await window.pos.plan.resizeBlock(blockId, startMin, endMin);
+      const res = (r.ok ? r.data : null) as { moved?: boolean; error?: string } | null;
+      if (!r.ok || res?.error) {
+        setMoveNote(
+          res?.error === "external_event"
+            ? "That event lives on your Google calendar — change its length there."
+            : "Could not resize that block."
+        );
+      }
+      await refresh();
+    } catch {
+      setMoveNote("Could not resize that block.");
+    }
+    setMoving(false);
+  }, [refresh]);
+
   const moveBlock = useCallback(async (blockId: number, startMin: number) => {
     setMoving(true);
     setMoveNote(null);
@@ -473,6 +493,7 @@ export default function DayPlanner() {
                 onToggle={() => setOpenKey((k) => (k === it.key ? null : it.key))}
                 onClose={closePopover}
                 onMove={moveBlock}
+                onResize={resizeBlock}
                 onDragStart={closePopover}
                 task={(it.taskId != null && tasksById.get(it.taskId)) || null} />
             ))}
@@ -567,7 +588,7 @@ function GapHint({ startMin, endMin, dim }: { startMin: number; endMin: number; 
  * own rect. Only one popover is open at a time — the open card's key lives in
  * DayPlanner, not here.
  */
-function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task, onMove, dragOffset, onDragStart }: {
+function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task, onMove, onResize, dragOffset, onDragStart }: {
   item: LaidOutItem; height: number; status: "past" | "current" | "future"; nowMin: number;
   open: boolean;
   onToggle: () => void;
@@ -575,6 +596,8 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
   task: { title: string; status: string } | null;
   /** Commit a drag: the block is pinned here and the day re-solves around it. */
   onMove?: (blockId: number, startMin: number) => void;
+  /** Commit an edge drag: the block keeps its other edge and the day re-solves. */
+  onResize?: (blockId: number, startMin: number, endMin: number) => void;
   /** Live px offset while this card is being dragged (0 when it is not). */
   dragOffset?: number;
   onDragStart?: (blockId: number, startMin: number) => void;
@@ -641,6 +664,46 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
   const [ghost, setGhost] = useState(0);
   const offset = ghost || dragOffset || 0;
 
+  // ── edge handles: extend or limit the time this takes ──
+  //
+  // Owner ask 2026-08-06: "make it so i can easily move the top/bottom of events to
+  // extend/limit time." Dragging an edge keeps the OTHER edge fixed, which is the whole
+  // difference from moving — and it says "this takes longer than you thought", so the task's
+  // estimate is corrected too (see planner.resizeBlock).
+  const [edge, setEdge] = useState<{ side: "top" | "bottom"; delta: number } | null>(null);
+  const resizable = movable && !!onResize;
+  const startResize = (side: "top" | "bottom") => (e: React.PointerEvent) => {
+    if (!resizable) return;
+    e.stopPropagation(); // never let the card's own move-drag also claim this gesture
+    e.preventDefault();
+    const el = e.currentTarget as HTMLElement;
+    el.setPointerCapture?.(e.pointerId);
+    const y0 = e.clientY;
+    const onMoveEdge = (ev: PointerEvent) => {
+      const raw = (ev.clientY - y0) / PX_PER_MIN;
+      setEdge({ side, delta: Math.round(raw / MOVE_SNAP_MIN) * MOVE_SNAP_MIN });
+    };
+    const onUp = (ev: PointerEvent) => {
+      el.removeEventListener("pointermove", onMoveEdge);
+      el.removeEventListener("pointerup", onUp);
+      el.releasePointerCapture?.(ev.pointerId);
+      const raw = (ev.clientY - y0) / PX_PER_MIN;
+      const delta = Math.round(raw / MOVE_SNAP_MIN) * MOVE_SNAP_MIN;
+      setEdge(null);
+      if (delta === 0) return;
+      const nextStart = side === "top" ? item.startMin + delta : item.startMin;
+      const nextEnd = side === "bottom" ? item.endMin + delta : item.endMin;
+      if (nextEnd - nextStart < MOVE_SNAP_MIN) return; // a block keeps at least one slot
+      onResize?.(item.blockId!, nextStart, nextEnd);
+    };
+    el.addEventListener("pointermove", onMoveEdge);
+    el.addEventListener("pointerup", onUp);
+  };
+  const topShift = edge?.side === "top" ? edge.delta * PX_PER_MIN : 0;
+  const heightShift =
+    edge?.side === "bottom" ? edge.delta * PX_PER_MIN : edge?.side === "top" ? -edge.delta * PX_PER_MIN : 0;
+  const shownHeight = Math.max(MOVE_SNAP_MIN * PX_PER_MIN, height + heightShift);
+
   return (
     <div className="absolute"
       onPointerDown={onPointerDown}
@@ -648,7 +711,7 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
       onPointerUp={endDrag}
       onPointerCancel={() => { drag.current = null; setGhost(0); }}
       style={{
-        top: yOf(item.startMin) + offset, height,
+        top: yOf(item.startMin) + offset + topShift, height: shownHeight,
         transition: offset ? "none" : "top 140ms ease",
         cursor: movable ? (offset ? "grabbing" : "grab") : "default",
         left: `calc(${GUTTER_PX + 6}px + (100% - ${GUTTER_PX + 10}px) * ${item.lane * laneW / 100})`,
@@ -730,6 +793,28 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
           )}
         </div>
       </div>
+      {resizable && (
+        <>
+          {/* Grab strips on the edges: invisible until hovered, above the card so they win the
+              gesture, and never taller than a quarter of a short block's body. */}
+          <div
+            onPointerDown={startResize("top")}
+            className="absolute left-0 right-0 opacity-0 hover:opacity-100 transition-opacity"
+            style={{ top: -3, height: Math.min(8, Math.max(5, shownHeight / 4)), cursor: "ns-resize", zIndex: 5 }}
+            title="Drag to change when this starts"
+          >
+            <div className="mx-auto rounded-full" style={{ width: 26, height: 3, marginTop: 2, background: "var(--accent)" }} />
+          </div>
+          <div
+            onPointerDown={startResize("bottom")}
+            className="absolute left-0 right-0 opacity-0 hover:opacity-100 transition-opacity"
+            style={{ bottom: -3, height: Math.min(8, Math.max(5, shownHeight / 4)), cursor: "ns-resize", zIndex: 5 }}
+            title="Drag to change how long this takes"
+          >
+            <div className="mx-auto rounded-full" style={{ width: 26, height: 3, marginTop: 3, background: "var(--accent)" }} />
+          </div>
+        </>
+      )}
       {open && <EventPopover item={item} anchorRef={cardRef} task={task} onClose={onClose} />}
     </div>
   );

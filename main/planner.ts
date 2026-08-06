@@ -699,6 +699,67 @@ export async function moveBlock(
   return { moved: true, plan };
 }
 
+/**
+ * Change a block's LENGTH by dragging one of its edges, pin it, and re-solve around it.
+ *
+ * Owner ask 2026-08-06: "make it so i can easily move the top/bottom of events to
+ * extend/limit time."
+ *
+ * The difference from moveBlock is what it means, not just what it writes. Moving a block says
+ * "do this later"; resizing says "this takes longer than you thought". So when the block came
+ * from a task, the task's ESTIMATE is updated to match — otherwise the correction lives only in
+ * one day's pin, and every future plan keeps budgeting the number he just told us was wrong.
+ */
+export async function resizeBlock(
+  db: Db,
+  doctrineDir: string,
+  secrets: SecretStore,
+  llm: LlmClient | null,
+  blockId: number,
+  newStartMin: number,
+  newEndMin: number,
+  deps?: ReplanDeps
+): Promise<MoveBlockResult> {
+  const row = db
+    .prepare(
+      `SELECT b.id, b.task_id, b.is_anchor, b.is_locked, b.starts_at, b.ends_at, p.plan_date
+         FROM block b JOIN plan p ON p.id = b.plan_id
+        WHERE b.id = ?`
+    )
+    .get(blockId) as
+    | {
+        id: number; task_id: number | null; is_anchor: number; is_locked: number;
+        starts_at: string; ends_at: string; plan_date: string;
+      }
+    | undefined;
+  if (!row) return { moved: false, error: "not_found" };
+  if (row.is_anchor === 1 && row.is_locked !== 1) return { moved: false, error: "external_event" };
+
+  const dateISO = row.plan_date;
+  const snap = (m: number) => Math.round(m / MOVE_SNAP_MIN) * MOVE_SNAP_MIN;
+  // Both edges land on the solver's grid, the block keeps at least one slot, and it stays
+  // inside its own date — hour 24 would be read as the next day and invert the block.
+  const latestEnd = Math.floor((24 * 60 - 1) / MOVE_SNAP_MIN) * MOVE_SNAP_MIN;
+  const start = clampMin(snap(newStartMin), 0, latestEnd - MOVE_SNAP_MIN);
+  const end = clampMin(snap(newEndMin), start + MOVE_SNAP_MIN, latestEnd);
+
+  db.prepare("UPDATE block SET starts_at = ?, ends_at = ?, is_locked = 1 WHERE id = ?").run(
+    toIso(dateISO, start),
+    toIso(dateISO, end),
+    blockId
+  );
+  // The correction outlives the day: this is his estimate now, not ours.
+  if (row.task_id != null) {
+    db.prepare("UPDATE task SET estimated_minutes = ?, estimate_source = 'stated' WHERE id = ?").run(
+      end - start,
+      row.task_id
+    );
+  }
+
+  const plan = await generatePlan(db, doctrineDir, secrets, llm, dateISO, { ...deps, fast: true });
+  return { moved: true, plan };
+}
+
 /** Release a pin so the planner may site this work itself again. Re-solves the day. */
 export async function unpinBlock(
   db: Db,

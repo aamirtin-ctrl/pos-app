@@ -52,7 +52,18 @@ afterEach(() => {
 // ── fixtures ────────────────────────────────────────────────────────────────
 
 /** The injected calendar. No network, and the check and the re-solve see one view of the day. */
-const calendar = (anchors: Anchor[]): ReplanDeps => ({ anchors: async () => anchors });
+// A FIXED clock, early on the day under test.
+//
+// DATE is 2026-08-06, which was the real date when these were written — so once the wall clock
+// passed each fixture's hours, the now-floor started treating them as history and the
+// past-block carry-forward pinned them where they stood. Two tests began failing in the
+// evening and would have passed again tomorrow, which is the worst kind of flake.
+//
+// These tests are about re-planning, not about what time it is. Pinning the clock at 06:00
+// keeps the whole day ahead of "now", which is the condition they were written under.
+const AT_0600 = new Date(`${DATE}T06:00:00`);
+
+const calendar = (anchors: Anchor[]): ReplanDeps => ({ anchors: async () => anchors, now: AT_0600 });
 
 const anchor = (
   startMin: number,

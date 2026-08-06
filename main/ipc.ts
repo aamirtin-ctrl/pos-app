@@ -510,6 +510,8 @@ export function registerIpc(deps: IpcDeps) {
   // recomputed by doctrine instead of dragged along by hand (owner ask 2026-08-06).
   h("plan.moveBlock", (blockId: number, startMin: number) =>
     planner.moveBlock(db, doctrineDir, secrets, deps.llm(), blockId, startMin));
+  h("plan.resizeBlock", (blockId: number, startMin: number, endMin: number) =>
+    planner.resizeBlock(db, doctrineDir, secrets, deps.llm(), blockId, startMin, endMin));
   h("plan.unpinBlock", (blockId: number) =>
     planner.unpinBlock(db, doctrineDir, secrets, deps.llm(), blockId));
 
