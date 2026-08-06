@@ -103,6 +103,7 @@ import { listSubscriptions, addSubscription, removeSubscription, eventsForDate a
 import {
   notionAvailable, searchTargets, syncNotion, PARENT_PAGE_KEY,
   listWorkspacePages, readPageBlocks, appendToPage, setTodoChecked, createWorkspacePage,
+  queryDatabaseRows, updateBlockText, deleteBlock,
 } from "./notion.ts";
 import {
   appleCalendarAvailable,
@@ -646,8 +647,12 @@ export function registerIpc(deps: IpcDeps) {
   // local mirror — "they all talk to each other" holds because there is only ever one copy.
   h("notion.pages", () => listWorkspacePages(secrets));
   h("notion.page", (pageId: string) => readPageBlocks(secrets, pageId));
-  h("notion.append", (pageId: string, line: string, kind?: "todo" | "text") =>
-    appendToPage(secrets, pageId, line, kind ?? "todo"));
+  h("notion.rows", (databaseId: string) => queryDatabaseRows(secrets, databaseId));
+  h("notion.append", (pageId: string, line: string, kind?: "todo" | "text", after?: string) =>
+    appendToPage(secrets, pageId, line, kind ?? "todo", after));
+  h("notion.updateBlock", (blockId: string, kind: "todo" | "text", line: string) =>
+    updateBlockText(secrets, blockId, kind, line));
+  h("notion.deleteBlock", (blockId: string) => deleteBlock(secrets, blockId));
   h("notion.check", (blockId: string, checked: boolean) => setTodoChecked(secrets, blockId, checked));
   h("notion.createPage", (title: string, firstLine?: string) =>
     createWorkspacePage(db, secrets, title, { firstLine }));

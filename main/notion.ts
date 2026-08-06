@@ -522,10 +522,12 @@ export async function syncNotion(db: Db, secrets: SecretStore): Promise<NotionSy
 // OWN databases (tasks/journal/commitments). Those are POS data published to Notion. This is
 // his workspace, borrowed.
 
-/** One page in the tab's list. */
+/** One thing the tab can open: a page he shared, or a database he shared. */
 export interface NotionPageRef {
   id: string;
   title: string;
+  /** Databases are opened as a row list; pages are opened as a block document. */
+  type: "page" | "database";
   /** Notion's own URL, for "open in Notion". */
   url: string | null;
   /** Last edit time, ISO — the tab sorts on it so what he touched last is on top. */
@@ -539,14 +541,25 @@ export interface NotionBlock {
   kind: "todo" | "text" | "heading" | "other";
   text: string;
   checked?: boolean;
+  /** False for shapes the tab knows how to display but not how to rewrite safely. */
+  editable: boolean;
 }
 
 /**
- * Pages the integration can see, newest edit first.
+ * What he actually SHARED with the integration — not everything Notion will hand back.
  *
- * Notion's /search returns only what the owner has explicitly shared with the integration,
- * which is the permission model doing exactly what it should — the tab can never show a page
- * he did not connect.
+ * Owner report 2026-08-06: "when I click the tab, there are, like, a bunch of untitled pages.
+ * I don't know why. I only gave it access to my Instagram content calendar, my habit tracker,
+ * and my Stanford first year course planner."
+ *
+ * Those three are DATABASES, and /search returns every ROW of a shared database as a page
+ * object in its own right. Filtering to `object: page` therefore did the exact opposite of
+ * what it looked like: it dropped the three things he named and kept their contents — habit
+ * rows and content-calendar entries, most of which are keyed by a date property and carry no
+ * title at all, hence a wall of "(untitled)".
+ *
+ * The top level is now what he connected: databases and top-level pages, never a row. Rows are
+ * reachable by opening the database they belong to, which is where they mean something.
  */
 export async function listWorkspacePages(secrets: SecretStore, limit = 50): Promise<NotionPageRef[]> {
   const token = requireToken(secrets);
@@ -554,16 +567,52 @@ export async function listWorkspacePages(secrets: SecretStore, limit = 50): Prom
     method: "POST",
     body: {
       page_size: Math.min(100, Math.max(1, limit)),
-      filter: { property: "object", value: "page" },
       sort: { direction: "descending", timestamp: "last_edited_time" },
+    },
+  });
+  const out: NotionPageRef[] = [];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  for (const r of (res.results ?? []) as any[]) {
+    if (r.archived) continue;
+    if (r.object !== "page" && r.object !== "database") continue;
+    // A row of a shared database is content, not a thing he connected.
+    if (r.object === "page" && r.parent?.type === "database_id") continue;
+    const title = extractTitle(r);
+    // An untitled top-level object is noise he cannot identify anyway.
+    if (title === "(untitled)") continue;
+    out.push({
+      id: r.id as string,
+      title,
+      type: r.object as "page" | "database",
+      url: (r.url as string) ?? null,
+      editedAt: (r.last_edited_time as string) ?? null,
+    });
+  }
+  return out;
+}
+
+/** The rows of a database, newest edit first — what "open the habit tracker" means. */
+export async function queryDatabaseRows(
+  secrets: SecretStore,
+  databaseId: string,
+  limit = 100
+): Promise<NotionPageRef[]> {
+  const token = requireToken(secrets);
+  const res = await notionFetch(token, `/databases/${databaseId}/query`, {
+    method: "POST",
+    body: {
+      page_size: Math.min(100, Math.max(1, limit)),
+      sorts: [{ timestamp: "last_edited_time", direction: "descending" }],
     },
   });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return ((res.results ?? []) as any[])
-    .filter((r) => r.object === "page" && !r.archived)
+    .filter((r) => !r.archived)
     .map((r) => ({
       id: r.id as string,
+      // A row with no title still has to be openable, so it keeps the placeholder here.
       title: extractTitle(r),
+      type: "page" as const,
       url: (r.url as string) ?? null,
       editedAt: (r.last_edited_time as string) ?? null,
     }));
@@ -577,15 +626,16 @@ export async function readPageBlocks(secrets: SecretStore, pageId: string, limit
     `/blocks/${pageId}/children?page_size=${Math.min(100, Math.max(1, limit))}`
   );
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return ((res.results ?? []) as any[]).map((b) => {
+  return ((res.results ?? []) as any[]).map((b): NotionBlock => {
     const t = b.type as string;
     const body = b[t] ?? {};
     const line = plain(body.rich_text);
-    if (t === "to_do") return { id: b.id, kind: "todo" as const, text: line, checked: !!body.checked };
-    if (t === "paragraph") return { id: b.id, kind: "text" as const, text: line };
-    if (t?.startsWith("heading_")) return { id: b.id, kind: "heading" as const, text: line };
-    // Anything else (toggles, callouts, embeds…) is shown as its text so the page still reads.
-    return { id: b.id, kind: "other" as const, text: line || `(${t})` };
+    if (t === "to_do") return { id: b.id, kind: "todo", text: line, checked: !!body.checked, editable: true };
+    if (t === "paragraph") return { id: b.id, kind: "text", text: line, editable: true };
+    if (t?.startsWith("heading_")) return { id: b.id, kind: "heading", text: line, editable: false };
+    // Anything else (toggles, callouts, child databases…) is shown so the page still reads,
+    // but not offered for editing — rewriting a shape we do not model could destroy content.
+    return { id: b.id, kind: "other", text: line || `(${t})`, editable: false };
   });
 }
 
@@ -594,7 +644,16 @@ export async function appendToPage(
   secrets: SecretStore,
   pageId: string,
   line: string,
-  kind: "todo" | "text" = "todo"
+  kind: "todo" | "text" = "todo",
+  /**
+   * Insert directly BELOW this block instead of at the end of the page.
+   *
+   * Owner report 2026-08-06: "when I open Stanford first year course planner, I get the option
+   * to add to this page, but I don't know where it's adding. I wanna specifically be able to
+   * add in specific spots." Appending blindly to the end of a structured page is close to
+   * useless — it lands under whatever happens to be last.
+   */
+  after?: string
 ): Promise<{ added: boolean }> {
   const token = requireToken(secrets);
   const body = line.replace(/\s+/g, " ").trim();
@@ -605,7 +664,7 @@ export async function appendToPage(
       : { object: "block", type: "paragraph", paragraph: { rich_text: text(body) } };
   await notionFetch(token, `/blocks/${pageId}/children`, {
     method: "PATCH",
-    body: { children: [block] },
+    body: { children: [block], ...(after ? { after } : {}) },
   });
   return { added: true };
 }
@@ -659,7 +718,40 @@ export async function createWorkspacePage(
   return {
     id: res.id as string,
     title: name,
+    type: "page",
     url: (res.url as string) ?? null,
     editedAt: (res.last_edited_time as string) ?? null,
   };
+}
+
+/**
+ * Rewrite one block's text in place — the tab is his page, editable, not a form that only
+ * appends (owner ask 2026-08-06: "maybe the pop ups should just be, like, the notion page,
+ * basically, but editable").
+ *
+ * Only the shapes readPageBlocks marks `editable` may be sent here. A heading or a callout is
+ * displayed but never rewritten: guessing at a structure we do not model risks destroying
+ * content in his real workspace, and there is no undo on the other side.
+ */
+export async function updateBlockText(
+  secrets: SecretStore,
+  blockId: string,
+  kind: "todo" | "text",
+  line: string
+): Promise<{ ok: true }> {
+  const token = requireToken(secrets);
+  const body = line.replace(/\s+/g, " ").trim();
+  if (!body) throw new Error("A line cannot be emptied — delete it instead");
+  await notionFetch(token, `/blocks/${blockId}`, {
+    method: "PATCH",
+    body: kind === "todo" ? { to_do: { rich_text: text(body) } } : { paragraph: { rich_text: text(body) } },
+  });
+  return { ok: true };
+}
+
+/** Remove a block. Notion archives rather than destroys, so this is recoverable in his trash. */
+export async function deleteBlock(secrets: SecretStore, blockId: string): Promise<{ ok: true }> {
+  const token = requireToken(secrets);
+  await notionFetch(token, `/blocks/${blockId}`, { method: "PATCH", body: { archived: true } });
+  return { ok: true };
 }

@@ -99,6 +99,9 @@ contextBridge.exposeInMainWorld("pos", {
     append: call("notion.append"),
     check: call("notion.check"),
     createPage: call("notion.createPage"),
+    rows: call("notion.rows"),
+    updateBlock: call("notion.updateBlock"),
+    deleteBlock: call("notion.deleteBlock"),
   },
   applecal: {
     available: call("applecal.available"),

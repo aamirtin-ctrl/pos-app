@@ -122,6 +122,7 @@ declare global {
       notion: {
         available: Call; targets: Call; setParent: Call; sync: Call;
         pages: Call; page: Call; append: Call; check: Call; createPage: Call;
+        rows: Call; updateBlock: Call; deleteBlock: Call;
       };
       applecal: { available: Call; calendars: Call; events: Call; mirror: Call };
       settings: {
