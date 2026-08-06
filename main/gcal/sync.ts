@@ -4,7 +4,9 @@
 //       anchor blocks for the planner.
 // WRITE: ONLY into the dedicated "POS — Planned" calendar. Never the primary. Every
 //        generated block is deletable in one action; real invitations are never touched.
-// Push is explicit — plan generated, reviewed, pushed on confirm. No auto-write.
+// Push is AUTOMATIC (owner directive 2026-08-06): a plan reaches Google as soon as it is
+//        generated, and again whenever it changes. The button is a retry, not the gesture.
+//        Blocks a re-plan removed are withdrawn from Google too — see drainTombstones.
 // Two-way rule: if the user moves a POS event in Google Calendar, the next sync marks
 // that block is_locked=1 and the planner treats it as an anchor. Do not fight the user.
 // Tasks: open planner tasks + confirmed commitments push to a "POS" Google Tasks list
@@ -47,6 +49,7 @@ export interface PushCalendarApi {
   events: {
     insert(args: { calendarId: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
     update(args: { calendarId: string; eventId: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
+    delete(args: { calendarId: string; eventId: string }): Promise<unknown>;
   };
 }
 
@@ -748,17 +751,75 @@ export function mergeCalendarSources(
  * and the UI keeps offering the retry — the old code could never distinguish "pushed" from
  * "tried and was refused".
  */
+// ── withdrawing events the plan no longer contains ───────────────────────────
+//
+// Pushing became automatic (owner directive 2026-08-06: "it should automatically populate to
+// my Google Calendar, it shouldn't require me to press a button"), and that turned a latent
+// leak into a real one. A re-plan DELETES the superseded blocks locally — cascade, so nothing
+// in TypeScript even sees it happen — and their Google events used to survive as orphans
+// nobody could ever match back to a block. Push once by hand and you never notice; push on
+// every re-plan and the calendar fills with ghosts of abandoned schedules.
+//
+// So the DELETE itself records the event id (migration 10's trigger, which cascades catch
+// too), and the next push withdraws them from Google. A block whose id is REUSED by the new
+// plan clears its own tombstone at insert time, so carrying a block across a re-plan updates
+// the event in place instead of deleting and recreating it.
+
+/** How many stale events one push may withdraw, so a huge backlog can't stall the day's push. */
+export const TOMBSTONE_DRAIN_LIMIT = 200;
+
+/**
+ * Delete every event the local plan no longer has a block for. Best-effort per event: an
+ * event already gone from Google (404/410) is a SUCCESS — the goal is that it not be there.
+ * Anything else leaves the row for the next push rather than losing track of it.
+ */
+export async function drainTombstones(
+  db: Db,
+  secrets: SecretStore,
+  deps?: Partial<GcalPushDeps>
+): Promise<{ deleted: number }> {
+  const rows = db
+    .prepare("SELECT id, event_id, calendar_id FROM gcal_tombstone ORDER BY id LIMIT ?")
+    .all(TOMBSTONE_DRAIN_LIMIT) as { id: number; event_id: string; calendar_id: string | null }[];
+  if (rows.length === 0) return { deleted: 0 };
+
+  const posCal = getSetting(db, "pos_calendar_id");
+  const cal = pushDeps(secrets, deps).calendar();
+  const forget = db.prepare("DELETE FROM gcal_tombstone WHERE id = ?");
+  let deleted = 0;
+  for (const r of rows) {
+    const calendarId = r.calendar_id ?? posCal;
+    // No POS calendar has ever existed, so neither has the event. Drop the row.
+    if (!calendarId) { forget.run(r.id); continue; }
+    try {
+      await cal.events.delete({ calendarId, eventId: r.event_id });
+      forget.run(r.id);
+      deleted++;
+    } catch (e) {
+      if (needsReconsent(e)) throw e; // a scope problem, not a missing event — let the caller map it
+      const status = (e as { code?: number; status?: number })?.code ?? (e as { status?: number })?.status;
+      if (status === 404 || status === 410) { forget.run(r.id); continue; } // already gone = done
+      console.warn(`gcal: could not withdraw event ${r.event_id}: ${(e as Error).message}`);
+    }
+  }
+  if (deleted > 0) clearAnchorsCache();
+  return { deleted };
+}
+
 export async function pushPlan(
   db: Db,
   secrets: SecretStore,
   planId: number,
   deps?: Partial<GcalPushDeps>
-): Promise<{ pushed: number }> {
+): Promise<{ pushed: number; withdrawn: number }> {
   const plan = db.prepare("SELECT plan_date FROM plan WHERE id = ?").get(planId) as { plan_date: string } | undefined;
   if (!plan) throw new Error(`plan ${planId} not found`);
   return withReconsentMapping(async () => {
     const calId = await ensurePosCalendar(db, secrets, deps);
     const cal = pushDeps(secrets, deps).calendar();
+    // Withdraw BEFORE writing: the owner should never see the old block and its replacement
+    // sitting on top of each other, even for the length of one push.
+    const { deleted: withdrawn } = await drainTombstones(db, secrets, deps);
     const blocks = db
       .prepare("SELECT id, block_type, title, starts_at, ends_at, gcal_event_id FROM block WHERE plan_id = ? AND is_anchor = 0")
       .all(planId) as { id: number; block_type: string; title: string; starts_at: string; ends_at: string; gcal_event_id: string | null }[];
@@ -780,7 +841,7 @@ export async function pushPlan(
     }
     db.prepare("UPDATE plan SET pushed_at = datetime('now') WHERE id = ?").run(planId);
     clearAnchorsCache(); // the day just changed in Google — next read must be live
-    return { pushed };
+    return { pushed, withdrawn };
   });
 }
 

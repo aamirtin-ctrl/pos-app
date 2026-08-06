@@ -105,18 +105,29 @@ describe("buildGrid (Phase 3 gate)", () => {
       expect(last.eligible.meeting).toBe(true);
     });
 
-    it("personal, meal and break stay legal after the boundary", () => {
+    // Owner report 2026-08-06: "Again, added the task of unpacking my travel bag two hours
+    // after my shutdown ritual. Shouldn't be doing this." `personal` used to be exempt from
+    // the boundary on the theory that the evening is his — but a chore the engine assigns him
+    // at 22:30 is not rest, and a shutdown that assignments run past is not a boundary.
+    it("no ASSIGNED work — personal chores included — survives the boundary", () => {
       const evening = grid.slots.find((s) => s.startMin === 21 * 60)!;
-      expect(evening.eligible.personal).toBe(true);
+      expect(evening.eligible.personal).toBe(false);
+      expect(evening.eligible.deep_work).toBe(false);
+      expect(evening.eligible.admin).toBe(false);
+    });
+
+    it("the doctrine's own scaffolding stays legal after the boundary", () => {
+      // meal/break/transition are never something he has to remember to do — they exist to
+      // structure the blocks around them, so the boundary has no business closing them.
+      const evening = grid.slots.find((s) => s.startMin === 21 * 60)!;
       expect(evening.eligible.meal).toBe(true);
       expect(evening.eligible.break).toBe(true);
       expect(evening.eligible.transition).toBe(true);
-      // Gym is life, not work, so the boundary does not touch it — but its OWN rule
-      // (end ≥3h before sleep) still applies, and at 21:00 that is what rejects it.
+      // Gym is rejected here by its OWN rule (end ≥3h before sleep), not by the boundary.
       expect(evening.eligible.gym).toBe(false);
     });
 
-    it("gym remains eligible after an early boundary — the ban is on work, not on the evening", () => {
+    it("gym survives an early boundary — training the evening is using it, not losing it", () => {
       // Shutdown 5h before sleep = 18:00, leaving post-boundary slots that clear the 3h gym floor.
       const early = parseDoctrine(
         DEFAULT_DOCTRINE_YAML.replace("before_sleep_hours: 2.5", "before_sleep_hours: 5.0")
@@ -125,7 +136,8 @@ describe("buildGrid (Phase 3 gate)", () => {
       expect(g.shutdownMin).toBe(18 * 60);
       const s = g.slots.find((x) => x.startMin === 18 * 60 + 30)!; // after the boundary, 4.25h to sleep
       expect(s.eligible.gym).toBe(true);
-      expect(s.eligible.personal).toBe(true);
+      // …while an assigned chore at the same minute is not.
+      expect(s.eligible.personal).toBe(false);
       expect(s.eligible.deep_work).toBe(false);
       expect(s.eligible.admin).toBe(false);
     });

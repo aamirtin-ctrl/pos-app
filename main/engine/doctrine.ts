@@ -47,6 +47,32 @@ export const WORK_TYPES: ReadonlySet<BlockType> = new Set([
   "deep_work", "focused_work", "admin", "comms", "meeting",
 ]);
 
+/**
+ * ASSIGNMENTS — everything the shutdown ritual closes the door on.
+ *
+ * WORK_TYPES turned out to be the wrong test for that door. Owner report 2026-08-06: "Again,
+ * added the task of unpacking my travel bag two hours after my shutdown ritual. Shouldn't be
+ * doing this." Unpacking a bag is typed `personal`, so the work-only ban let it through — but
+ * it is still a chore the engine handed him at 22:30, and calling it personal does not make
+ * it rest. The distinction that actually matters is not work-versus-life, it is
+ * ASSIGNED-versus-PLACED:
+ *
+ *   - Assigned: it came off his list. `personal` belongs here with the work types — the
+ *     evening being his is precisely why POS must stop putting chores in it.
+ *   - Placed: the doctrine's own scaffolding — the shutdown ritual (which must stay legal at
+ *     its own start), plus `meal`, `break` and `transition`, which exist only to structure
+ *     the blocks around them and never represent something he has to remember to do.
+ *
+ * `gym` is deliberately NOT here, and the distinction is the point: a workout after the work
+ * day closes is the evening being used WELL, not an imposition on it. Its own rule already
+ * keeps it clear of sleep (min_gym_end_before_sleep_hours), which is the constraint that
+ * actually matters for exercise. Barring it here would have banned evening training outright
+ * on any day with an early shutdown — a real loss, and nothing the owner asked for.
+ */
+export const ASSIGNABLE_TYPES: ReadonlySet<BlockType> = new Set([
+  ...WORK_TYPES, "personal",
+]);
+
 const curvePoint = z.object({ hours_after_wake: z.number().min(0), capacity: z.number().min(0).max(100) });
 
 const doctrineSchema = z.object({
@@ -206,12 +232,78 @@ export function parseDoctrine(yamlText: string): Doctrine {
   return doctrineSchema.parse(raw);
 }
 
-/** Seeds the default doctrine.yaml if missing, then loads+validates it. */
+// ── keeping an EXISTING doctrine.yaml current ────────────────────────────────
+//
+// Owner report 2026-08-06: "when I sent the good morning tasks, it should have also allotted
+// time in the morning for my wake-up routine, showering, eating breakfast."
+//
+// It should have — the ritual had been added to the shipped default the day before, in his
+// own words. But `loadDoctrine` only ever wrote that default when the file was MISSING, and
+// his doctrine.yaml was created before the ritual existed. So the fix shipped, the tests
+// passed, and the one person it was for never saw it. Any doctrine improvement from here on
+// would have had the same fate.
+//
+// This reconciles by LABEL and only ever adds: a ritual he deleted on purpose stays deleted
+// only if he also removes it from the default, which is the honest trade for not silently
+// overwriting a file he is invited to edit. His comments and ordering survive because the
+// insertion is textual — parsing to an object and re-dumping would strip every comment in a
+// file whose comments are half its value.
+
+/** A `- { … }` ritual line from a YAML block, with its label if it has one. */
+function ritualLines(yamlText: string): { line: string; label: string | null }[] {
+  const start = yamlText.search(/^fixed_rituals:\s*$/m);
+  if (start < 0) return [];
+  const rest = yamlText.slice(start).split("\n").slice(1);
+  const out: { line: string; label: string | null }[] = [];
+  for (const line of rest) {
+    if (/^\S/.test(line)) break; // dedent → the block ended
+    if (!/^\s*-\s*\{/.test(line)) continue;
+    out.push({ line, label: line.match(/label:\s*"([^"]*)"/)?.[1] ?? null });
+  }
+  return out;
+}
+
+/**
+ * Add any ritual the shipped default defines that the owner's file has no label for.
+ * Returns the labels added. A file with no `fixed_rituals:` block is left alone.
+ */
+export function reconcileRituals(yamlText: string): { text: string; added: string[] } {
+  const mine = ritualLines(yamlText);
+  if (mine.length === 0) return { text: yamlText, added: [] };
+  const have = new Set(mine.map((r) => r.label).filter((l): l is string => l !== null));
+  const missing = ritualLines(DEFAULT_DOCTRINE_YAML).filter((r) => r.label && !have.has(r.label));
+  if (missing.length === 0) return { text: yamlText, added: [] };
+
+  // Insert after the last ritual line that is already there, so ordering stays sane.
+  const lines = yamlText.split("\n");
+  const lastIdx = lines.lastIndexOf(mine[mine.length - 1].line);
+  if (lastIdx < 0) return { text: yamlText, added: [] };
+  lines.splice(lastIdx + 1, 0, ...missing.map((r) => r.line));
+  return { text: lines.join("\n"), added: missing.map((r) => r.label!) };
+}
+
+/**
+ * Seeds the default doctrine.yaml if missing, reconciles rituals into an existing one, then
+ * loads+validates it. A reconciliation that would produce an invalid file is discarded — the
+ * owner's working doctrine is never traded for a newer one that does not parse.
+ */
 export function loadDoctrine(dir: string): Doctrine {
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, "doctrine.yaml");
   if (!fs.existsSync(file)) fs.writeFileSync(file, DEFAULT_DOCTRINE_YAML, "utf8");
-  return parseDoctrine(fs.readFileSync(file, "utf8"));
+  const text = fs.readFileSync(file, "utf8");
+  const { text: reconciled, added } = reconcileRituals(text);
+  if (added.length > 0) {
+    try {
+      const parsed = parseDoctrine(reconciled);
+      fs.writeFileSync(file, reconciled, "utf8");
+      console.log(`doctrine: added missing ritual(s) — ${added.join(", ")}`);
+      return parsed;
+    } catch (e) {
+      console.warn(`doctrine: ritual reconciliation produced an invalid file, keeping yours (${(e as Error).message})`);
+    }
+  }
+  return parseDoctrine(text);
 }
 
 export function saveDoctrine(dir: string, yamlText: string): Doctrine {

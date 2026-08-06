@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { openDb, getSetting, setSetting, type Db } from "../main/db/db.ts";
+import { RECONNECT_GRACE_DAYS } from "../main/crm/reconnect.ts";
 import type { SecretStore } from "../main/secrets.ts";
 import {
   DIGEST_PREFIX,
@@ -42,6 +43,9 @@ afterEach(() => {
 
 const todayISO = () => new Date().toISOString().slice(0, 10);
 
+// `reconnectDueDaysAgo` must clear RECONNECT_GRACE_DAYS for the person to reach the digest:
+// since 2026-08-06 a name only surfaces once it is meaningfully past due, not the instant
+// the 90-day threshold ticks over.
 function addPerson(name: string, opts: { reconnectDueDaysAgo?: number } = {}): number {
   const r = db.prepare("INSERT INTO person (display_name, tier) VALUES (?, 1)").run(name);
   const id = Number(r.lastInsertRowid);
@@ -98,7 +102,7 @@ describe("composeDigest", () => {
     const c1 = addCommitment("Send Raj the deck", { personId: raj, sourceId: src });
     const c2 = addCommitment("Collect the lease from Dev");
     const t1 = addTask("Book flights");
-    const sarah = addPerson("Sarah Chen", { reconnectDueDaysAgo: 12 });
+    const sarah = addPerson("Sarah Chen", { reconnectDueDaysAgo: RECONNECT_GRACE_DAYS + 12 });
 
     const { text, mapping } = composeDigest(db);
 
@@ -254,7 +258,7 @@ async function seedAndSend(): Promise<{ raj: number; c1: number; c2: number; t1:
   const c2 = addCommitment("Collect the lease from Dev");
   addTask("Task spawned by c2", { commitmentId: c2, planDate: "2099-01-01" }); // proves the cascade
   const t1 = addTask("Book flights");
-  const sarah = addPerson("Sarah Chen", { reconnectDueDaysAgo: 12 });
+  const sarah = addPerson("Sarah Chen", { reconnectDueDaysAgo: RECONNECT_GRACE_DAYS + 12 });
   setSetting(db, "digest_enabled", "1");
   setSetting(db, "capture_self_handles", "+12145550100");
   const res = await sendMorningDigest(db, noGoogle, { runScript: sendStub });

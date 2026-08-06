@@ -4,7 +4,7 @@
 // set before scoring ever happens. Hard constraints are filters, not penalties.
 
 import {
-  BLOCK_TYPES, COGNITIVE_TYPES, WORK_TYPES, capacityAt, dayBounds,
+  ASSIGNABLE_TYPES, BLOCK_TYPES, COGNITIVE_TYPES, capacityAt, dayBounds,
   shutdownStartMin, type BlockType, type Doctrine,
 } from "./doctrine.ts";
 
@@ -135,12 +135,22 @@ export function buildGrid(doctrine: Doctrine, anchors: Anchor[]): Grid {
       if (t === "gym" && s.hoursToSleep < hc.min_gym_end_before_sleep_hours) ok = false;
       // Comms must end >= latest_comms_window_before_sleep_hours before sleep.
       if (t === "comms" && s.hoursToSleep < hc.latest_comms_window_before_sleep_hours) ok = false;
-      // The shutdown ritual CLOSES the work day. No work type may start at or after it.
-      // Because the solver requires every slot of a run to be eligible, this also stops a
-      // work block that starts before the boundary from running through it — work must be
-      // finished by shutdown, not merely begun. Non-work (personal/meal/break/gym, each
-      // still subject to its own rules) stays legal: the evening is theirs.
-      if (shutdownMin !== null && WORK_TYPES.has(t) && s.startMin >= shutdownMin) ok = false;
+      // The shutdown ritual CLOSES THE DAY — for anything the owner put on a to-do list.
+      //
+      // It used to close the day only for WORK_TYPES, on the theory that the evening is his
+      // and a personal errand is not work. Owner report 2026-08-06: "Again, added the task of
+      // unpacking my travel bag two hours after my shutdown ritual. Shouldn't be doing this."
+      // He is right, and the earlier reading was too clever. Unpacking a bag at 22:30 is not
+      // leisure — it is a chore the engine assigned him, and being labelled `personal` does
+      // not make it restful. A shutdown ritual that other assignments run past isn't a
+      // boundary at all.
+      //
+      // What stays legal after shutdown is what the DOCTRINE places (the ritual itself, and
+      // the recovery/meal blocks the solver inserts around real work), never a task. Because
+      // the solver requires every slot of a run to be eligible, this also stops a block that
+      // starts before the boundary from running through it — assignments must be FINISHED by
+      // shutdown, not merely begun.
+      if (shutdownMin !== null && ASSIGNABLE_TYPES.has(t) && s.startMin >= shutdownMin) ok = false;
       s.eligible[t] = ok;
     }
   }

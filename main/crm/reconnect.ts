@@ -6,6 +6,24 @@ import type { Db } from "../db/db.ts";
 
 export const TIER_DAYS: Record<number, number> = { 0: 90, 1: 90, 2: 120, 3: Infinity };
 
+/**
+ * How far PAST due a relationship must be before it is worth raising.
+ *
+ * Owner report 2026-08-06: "it still tells me to reconnect with people that are only, like,
+ * zero days over or one day over or eighteen days over. Shouldn't be doing that."
+ *
+ * A threshold crossing is not an event. Ninety days is his judgement about roughly how long
+ * a friendship can go quiet, and treating it as an exact instant meant the list re-armed
+ * every single morning with whoever happened to tick over at midnight — the least urgent
+ * people it could possibly show him, presented as though something had just become due.
+ *
+ * A grace band makes "overdue" mean something: by the time a name appears, it is genuinely
+ * past time rather than one day past arithmetic. Three weeks covers all three numbers he
+ * named and is short enough that nobody gets lost. Nothing else changes — the cadence, the
+ * dismissals and the group suppressions are all untouched.
+ */
+export const RECONNECT_GRACE_DAYS = 21;
+
 export interface ReconnectRow {
   id: number;
   display_name: string;
@@ -18,10 +36,49 @@ export interface ReconnectRow {
   groups: string[];
 }
 
-/** Recompute person.next_touch_due_at = last_contact_at + tier threshold. Tier 3 → NULL. */
+/**
+ * Bring person.last_contact_at up to date with the messages POS has actually ingested.
+ *
+ * Owner report 2026-08-06: "in the reconnect section it still tells me to reconnect with
+ * people that are only, like, zero days over or one day over or eighteen days over."
+ *
+ * The cadence was never the bug — the tiers are 90/90/120 days and were honoring his
+ * three-month rule. The DATE was. `last_contact_at` arrived with the PersonalCRM2 migration
+ * and was then frozen: every iMessage, email and LinkedIn thread ingested since updated
+ * `interaction` and left the person row alone. So the reconnect list was computing "90 days
+ * since you spoke" from a date that stopped moving in April.
+ *
+ * The clearest case in his data: Ishaan last messaged him 2026-07-27 — ten days ago — while
+ * his person row still said 2026-03-27, which put him twelve days "overdue" for a
+ * three-month reconnect. That is exactly the barely-over-the-line noise he was seeing, and
+ * several of those people were not due at all.
+ *
+ * MAX, never overwrite downward: a contact logged by hand (a call, a coffee) has no
+ * interaction row behind it and must not be erased by this.
+ */
+export function refreshLastContact(db: Db): number {
+  return db
+    .prepare(
+      `UPDATE person SET last_contact_at = (
+         SELECT MAX(i.occurred_at) FROM interaction i WHERE i.person_id = person.id
+       )
+       WHERE EXISTS (
+         SELECT 1 FROM interaction i
+          WHERE i.person_id = person.id
+            AND (person.last_contact_at IS NULL OR i.occurred_at > person.last_contact_at)
+       )`
+    )
+    .run().changes;
+}
+
+/**
+ * Recompute person.next_touch_due_at = last_contact_at + tier threshold. Tier 3 → NULL.
+ * Refreshes last_contact_at first, so the cadence is measured from when they actually last
+ * spoke rather than from whatever the migration froze in place.
+ */
 export function refreshNextTouch(db: Db): number {
   const run = db.transaction(() => {
-    let changed = 0;
+    let changed = refreshLastContact(db);
     for (const [tier, days] of Object.entries(TIER_DAYS)) {
       if (!Number.isFinite(days)) {
         changed += db
@@ -53,7 +110,11 @@ const GROUP_SEP = String.fromCharCode(31);
  * Each row carries the person's group names. Ordered by tier (inner circle first), then
  * most-overdue first.
  */
-export function reconnectDue(db: Db, now: Date = new Date()): ReconnectRow[] {
+export function reconnectDue(
+  db: Db,
+  now: Date = new Date(),
+  graceDays: number = RECONNECT_GRACE_DAYS
+): ReconnectRow[] {
   const nowIso = now.toISOString().replace("T", " ").slice(0, 19);
   const rows = db
     .prepare(
@@ -63,7 +124,7 @@ export function reconnectDue(db: Db, now: Date = new Date()): ReconnectRow[] {
                  JOIN grp g ON g.id = pg.group_id WHERE pg.person_id = p.id) AS group_names
        FROM person p
        WHERE p.next_touch_due_at IS NOT NULL
-         AND p.next_touch_due_at <= ?
+         AND p.next_touch_due_at <= datetime(?, '-' || ? || ' days')
          AND p.tier < 3
          AND NOT EXISTS (
            SELECT 1 FROM dismissal d
@@ -76,7 +137,7 @@ export function reconnectDue(db: Db, now: Date = new Date()): ReconnectRow[] {
          )
        ORDER BY p.tier ASC, overdue_days DESC`
     )
-    .all(nowIso, nowIso, nowIso) as (Omit<ReconnectRow, "groups"> & { group_names: string | null })[];
+    .all(nowIso, nowIso, graceDays, nowIso) as (Omit<ReconnectRow, "groups"> & { group_names: string | null })[];
   return rows.map(({ group_names, ...r }) => ({
     ...r,
     groups: group_names ? group_names.split(GROUP_SEP).sort() : [],

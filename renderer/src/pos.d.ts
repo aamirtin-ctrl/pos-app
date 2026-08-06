@@ -17,6 +17,8 @@ type Call<T = unknown> = (...args: unknown[]) => Promise<IpcResult<T>>;
 export interface PlanPushResult {
   pushed: number;
   tasks: number;
+  /** Stale events withdrawn from Google — blocks a re-plan removed. */
+  withdrawn: number;
   error?: string;
 }
 

@@ -84,6 +84,7 @@ interface FakeCalls {
   calendarsInsert: number;
   eventsInsert: number;
   eventsUpdate: number;
+  eventsDelete: number;
   tasksInsert: number;
 }
 
@@ -92,8 +93,14 @@ interface FakeCalls {
  * the 403 exactly where the real one lands (calendars.insert, or events.insert once the
  * calendar already exists).
  */
-function fakeDeps(opts: { throwOn?: keyof FakeCalls; error?: () => Error } = {}): GcalPushDeps & { calls: FakeCalls } {
-  const calls: FakeCalls = { calendarsGet: 0, calendarsInsert: 0, eventsInsert: 0, eventsUpdate: 0, tasksInsert: 0 };
+function fakeDeps(
+  opts: { throwOn?: keyof FakeCalls; error?: () => Error } = {}
+): GcalPushDeps & { calls: FakeCalls; deleted: string[] } {
+  const calls: FakeCalls = {
+    calendarsGet: 0, calendarsInsert: 0, eventsInsert: 0, eventsUpdate: 0, eventsDelete: 0, tasksInsert: 0,
+  };
+  /** Event ids the fake Google has been asked to delete, in order. */
+  const deleted: string[] = [];
   const boom = opts.error ?? insufficientPermission;
   const guard = (k: keyof FakeCalls) => {
     calls[k]++;
@@ -125,6 +132,11 @@ function fakeDeps(opts: { throwOn?: keyof FakeCalls; error?: () => Error } = {})
         guard("eventsUpdate");
         return { data: { id: "ev" } };
       },
+      async delete(args: { calendarId: string; eventId: string }) {
+        guard("eventsDelete");
+        deleted.push(args.eventId);
+        return {};
+      },
     },
   };
   const tasks: PushTasksApi = {
@@ -152,7 +164,7 @@ function fakeDeps(opts: { throwOn?: keyof FakeCalls; error?: () => Error } = {})
       },
     },
   };
-  return { calls, calendar: () => calendar, tasks: () => tasks };
+  return { calls, deleted, calendar: () => calendar, tasks: () => tasks };
 }
 
 let dir: string;
@@ -288,7 +300,7 @@ describe("acceptPlan pushes automatically", () => {
     const res = await acceptPlan(db, planId, connected, deps);
 
     expect(res.accepted).toBe(true);
-    expect(res.push).toEqual({ pushed: 3, tasks: 0 });
+    expect(res.push).toEqual({ pushed: 3, tasks: 0, withdrawn: 0 });
     expect(deps.calls.eventsInsert).toBe(3);
     expect(plan(planId).accepted_at).toBeTruthy();
     expect(plan(planId).pushed_at).toBeTruthy();
@@ -306,7 +318,7 @@ describe("acceptPlan pushes automatically", () => {
     const res = await acceptPlan(db, planId, connected, deps);
 
     expect(res.accepted).toBe(true);
-    expect(res.push).toEqual({ pushed: 0, tasks: 0, error: "auto_push_off" });
+    expect(res.push).toEqual({ pushed: 0, tasks: 0, withdrawn: 0, error: "auto_push_off" });
     expect(deps.calls.eventsInsert).toBe(0);
     expect(plan(planId).accepted_at).toBeTruthy();
     expect(plan(planId).pushed_at).toBeNull();
@@ -321,7 +333,7 @@ describe("acceptPlan pushes automatically", () => {
     const res = await acceptPlan(db, planId, connected, fakeDeps({ throwOn: "calendarsInsert" }));
 
     expect(res.accepted).toBe(true);
-    expect(res.push).toEqual({ pushed: 0, tasks: 0, error: RECONSENT_REQUIRED });
+    expect(res.push).toEqual({ pushed: 0, tasks: 0, withdrawn: 0, error: RECONSENT_REQUIRED });
     expect(plan(planId).accepted_at).toBeTruthy();
     expect(plan(planId).pushed_at).toBeNull(); // still pending, so the sweep retries it
   });
@@ -331,7 +343,7 @@ describe("acceptPlan pushes automatically", () => {
     const deps = fakeDeps();
     const res = await pushPlanToGoogle(db, store(OLD_SCOPE), planId, deps);
 
-    expect(res).toEqual({ pushed: 0, tasks: 0, error: RECONSENT_REQUIRED });
+    expect(res).toEqual({ pushed: 0, tasks: 0, withdrawn: 0, error: RECONSENT_REQUIRED });
     expect(deps.calls.calendarsInsert).toBe(0); // no doomed round-trip at all
   });
 
@@ -339,7 +351,7 @@ describe("acceptPlan pushes automatically", () => {
     const planId = addPlan();
     const deps = fakeDeps();
     const res = await pushPlanToGoogle(db, store(WIDE_SCOPE, { tokens: false }), planId, deps);
-    expect(res).toEqual({ pushed: 0, tasks: 0, error: "not_connected" });
+    expect(res).toEqual({ pushed: 0, tasks: 0, withdrawn: 0, error: "not_connected" });
     expect(deps.calls.eventsInsert).toBe(0);
   });
 });
@@ -353,20 +365,40 @@ describe("worker auto-push sweep", () => {
 
     const deps = fakeDeps();
     const first = await sweepAutoPush(db, connected, deps);
-    expect(first).toEqual({ plans: 1, pushed: 2 });
+    expect(first).toEqual({ plans: 1, pushed: 2, withdrawn: 0 });
     expect(deps.calls.eventsInsert).toBe(2);
     expect(plan(planId).pushed_at).toBeTruthy();
 
     // Second tick: nothing left to do, and no further Google writes.
     expect(plansNeedingPush(db)).toEqual([]);
     const second = await sweepAutoPush(db, connected, deps);
-    expect(second).toEqual({ plans: 0, pushed: 0 });
+    expect(second).toEqual({ plans: 0, pushed: 0, withdrawn: 0 });
     expect(deps.calls.eventsInsert).toBe(2);
   });
 
-  it("ignores plans that were never accepted", async () => {
-    addPlan({ accepted: false });
-    expect(plansNeedingPush(db)).toEqual([]);
+  // Owner report 2026-08-06, verbatim: "it should automatically populate to my Google
+  // Calendar, it shouldn't require me to press a button." It already did not — but only for
+  // plans he had ACCEPTED, and accepting was a button. His plan for the day sat with
+  // accepted_at NULL and Google stayed empty. This test used to assert the opposite.
+  it("pushes a plan the owner never accepted — acceptance is not the gate", async () => {
+    const planId = addPlan({ accepted: false, blocks: 2 });
+    expect(plansNeedingPush(db)).toEqual([planId]);
+
+    const deps = fakeDeps();
+    expect(await sweepAutoPush(db, connected, deps)).toEqual({ plans: 1, pushed: 2, withdrawn: 0 });
+    expect(deps.calls.eventsInsert).toBe(2);
+    expect(plan(planId).pushed_at).toBeTruthy();
+    expect(plan(planId).accepted_at).toBeNull(); // pushing did not silently accept for him
+  });
+
+  // Re-planning an accepted day leaves the superseded row behind (generatePlan only deletes
+  // un-accepted ones). Pushing both would put two contradictory schedules on one calendar.
+  it("pushes only the newest plan when a day has more than one", async () => {
+    const date = new Date().toISOString().slice(0, 10);
+    const older = addPlan({ accepted: true, blocks: 1, date });
+    const newer = addPlan({ accepted: false, blocks: 1, date });
+    db.prepare("UPDATE plan SET generated_at = datetime('now', '-1 hour') WHERE id = ?").run(older);
+    expect(plansNeedingPush(db)).toEqual([newer]);
   });
 
   it("re-pushes an accepted plan whose blocks Google does not have", async () => {
@@ -392,18 +424,19 @@ describe("worker auto-push sweep", () => {
     addPlan({ accepted: true });
     const deps = fakeDeps();
     const res = await sweepAutoPush(db, store(OLD_SCOPE), deps);
-    expect(res).toEqual({ plans: 0, pushed: 0, skipped: "no_write_scope" });
+    expect(res).toEqual({ plans: 0, pushed: 0, withdrawn: 0, skipped: "no_write_scope" });
     expect(deps.calls.calendarsGet + deps.calls.calendarsInsert + deps.calls.eventsInsert).toBe(0);
   });
 
   it("skips silently when auto_push is off or Google is not connected", async () => {
     addPlan({ accepted: true });
     setSetting(db, AUTO_PUSH_KEY, "0");
-    expect(await sweepAutoPush(db, connected, fakeDeps())).toEqual({ plans: 0, pushed: 0, skipped: "auto_push_off" });
+    expect(await sweepAutoPush(db, connected, fakeDeps())).toEqual({ plans: 0, pushed: 0, withdrawn: 0, skipped: "auto_push_off" });
     setSetting(db, AUTO_PUSH_KEY, "1");
     expect(await sweepAutoPush(db, store(WIDE_SCOPE, { tokens: false }), fakeDeps())).toEqual({
       plans: 0,
       pushed: 0,
+      withdrawn: 0,
       skipped: "not_connected",
     });
   });
@@ -421,5 +454,100 @@ describe("worker auto-push sweep", () => {
     const old = new Date(Date.now() - 30 * 86_400_000).toISOString().slice(0, 10);
     addPlan({ accepted: true, date: old });
     expect(plansNeedingPush(db)).toEqual([]);
+  });
+});
+
+// ── 4. withdrawing events the plan no longer contains ────────────────────────
+//
+// The failure automatic pushing would otherwise introduce. Pushing used to be deliberate, so
+// a superseded plan never reached Google and left nothing behind. Now every plan pushes, and
+// a re-plan deletes the old blocks by CASCADE — invisible to TypeScript. Without the
+// migration-10 trigger their events would survive as orphans, and the owner's calendar would
+// fill with the ghosts of every schedule the engine ever abandoned.
+
+describe("stale event withdrawal", () => {
+  const tombstones = () =>
+    (db.prepare("SELECT event_id FROM gcal_tombstone ORDER BY event_id").all() as { event_id: string }[])
+      .map((r) => r.event_id);
+
+  it("records a tombstone when a block's plan is deleted (the cascade path)", () => {
+    const planId = addPlan({ blocks: 2 });
+    setSetting(db, "pos_calendar_id", "POS_CAL");
+    db.prepare("UPDATE block SET gcal_event_id = 'ev-' || id WHERE plan_id = ?").run(planId);
+    const ids = (db.prepare("SELECT gcal_event_id AS e FROM block WHERE plan_id = ?").all(planId) as { e: string }[])
+      .map((r) => r.e).sort();
+
+    db.prepare("DELETE FROM plan WHERE id = ?").run(planId); // blocks cascade
+    expect(db.prepare("SELECT COUNT(*) AS n FROM block").get()).toEqual({ n: 0 });
+    expect(tombstones()).toEqual(ids);
+    // The calendar is captured at tombstone time, not resolved later.
+    expect(db.prepare("SELECT DISTINCT calendar_id AS c FROM gcal_tombstone").all()).toEqual([{ c: "POS_CAL" }]);
+  });
+
+  it("never tombstones a block Google never had", () => {
+    const planId = addPlan({ blocks: 2 }); // gcal_event_id all NULL
+    db.prepare("DELETE FROM plan WHERE id = ?").run(planId);
+    expect(tombstones()).toEqual([]);
+  });
+
+  it("withdraws tombstoned events on the next push, then forgets them", async () => {
+    const gone = addPlan({ blocks: 2 });
+    setSetting(db, "pos_calendar_id", "POS_CAL");
+    db.prepare("UPDATE block SET gcal_event_id = 'stale-' || id WHERE plan_id = ?").run(gone);
+    db.prepare("DELETE FROM plan WHERE id = ?").run(gone);
+    const stale = tombstones();
+    expect(stale).toHaveLength(2);
+
+    const planId = addPlan({ blocks: 1 });
+    const deps = fakeDeps();
+    const res = await pushPlanToGoogle(db, connected, planId, deps);
+    expect(res.error).toBeUndefined();
+    expect(res.withdrawn).toBe(2);
+    expect(deps.calls.eventsDelete).toBe(2);
+    expect([...deps.deleted].sort()).toEqual(stale); // exactly the orphans, nothing else
+    expect(tombstones()).toEqual([]); // debt discharged — never retried
+
+    // A second push has nothing left to withdraw.
+    const again = await pushPlanToGoogle(db, connected, planId, deps);
+    expect(again.withdrawn).toBe(0);
+    expect(deps.calls.eventsDelete).toBe(2);
+  });
+
+  it("treats an event already gone from Google as withdrawn", async () => {
+    const gone = addPlan({ blocks: 1 });
+    setSetting(db, "pos_calendar_id", "POS_CAL");
+    db.prepare("UPDATE block SET gcal_event_id = 'stale' WHERE plan_id = ?").run(gone);
+    db.prepare("DELETE FROM plan WHERE id = ?").run(gone);
+
+    const planId = addPlan({ blocks: 1 });
+    // 404 = the user deleted it himself. The goal is that it not be there; it is not there.
+    const res = await pushPlanToGoogle(db, connected, planId, fakeDeps({ throwOn: "eventsDelete", error: notFound }));
+    expect(res.error).toBeUndefined();
+    expect(tombstones()).toEqual([]);
+  });
+
+  it("keeps the debt when a withdrawal fails for a reason we cannot dismiss", async () => {
+    const gone = addPlan({ blocks: 1 });
+    setSetting(db, "pos_calendar_id", "POS_CAL");
+    db.prepare("UPDATE block SET gcal_event_id = 'stale' WHERE plan_id = ?").run(gone);
+    db.prepare("DELETE FROM plan WHERE id = ?").run(gone);
+
+    const planId = addPlan({ blocks: 1 });
+    const res = await pushPlanToGoogle(db, connected, planId, fakeDeps({ throwOn: "eventsDelete", error: networkError }));
+    expect(res.pushed).toBe(1); // the day still went out
+    expect(tombstones()).toEqual(["stale"]); // and the ghost is still owed a deletion
+  });
+
+  it("drains on a tick where no plan needs pushing at all", async () => {
+    const gone = addPlan({ blocks: 1, pushedAt: null });
+    setSetting(db, "pos_calendar_id", "POS_CAL");
+    db.prepare("UPDATE block SET gcal_event_id = 'stale' WHERE plan_id = ?").run(gone);
+    db.prepare("DELETE FROM plan WHERE id = ?").run(gone);
+    expect(plansNeedingPush(db)).toEqual([]); // the day was abandoned; nothing to push
+
+    const deps = fakeDeps();
+    expect(await sweepAutoPush(db, connected, deps)).toEqual({ plans: 0, pushed: 0, withdrawn: 1 });
+    expect(deps.deleted).toEqual(["stale"]);
+    expect(tombstones()).toEqual([]);
   });
 });

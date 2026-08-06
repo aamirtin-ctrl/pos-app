@@ -21,7 +21,7 @@ import {
 } from "./crm/commitments.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { runEnrichment } from "./crm/enrich.ts";
-import { commitmentToTask, closeGoogleTask, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
+import { commitmentToTask, closeGoogleTask, drainTombstones, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
 import { hasCalendarWriteScope, isGoogleConnected } from "./gcal/auth.ts";
 import { autoPushEnabled, pushPlanToGoogle } from "./planner.ts";
 import { eventsForDate as icsEventsForDate } from "./icscal.ts";
@@ -746,11 +746,17 @@ export function enrichDayKey(now: Date = new Date()): string {
 
 // ── auto-push sweep ──────────────────────────────────────────────────────────
 //
-// Accepting a plan pushes it (planner.acceptPlan). This is the safety net for every plan
-// that did NOT get out: the app was offline, Google was slow, the push timed out, or the
-// plan was accepted before this feature existed. Runs on the same 15-minute tick.
+// Generating a plan pushes it (planner.generatePlan). This is the safety net for every plan
+// that did NOT get out: the app was offline, Google was slow, or the push timed out. Runs on
+// the same 15-minute tick.
+//
+// Owner report 2026-08-06: "it should automatically populate to my Google Calendar, it
+// shouldn't require me to press a button." It already did not — but ONLY for plans he had
+// ACCEPTED, and acceptance was a button. Today's plan sat with accepted_at NULL, so both the
+// accept-time push and this sweep skipped it and Google stayed empty. Acceptance is no longer
+// the gate: a plan is the app's best current answer for that day, and Google should show it.
 
-/** How far back the sweep looks. Older accepted plans are history, not pending work. */
+/** How far back the sweep looks. Older plans are history, not pending work. */
 export const AUTO_PUSH_WINDOW_DAYS = 7;
 
 export interface AutoPushSweepResult {
@@ -758,6 +764,8 @@ export interface AutoPushSweepResult {
   plans: number;
   /** Calendar blocks written across them. */
   pushed: number;
+  /** Stale events withdrawn from Google (blocks a re-plan removed). */
+  withdrawn: number;
   /** Why the sweep did nothing, when it did nothing on purpose. */
   skipped?: "auto_push_off" | "not_connected" | "no_write_scope";
   /** First real push failure encountered (the sweep still tries the rest). */
@@ -765,30 +773,47 @@ export interface AutoPushSweepResult {
 }
 
 /**
- * Accepted plans within the window that Google does not have in full:
+ * Plans within the window that Google does not have in full:
  *   - never pushed (`pushed_at IS NULL`), or
  *   - carrying a non-anchor block Google has no event for, or one created after the last
  *     push (the plan changed since it went out).
+ *
+ * Only the NEWEST plan per day is a candidate. Re-planning an already-accepted day leaves the
+ * superseded row behind (generatePlan only deletes un-accepted ones), and pushing both would
+ * put two contradictory schedules on the same calendar. The newest plan is the live answer;
+ * the older row's events are withdrawn by the tombstone drain instead.
  */
 export function plansNeedingPush(db: Db, windowDays = AUTO_PUSH_WINDOW_DAYS): number[] {
   return (
     db
       .prepare(
-        `SELECT p.id FROM plan p
-          WHERE p.accepted_at IS NOT NULL
-            AND p.plan_date >= date('now', ?)
+        `WITH newest AS (
+           SELECT p.id, p.pushed_at,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY p.plan_date ORDER BY p.generated_at DESC, p.id DESC
+                  ) AS rn
+             FROM plan p
+            WHERE p.plan_date >= date('now', ?)
+         )
+         SELECT n.id FROM newest n
+          WHERE n.rn = 1
             AND (
-              p.pushed_at IS NULL
+              n.pushed_at IS NULL
               OR EXISTS (
                 SELECT 1 FROM block b
-                 WHERE b.plan_id = p.id AND b.is_anchor = 0
-                   AND (b.gcal_event_id IS NULL OR b.created_at > p.pushed_at)
+                 WHERE b.plan_id = n.id AND b.is_anchor = 0
+                   AND (b.gcal_event_id IS NULL OR b.created_at > n.pushed_at)
               )
             )
-          ORDER BY p.id`
+          ORDER BY n.id`
       )
       .all(`-${windowDays} day`) as { id: number }[]
   ).map((r) => r.id);
+}
+
+/** Are there events awaiting withdrawal? Drives a drain even when no plan needs pushing. */
+export function tombstonesPending(db: Db): number {
+  return (db.prepare("SELECT COUNT(*) AS n FROM gcal_tombstone").get() as { n: number }).n;
 }
 
 /**
@@ -802,12 +827,13 @@ export async function sweepAutoPush(
   secrets: SecretStore,
   deps?: Partial<GcalPushDeps>
 ): Promise<AutoPushSweepResult> {
-  const out: AutoPushSweepResult = { plans: 0, pushed: 0 };
+  const out: AutoPushSweepResult = { plans: 0, pushed: 0, withdrawn: 0 };
   if (!autoPushEnabled(db)) return { ...out, skipped: "auto_push_off" };
   if (!isGoogleConnected(secrets)) return { ...out, skipped: "not_connected" };
   if (!hasCalendarWriteScope(secrets)) return { ...out, skipped: "no_write_scope" };
 
-  for (const planId of plansNeedingPush(db)) {
+  const planIds = plansNeedingPush(db);
+  for (const planId of planIds) {
     const res = await pushPlanToGoogle(db, secrets, planId, deps);
     if (res.error) {
       out.error ??= res.error;
@@ -816,6 +842,16 @@ export async function sweepAutoPush(
     }
     out.plans++;
     out.pushed += res.pushed;
+    out.withdrawn += res.withdrawn;
+  }
+  // A day whose plan was abandoned entirely leaves events to withdraw and no plan to push,
+  // so the drain cannot be left to ride along with a push that never happens.
+  if (planIds.length === 0 && tombstonesPending(db) > 0) {
+    try {
+      out.withdrawn += (await drainTombstones(db, secrets, deps)).deleted;
+    } catch (e) {
+      out.error ??= (e as Error).message;
+    }
   }
   return out;
 }

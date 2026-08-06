@@ -61,10 +61,66 @@ describe("reconnectDue", () => {
     addPerson("Archive", 3, "2020-01-01 00:00:00"); // tier 3 never surfaces
     refreshNextTouch(db);
 
+    // "Network Barely" is 6 days past due and is deliberately NOT here — see the grace band
+    // below. Passing graceDays: 0 recovers the pre-2026-08-06 ordering behavior exactly.
+    expect(reconnectDue(db, NOW, 0).map((p) => p.display_name)).toEqual([
+      "Inner Overdue", "Network Very", "Network Barely",
+    ]);
+
     const due = reconnectDue(db, NOW);
-    expect(due.map((p) => p.display_name)).toEqual(["Inner Overdue", "Network Very", "Network Barely"]);
+    expect(due.map((p) => p.display_name)).toEqual(["Inner Overdue", "Network Very"]);
     expect(due[0].overdue_days).toBe(34);
     expect(due[1].overdue_days).toBe(94);
+  });
+
+  // Owner report 2026-08-06: "it still tells me to reconnect with people that are only, like,
+  // zero days over or one day over or eighteen days over. Shouldn't be doing that."
+  //
+  // A threshold crossing is not an event. Ninety days is his judgement about how long a
+  // friendship can go quiet, and treating it as an exact instant re-armed the list every
+  // morning with whoever ticked over at midnight — the least urgent people it could show him.
+  it("holds someone back until they are meaningfully past due, not one day past arithmetic", () => {
+    const barely = addPerson("Just Crossed", 1, "2026-05-05 00:00:00"); // due 08-03 = NOW, 0d over
+    const eighteen = addPerson("Eighteen Over", 1, "2026-04-17 00:00:00"); // due 07-16, 18d over
+    const properly = addPerson("Long Overdue", 1, "2026-03-01 00:00:00"); // due 05-30, 65d over
+    refreshNextTouch(db);
+
+    const names = reconnectDue(db, NOW).map((p) => p.display_name);
+    expect(names).toContain("Long Overdue");
+    expect(names).not.toContain("Just Crossed"); // the 0-day case he named
+    expect(names).not.toContain("Eighteen Over"); // and the 18-day one
+    expect([barely, eighteen, properly].length).toBe(3);
+
+    // Nobody is lost — they surface once they are genuinely past time.
+    const later = new Date(NOW.getTime() + 30 * 86_400_000);
+    expect(reconnectDue(db, later).map((p) => p.display_name)).toContain("Just Crossed");
+  });
+
+  // The bug underneath the noise: last_contact_at arrived with the PersonalCRM2 migration and
+  // then froze, while every message POS ingested since updated `interaction` alone. In his
+  // data Ishaan had texted ten days earlier and still showed as twelve days overdue.
+  it("measures the cadence from the last message actually ingested", () => {
+    const p = addPerson("Texted Recently", 1, "2026-01-01 00:00:00"); // stale: would be 124d overdue
+    db.prepare(
+      `INSERT INTO interaction (person_id, channel, direction, occurred_at, body_summary)
+       VALUES (?, 'imessage', 'inbound', ?, 'hey')`
+    ).run(p, "2026-07-27 12:00:00"); // one week before NOW
+    refreshNextTouch(db);
+
+    const lc = (db.prepare("SELECT last_contact_at c FROM person WHERE id = ?").get(p) as { c: string }).c;
+    expect(lc).toBe("2026-07-27 12:00:00");
+    expect(reconnectDue(db, NOW).map((x) => x.display_name)).not.toContain("Texted Recently");
+  });
+
+  it("never moves last_contact_at backwards — a hand-logged coffee has no interaction row", () => {
+    const p = addPerson("Met In Person", 1, "2026-07-30 00:00:00");
+    db.prepare(
+      `INSERT INTO interaction (person_id, channel, direction, occurred_at, body_summary)
+       VALUES (?, 'imessage', 'inbound', ?, 'old thread')`
+    ).run(p, "2026-01-05 09:00:00");
+    refreshNextTouch(db);
+    const lc = (db.prepare("SELECT last_contact_at c FROM person WHERE id = ?").get(p) as { c: string }).c;
+    expect(lc).toBe("2026-07-30 00:00:00");
   });
 
   it("excludes stale-dismissed persons (indefinite and future snooze), keeps expired snoozes", () => {

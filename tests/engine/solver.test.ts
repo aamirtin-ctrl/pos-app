@@ -40,10 +40,30 @@ function meetingClusters(blocks: { blockType: string; startMin: number; endMin: 
 }
 
 describe("solver — §9 gate", () => {
-  it("rejects an unsplittable deep work block > 120 min", () => {
+  // Owner report 2026-08-06: "I don't get why that exceeded the deep work cap for today
+  // because I didn't do any deep work today." His 2h Stanford math test buffered to 2h30 and
+  // was correctly unsplittable — 30 minutes over the block cap, so the day dropped it while
+  // narrating "No deep work is scheduled today" in the same breath.
+  //
+  // max_deep_work_block_minutes is doctrine about how POS should CHUNK work, not a claim that
+  // longer sittings are impossible. Applied to indivisible work it deleted a real obligation.
+  it("places unsplittable deep work over the block cap, and says so", () => {
     const t = mkTask({ blockType: "deep_work", estimatedMinutes: 150, splittable: false, cognitiveLoad: 5 });
     const r = solve([t], doctrine, []);
-    expect(r.blocks.filter((b) => b.taskId === t.id)).toHaveLength(0);
+    const placed = r.blocks.filter((b) => b.taskId === t.id);
+    expect(placed).toHaveLength(1);
+    expect(placed[0].endMin - placed[0].startMin).toBe(150); // whole, not truncated
+    expect(r.unplaced).toHaveLength(0);
+    expect(r.notes.join(" ")).toMatch(/2h30 in one sitting.*2h focus cap/);
+  });
+
+  // The DAILY budget is a real ceiling and still binds — that one is about how much focus a
+  // day holds, not about how a single session is cut.
+  it("still refuses deep work once the day's budget is spent", () => {
+    // 4h/day ceiling: two 2h30 unsplittable tasks cannot both be seated.
+    const a = mkTask({ id: 1, blockType: "deep_work", estimatedMinutes: 150, splittable: false, cognitiveLoad: 5 });
+    const b = mkTask({ id: 2, blockType: "deep_work", estimatedMinutes: 150, splittable: false, cognitiveLoad: 5 });
+    const r = solve([a, b], doctrine, []);
     expect(r.unplaced).toHaveLength(1);
     expect(r.unplaced[0].reason).toBe("exceeded_deep_work_cap");
   });
@@ -259,6 +279,42 @@ describe("solver — §9 gate", () => {
     expect(untagged.notes.some((n) => /^Moved /.test(n))).toBe(false);
   });
 
+  // Deadline windows (2026-08-06) gave PlannerTask two new fields and the solver a new
+  // unplaced reason. Everything above this line describes a day with no windows in it, and
+  // must keep describing it exactly — this pins that a task WITHOUT a window is not merely
+  // similar to before but identical, whether the fields are absent or explicitly empty.
+  it("a task with no deadline window behaves exactly as it did before windows existed", () => {
+    const anchors: Anchor[] = [
+      { startMin: 10 * 60, endMin: 10 * 60 + 30, blockType: "meeting", title: "standup" },
+      { startMin: 15 * 60, endMin: 16 * 60, blockType: "meeting", title: "partner sync", movable: true },
+    ];
+    const build = () => [
+      mkTask({ blockType: "deep_work", estimatedMinutes: 90, isMit: true, cognitiveLoad: 5, title: "MIT" }),
+      mkTask({ blockType: "deep_work", estimatedMinutes: 120, cognitiveLoad: 4, title: "deep A" }),
+      mkTask({ blockType: "focused_work", estimatedMinutes: 90, title: "focus" }),
+      mkTask({ blockType: "admin", estimatedMinutes: 45, project: "ops", title: "admin" }),
+      mkTask({ blockType: "gym", estimatedMinutes: 60, title: "Gym" }),
+    ];
+    // Same tasks, same ids: one set never mentions the new fields, the other says "no window"
+    // out loud. Both are the old contract and both must produce the identical day.
+    nextId = 900;
+    const bare = build();
+    nextId = 900;
+    const explicit = build().map((t) => ({ ...t, windowEnd: null, planDate: "2026-08-06" }));
+
+    const a = solve(bare, doctrine, anchors);
+    const b = solve(explicit, doctrine, anchors);
+    // Compared field by field rather than whole-object: `unplaced` echoes the task it was
+    // given, so the two would differ on the very fields under test even with an identical day.
+    expect(JSON.stringify(a.blocks)).toBe(JSON.stringify(b.blocks));
+    expect(JSON.stringify(a.notes)).toBe(JSON.stringify(b.notes));
+    expect(a.unplaced.map((u) => [u.task.id, u.reason])).toEqual(
+      b.unplaced.map((u) => [u.task.id, u.reason])
+    );
+    // and nothing in a windowless day may ever come back as a deferral
+    expect(a.unplaced.every((u) => u.reason !== "deferred_within_window")).toBe(true);
+  });
+
   it("breaks are inserted after deep work blocks", () => {
     const t = mkTask({ blockType: "deep_work", estimatedMinutes: 90, cognitiveLoad: 5 });
     const r = solve([t], doctrine, []);
@@ -317,23 +373,29 @@ describe("solver — shutdown is a hard end-of-work boundary", () => {
     expect(r.notes.some((n) => /work day closes at 20:30/i.test(n))).toBe(true);
   });
 
-  it("gym and personal blocks may still be placed after shutdown", () => {
+  // Owner report 2026-08-06: "Again, added the task of unpacking my travel bag two hours after
+  // my shutdown ritual. Shouldn't be doing this." `personal` used to be exempt on the theory
+  // that the evening is his — but a chore POS assigns him at 22:30 is not rest.
+  //
+  // Gym is the deliberate exception: training after the work day closes is the evening being
+  // used well, and its own rule already keeps it clear of sleep.
+  it("gym may be placed after shutdown; an assigned personal chore may not", () => {
     // Boundary at 18:00 so the evening has room that clears the 3h gym-before-sleep floor.
     const early = parseDoctrine(DEFAULT_DOCTRINE_YAML.replace("before_sleep_hours: 2.5", "before_sleep_hours: 5.0"));
-    // Everything before 18:00 is occupied, so the ONLY place gym can go is after shutdown.
+    // Everything before 18:00 is occupied, so the ONLY place either could go is after shutdown.
     const anchors: Anchor[] = [
       { startMin: W, endMin: 18 * 60, blockType: "personal", title: "packed" },
     ];
-    const gym = mkTask({ blockType: "gym", estimatedMinutes: 60, title: "Gym" });
-    const personal = mkTask({ blockType: "personal", estimatedMinutes: 30, title: "Call Mum" });
-    const r = solve([gym, personal], early, anchors);
+    const gym = mkTask({ id: 1, blockType: "gym", estimatedMinutes: 60, title: "Gym" });
+    const chore = mkTask({ id: 2, blockType: "personal", estimatedMinutes: 30, title: "Unpack travel bag" });
+    const r = solve([gym, chore], early, anchors);
 
     const g = r.blocks.find((b) => b.taskId === gym.id);
     expect(g).toBeTruthy();
     expect(g!.startMin).toBeGreaterThanOrEqual(18 * 60); // genuinely after the boundary
-    const p = r.blocks.find((b) => b.taskId === personal.id);
-    expect(p).toBeTruthy();
-    expect(p!.startMin).toBeGreaterThanOrEqual(18 * 60);
+
+    expect(r.blocks.find((b) => b.taskId === chore.id)).toBeUndefined();
+    expect(r.unplaced.map((u) => u.task.id)).toContain(chore.id);
   });
 
   it("an editable boundary actually moves — 4.0h closes the day at 19:00", () => {

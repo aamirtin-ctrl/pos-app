@@ -662,31 +662,50 @@ function NarrationFooter({ plan }: { plan: PlanView | null }) {
 }
 
 /** What plan.accept / plan.push report back (mirrors PlanPushResult in pos.d.ts). */
-type PushResult = { pushed: number; tasks: number; error?: string };
+type PushResult = { pushed: number; tasks: number; withdrawn?: number; error?: string };
 
 /** The stale-grant case: the owner must re-authorize before anything can go out. */
 const RECONSENT = "reconsent_required";
 
+/** Mirrors solver.DEFERRED_REASON — the one "unplaced" reason that means "not today". */
+const DEFERRED_REASON = "deferred_within_window";
+
+/** "2026-08-07" → "Friday". Falls back to the raw date if it will not parse. */
+function weekdayOf(iso: string): string {
+  const d = new Date(`${iso}T12:00:00`);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString(undefined, { weekday: "long" });
+}
+
 /** Plain-English reason for a typed push error. */
 function pushErrorCopy(error: string): string {
   if (error === RECONSENT) return "Google needs re-authorizing since POS's calendar permissions changed.";
-  if (error === "not_connected") return "Not pushed — connect Google in Settings.";
+  if (error === "not_connected") return "Not on Google — connect Google in Settings.";
   if (error === "auto_push_off") return "Automatic push is off — use Push now, or turn it back on in Settings.";
-  return `Not pushed — ${error}`;
+  return `Not on Google — ${error}`;
 }
 
 function pushOkCopy(r: PushResult): string {
-  const blocks = `Pushed ${r.pushed} block${r.pushed === 1 ? "" : "s"} to Google`;
-  return r.tasks > 0 ? `${blocks} and ${r.tasks} task${r.tasks === 1 ? "" : "s"}` : blocks;
+  const parts = [`${r.pushed} block${r.pushed === 1 ? "" : "s"}`];
+  if (r.tasks > 0) parts.push(`${r.tasks} task${r.tasks === 1 ? "" : "s"}`);
+  const withdrawn = r.withdrawn ?? 0;
+  const tail = withdrawn > 0 ? ` (${withdrawn} stale event${withdrawn === 1 ? "" : "s"} removed)` : "";
+  return `On your Google Calendar — ${parts.join(" and ")}${tail}.`;
 }
 
 /**
- * Accept/push strip; the narration itself lives in NarrationFooter above.
+ * Sync/accept strip; the narration itself lives in NarrationFooter above.
  *
- * Accept is the whole gesture (owner directive 2026-08-05) — it accepts AND pushes, and
- * reports what landed inline. "Push now" is only a retry, shown when a push has actually
- * failed; a `reconsent_required` failure additionally offers Reconnect Google, which
- * re-runs the push as soon as consent comes back.
+ * Pushing is AUTOMATIC (owner directive 2026-08-06: "it should automatically populate to my
+ * Google Calendar, it shouldn't require me to press a button"). The plan goes out the moment
+ * it is generated and again whenever it changes, so this strip REPORTS the sync rather than
+ * asking for it. "Push now" is a retry, shown only when Google does not have the current plan;
+ * a `reconsent_required` failure additionally offers Reconnect Google, which re-runs the push
+ * as soon as consent comes back.
+ *
+ * Accept survives with its ORIGINAL and narrower meaning — the owner has read this day and
+ * locked it — because that is what the evening outcome capture and the re-plan logic key on
+ * (an un-accepted plan re-solves freely; an accepted one is defended). It is no longer the
+ * gate on reaching Google, which is what used to leave a perfectly good plan stranded locally.
  */
 function PlanControls({ plan, onChange }: { plan: PlanView | null; onChange: () => void }) {
   const [busy, setBusy] = useState<string | null>(null);
@@ -732,23 +751,48 @@ function PlanControls({ plan, onChange }: { plan: PlanView | null; onChange: () 
     return (p.data as PushResult) ?? null;
   });
 
-  const failed = !!push?.error;
-  // Retry is offered for a failure we saw, or for an accepted plan Google never got.
-  const showRetry = !!plan.plan.accepted_at && (failed || (!push && !plan.plan.pushed_at));
+  // A button press in this component wins; otherwise report the push that generation already
+  // did, so a reconsent failure is visible immediately rather than only after a manual retry.
+  const shown = push ?? plan.push ?? null;
+  const failed = !!shown?.error;
+  // Retry is offered whenever Google does not have this plan — a failure we just saw, or a
+  // plan whose automatic push has not landed yet. Acceptance is deliberately NOT part of this
+  // condition any more: an un-accepted plan is exactly the case that used to strand.
+  const showRetry = failed || (!shown && !plan.plan.pushed_at);
+  // Nothing has failed and nothing is pending → say so from the persisted stamp, so the
+  // status survives a reload instead of only existing in this component's state.
+  const syncedCopy = shown
+    ? null
+    : plan.plan.pushed_at
+      ? "On your Google Calendar — syncs automatically as the day changes."
+      : "Not on Google yet — this pushes automatically, or use Push now.";
+
+  const unplaced = plan.unplaced ?? [];
+  const deferred = unplaced.filter((u) => u.reason === DEFERRED_REASON);
+  const overflow = unplaced.filter((u) => u.reason !== DEFERRED_REASON);
 
   return (
     <div className="mt-3 rounded-2xl border bg-white p-4 shadow-sm" style={{ borderColor: "var(--line)" }}>
-      {(plan.unplaced?.length ?? 0) > 0 && (
+      {/* A deferral is a DECISION, not a failure — the work has days left in its window and
+          the engine spent today on what could not wait. Listing it under "Didn't fit" in the
+          same red as real overflow told the owner the opposite of what happened. */}
+      {deferred.length > 0 && (
+        <p className="text-xs mb-2" style={{ color: "var(--muted)" }}>
+          Moved to a later day: {deferred.map((u) => `${u.title}${u.movedTo ? ` (${weekdayOf(u.movedTo)})` : ""}`).join(", ")}
+        </p>
+      )}
+      {overflow.length > 0 && (
         <p className="text-xs mb-2" style={{ color: "var(--danger)" }}>
-          Didn't fit: {plan.unplaced.map((u) => `${u.title} (${u.reason.replace(/_/g, " ")})`).join(", ")}
+          Didn't fit: {overflow.map((u) => `${u.title} (${u.reason.replace(/_/g, " ")})`).join(", ")}
         </p>
       )}
       <div className="flex items-center gap-2 flex-wrap">
         {!plan.plan.accepted_at && (
           <button onClick={accept} disabled={!!busy}
+            title="Lock this day in — stops it re-solving on its own and turns on tonight's outcome check-in."
             className="px-3.5 py-1.5 rounded-full text-xs font-medium text-white shadow-sm disabled:opacity-60"
             style={{ background: "var(--accent)" }}>
-            {busy ?? "Accept & push"}
+            {busy ?? "Lock this day"}
           </button>
         )}
         {showRetry && (
@@ -758,7 +802,7 @@ function PlanControls({ plan, onChange }: { plan: PlanView | null; onChange: () 
             {busy ?? "Push now"}
           </button>
         )}
-        {failed && push?.error === RECONSENT && (
+        {failed && shown?.error === RECONSENT && (
           <button onClick={reconnect} disabled={!!busy}
             className="px-3.5 py-1.5 rounded-full text-xs font-medium text-white shadow-sm disabled:opacity-60"
             style={{ background: "var(--accent)" }}>
@@ -767,11 +811,9 @@ function PlanControls({ plan, onChange }: { plan: PlanView | null; onChange: () 
         )}
         {msg && <span className="text-xs" style={{ color: "var(--danger)" }}>{msg}</span>}
       </div>
-      {push && (
-        <p className="text-xs mt-2" style={{ color: push.error ? "var(--danger)" : "var(--muted)" }}>
-          {push.error ? pushErrorCopy(push.error) : pushOkCopy(push)}
-        </p>
-      )}
+      <p className="text-xs mt-2" style={{ color: shown?.error ? "var(--danger)" : "var(--muted)" }}>
+        {shown ? (shown.error ? pushErrorCopy(shown.error) : pushOkCopy(shown)) : syncedCopy}
+      </p>
     </div>
   );
 }

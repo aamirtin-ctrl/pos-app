@@ -77,6 +77,9 @@ import { extractJson, type LlmClient } from "../llm/provider.ts";
 import { markDegraded } from "../backfill.ts";
 import { extractFollowups } from "./followups.ts";
 import { parseWhen } from "./when.ts";
+// One reader for deadline WINDOWS across the whole app: the braindump parser and this
+// extractor must agree that "the rest of the week" ends on the coming Sunday.
+import { parseWindow } from "../engine/parse.ts";
 
 export const REVIEW_CONFIDENCE = 0.7;
 /** Deterministic-fallback rows are raw message fragments, never rewrites — cap them here. */
@@ -230,6 +233,23 @@ export function passesCommitmentGate(description: string): boolean {
   if (rest.length > 0 && rest.every((w) => VAGUE_WORDS.has(w) || FILLER_WORDS.has(w))) return false;
   if (/\b(to|for|with|from)\s+(the\s+)?contact\b/i.test(d)) return false; // anonymous placeholder
   if (/\byou\b|\byour\b/i.test(d)) return false; // second-person = unrewritten message quote
+  // ── third-person narration about the thread (owner report 2026-08-06) ──
+  //
+  // "So in those commitments, it's just taking a text, copying it, copy-paste. It needs to
+  // take the text in context of a conversation so we can understand what the task is and
+  // then give a brief phrase that actually describes the task."
+  //
+  // His live rows: "User will ask Papa to get a paid Spotify account." and "Contact will
+  // talk to him during their call tomorrow." Neither is a QUOTE, so every copy-detection
+  // rule above passed them — they are the model narrating the conversation back in the
+  // third person, in the prompt's own vocabulary. On a to-do list that is worse than a
+  // quote: "Contact will talk to him" names nobody and asks nothing of the reader.
+  //
+  // A task is addressed to the person doing it. Anything that opens by describing a party,
+  // or that refers to "the user"/"the contact" anywhere, is a restatement rather than an
+  // instruction, and goes to review instead of onto the list.
+  if (/^(?:the\s+)?(?:user|contact|they|he|she|it)\b/i.test(d)) return false;
+  if (/\bthe\s+(?:user|contact)\b/i.test(d)) return false;
   return true;
 }
 
@@ -568,6 +588,22 @@ TITLE — the headline, never a quote (this exact string becomes the task in the
 - Write "Bring cash for <person>", never "Give cash to contact". Never leave second-person fragments like "call you" or "you can upload".
 - Two snippets that mean the SAME thing must get the SAME title, word for word — they are one commitment, not two.
 
+WRITE AN INSTRUCTION, NOT A SUMMARY OF THE CHAT. You are writing the line the reader will see
+on their own to-do list, addressed to them. Never narrate the conversation back:
+- NEVER begin a title with "User", "Contact", "They", "He", "She" — and never use the words
+  "the user" or "the contact" anywhere in it. Those are words from THIS prompt, not from a task.
+- Resolve every pronoun against the thread before you write. If you cannot tell who "him" or
+  "they" refers to, you do not understand the commitment well enough to record it — omit it.
+- A snippet is one turn in a conversation. Read the THREAD CONTEXT to find out what the
+  exchange was actually about, then name that. The snippet is evidence, not the answer.
+These are real failures from this user's own data — do not repeat their shape:
+  BAD  "User will ask Papa to get a paid Spotify account."   (narrates; "User" is not a person)
+  GOOD "Ask Papa about upgrading to Spotify Premium"
+  BAD  "Contact will talk to him during their call tomorrow." (whose call? who is "him"?)
+  GOOD (omit — the obligation is someone else's, and the thread does not say what it is)
+  BAD  "Can u figure out a way to integrate Hubspot scheduler" (a quoted question)
+  GOOD "Look into integrating the HubSpot scheduler for Taha"
+
 TASK vs CALENDAR EVENT — set "kind":
 - "event" only when it happens at a place/time with other people: a meeting, call, dinner, flight, appointment, meetup. Give "start_time" as HH:MM (24h) when the snippet states a clock time, else null.
 - "task" for everything else — something to do by a date, with no meeting time. "start_time" MUST be null for tasks.
@@ -593,6 +629,13 @@ RESOLVE DATES — use the DATE REFERENCE table below; never invent:
 - SAME-DAY SCOPE: a time-of-day or same-day marker with NO other date ("at 5:30", "by noon", "tonight", "this afternoon", "in an hour") refers to the message's SENT date, not to today. If that moment has already passed by now, the item is EXPIRED — output nothing for it. NEVER keep it as an undated task.
 - PERSONAL ANCHORS: a reference to a named point in the USER's own life — "the start of school", "when school starts", "the beginning of the term", "move-in", "next semester" — resolves against the ABOUT THE USER block at the top of this prompt. "meetup at the start of school" gets that term-start date as due_at. If the block records no such date, leave due_at null; never guess one.
 
+DEADLINE WINDOW — "on Thursday" and "any day up to Thursday" are different promises:
+- "window_end" is the LAST day the work may happen; "flexible" says whether it may happen on ANY day up to it.
+- A RANGE — "this week", "the rest of the week", "by Friday", "over the next few days", "whenever", "no rush", "it doesn't have to be today" — sets "window_end" to the last day of that range (from the table) and "flexible": true.
+- A SPECIFIC day — "today", "tomorrow", "Thursday", a clock time — sets "window_end" to that day and "flexible": false. It happens that day; it does not move.
+- No stated timeframe at all → "window_end": null, "flexible": false. Never invent a range.
+- Window examples: "I could go through the advising stuff the rest of the week, it doesn't have to be today" → { "window_end": "<the coming Sunday from the table>", "flexible": true }. "the math test is today" → { "window_end": "<the sent day from the table>", "flexible": false }.
+
 DIRECTION:
 - "i_owe_them" when the USER owes the contact; "they_owe_me" when the contact owes the user.
 
@@ -615,6 +658,7 @@ POSITIVE EXAMPLES (message → normalized headline):
 - Mom-thread about Stanford dorm packing — user: "add a boot tray to my list" → { "title": "Add boot tray to the Stanford dorm packing list", "direction": "i_owe_them", "due_at": null, "kind": "task", "start_time": null }
 - "dinner with Priya thursday 7pm" → { "title": "Dinner with Priya", "due_at": "<that Thursday from the table>", "kind": "event", "start_time": "19:00" }
 - Thread agrees on a meetup "in late September" → due_at = that September's late anchor (the 25th) from the table.
+- User: "I need about two hours to go through my Stanford academic advising stuff — I could do this the rest of the week, it doesn't have to be today" → { "title": "Go through Stanford academic advising", "direction": "i_owe_them", "due_at": "<the coming Sunday from the table>", "window_end": "<the same Sunday>", "flexible": true, "kind": "task", "start_time": null }
 
 CONFIDENCE — be honest:
 - 0.9+ only when the obligation is explicit and unambiguous in the text.
@@ -631,7 +675,7 @@ SNIPPETS:
 ${numberedSnippets(cands, contexts)}
 
 Return STRICT JSON ONLY — no prose, no markdown fences — an array (possibly empty), using the SAME n:
-[{ "n": <number>, "title": "<rewritten imperative headline>", "direction": "i_owe_them" | "they_owe_me", "due_at": "<ISO date>" | null, "kind": "task" | "event", "start_time": "<HH:MM>" | null, "confidence": <0-1> }]
+[{ "n": <number>, "title": "<rewritten imperative headline>", "direction": "i_owe_them" | "they_owe_me", "due_at": "<ISO date>" | null, "window_end": "<ISO date>" | null, "flexible": true | false, "kind": "task" | "event", "start_time": "<HH:MM>" | null, "confidence": <0-1> }]
 
 Rules: only use n values from the list; do not invent facts or dates; never copy snippet text verbatim into title.`;
 }
@@ -867,6 +911,27 @@ export async function extractCommitmentsLlm(
                   ? Math.min(1, Math.max(0, confRaw))
                   : classifyConfidence.get(src.n) ?? 0.5;
                 let dueAt = typeof o.due_at === "string" && o.due_at ? o.due_at.slice(0, 10) : null;
+                // ── deadline window (owner report 2026-08-06) ──
+                //
+                // "I could do this the rest of the week, it doesn't have to be today" used to
+                // leave due_at null, because none of the date rules above recognise a RANGE —
+                // only a day. So work he had explicitly given himself a week for arrived
+                // undated, and every surface that sorts by due_at treated it as "someday".
+                //
+                // A flexible range has one honest due date: the LAST day of the range. The
+                // model states it; when it does not, the sent-date-anchored deterministic
+                // reader (engine/parse.ts parseWindow) does — the same rules the braindump
+                // parser uses, so one sentence means the same thing on both surfaces.
+                const win = parseWindow(
+                  src.text,
+                  (src.row.occurred_at ?? now.toISOString()).slice(0, 10)
+                );
+                const modelEnd =
+                  typeof o.window_end === "string" && /^\d{4}-\d{2}-\d{2}/.test(o.window_end)
+                    ? o.window_end.slice(0, 10)
+                    : null;
+                const windowEnd = o.flexible === true && modelEnd ? modelEnd : win.flexible ? win.windowEnd : null;
+                if (!dueAt && windowEnd) dueAt = windowEnd;
                 if (!dueAt) {
                   // Named-date cross-check (main/context.ts): the model left this undated,
                   // but the text points at a named moment in the USER's own life — "meetup

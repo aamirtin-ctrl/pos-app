@@ -366,4 +366,76 @@ ALTER TABLE block ADD COLUMN flexibility TEXT NOT NULL DEFAULT 'flexible';
 UPDATE block SET flexibility = 'fixed' WHERE is_anchor = 1 OR is_locked = 1;
 `,
   },
+  {
+    version: 9,
+    name: "task_window",
+    sql: `
+-- Deadline WINDOWS (owner report 2026-08-06). Yesterday he captured "maybe about two hours
+-- in total to go through my Stanford academic advising stuff — I could do this the rest of
+-- the week, it doesn't have to be today." Today he captured "two hours for a Stanford math
+-- test today." The advising task had been pinned to a single day, so today it competed with
+-- the test instead of being deferred. His expectation, in his words: the app should have
+-- remembered the work was due anytime this week and moved it.
+--
+-- A task could only ever say "this day" (plan_date) or "by this instant" (hard_deadline_at).
+-- There was no way to say "N minutes of work, ANYWHERE in this window", so every flexible
+-- phrase the extractor heard ("this week", "by Friday", "no rush") was discarded.
+--
+--   window_start — first day the work may be scheduled. Defaults to the creation/plan date.
+--   window_end   — LAST day the work may be scheduled, inclusive.
+--
+-- Semantics, and the whole point of the column: with a window_end set, plan_date stops being
+-- a commitment and becomes the CURRENTLY CHOSEN day. The solver may hand the task back as
+-- 'deferred_within_window' and the planner then advances plan_date to the next day inside the
+-- window — never past window_end. On window_end itself there is nowhere left to go, so a
+-- failure there is a real failure ('no_eligible_slot'), not a deferral.
+--
+-- INVARIANT the engine relies on: window_end is written ONLY for work the user said was
+-- flexible across a range. A specific day ("today", "tomorrow", "Thursday") leaves window_end
+-- NULL and is expressed by plan_date alone — so "window_end is set" and "this may move" are
+-- the same statement, and no task without a window behaves any differently than before.
+ALTER TABLE task ADD COLUMN window_start TEXT;
+ALTER TABLE task ADD COLUMN window_end TEXT;
+CREATE INDEX idx_task_window ON task(window_end) WHERE window_end IS NOT NULL;
+`,
+  },
+  {
+    version: 10,
+    name: "gcal_tombstone",
+    sql: `
+-- Withdrawing events the plan no longer contains (owner directive 2026-08-06: "it should
+-- automatically populate to my Google Calendar, it shouldn't require me to press a button").
+--
+-- Pushing used to be a deliberate act, so a superseded plan simply never reached Google and
+-- nothing was left behind. Now every plan pushes, and re-planning a day DELETES the old
+-- blocks — by cascade, so no TypeScript ever sees it happen. Their Google events would
+-- survive as orphans with nothing left to match them back to, and the owner's calendar would
+-- silently accumulate the ghosts of every abandoned schedule.
+--
+-- The DELETE itself is therefore what records the debt. A trigger fires on any block removal
+-- (cascades included, which is the case that matters) and the next push withdraws the event.
+-- Deleting a row from this table means "Google no longer has it" — that is why an event
+-- already gone from Google, a 404, counts as success in drainTombstones.
+--
+-- INSERT OR IGNORE + the unique index make the trigger idempotent: an event id can be owed a
+-- deletion once, no matter how many blocks carried it over their lifetimes.
+CREATE TABLE gcal_tombstone (
+  id INTEGER PRIMARY KEY,
+  event_id TEXT NOT NULL,
+  -- Which calendar to delete from, captured at tombstone time. The POS calendar id is
+  -- stable, but reading it now means a later re-created calendar can never make us issue a
+  -- delete against the wrong one.
+  calendar_id TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX idx_gcal_tombstone_event ON gcal_tombstone(event_id);
+
+CREATE TRIGGER block_gcal_tombstone AFTER DELETE ON block
+WHEN OLD.gcal_event_id IS NOT NULL
+BEGIN
+  INSERT OR IGNORE INTO gcal_tombstone (event_id, calendar_id)
+  VALUES (OLD.gcal_event_id, (SELECT value FROM setting WHERE key = 'pos_calendar_id'));
+END;
+`,
+  },
 ];

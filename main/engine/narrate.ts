@@ -4,11 +4,36 @@
 // Deterministic template fallback when the LLM is unavailable.
 
 import { shutdownStartMin, type Doctrine } from "./doctrine.ts";
-import type { SolveResult, PlacedBlock } from "./solver.ts";
+import { DEFERRED_REASON, nextDayInWindow, type SolveResult, type PlacedBlock } from "./solver.ts";
 import type { LlmClient } from "../llm/provider.ts";
 
 const fmt = (min: number) =>
   `${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}`;
+
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+/** "2026-08-07" → "Friday". Falls back to the raw date if it is unparseable. */
+const dayName = (dateISO: string | null | undefined): string => {
+  if (!dateISO) return "a later day";
+  const t = Date.parse(`${dateISO}T00:00:00Z`);
+  return Number.isNaN(t) ? dateISO : WEEKDAYS[new Date(t).getUTCDay()];
+};
+
+/**
+ * Deferrals are not losses and must never be narrated as ones. A windowed task that moved has
+ * days left; the task that stayed does not. That is a CHOICE the engine made on his behalf,
+ * and the sentence has to read like one — "Advising moved to Friday; it has until Sunday and
+ * the test doesn't", never "1 task did not fit".
+ */
+const deferralSentence = (result: SolveResult): string | null => {
+  const moved = result.unplaced.filter((u) => u.reason === DEFERRED_REASON);
+  if (moved.length === 0) return null;
+  const clauses = moved.map((u) => {
+    const to = dayName(nextDayInWindow(u.task));
+    const until = u.task.windowEnd ? `, and it has until ${dayName(u.task.windowEnd)}` : "";
+    return `${u.task.title} moved to ${to}${until}`;
+  });
+  return `${clauses.join("; ")} — today's work does not.`;
+};
 
 export async function narrate(
   result: SolveResult,
@@ -17,6 +42,11 @@ export async function narrate(
 ): Promise<string> {
   const summary = summarize(result);
   const closes = shutdownStartMin(doctrine);
+  // Two different things wearing one field. A deferral is a scheduling DECISION; an unplaced
+  // task is work that fell off. Handing the model one undifferentiated list is how "moved to
+  // Friday, it has all week" turns into "did not fit" in the summary he actually reads.
+  const moved = result.unplaced.filter((u) => u.reason === DEFERRED_REASON);
+  const dropped = result.unplaced.filter((u) => u.reason !== DEFERRED_REASON);
   if (llm) {
     const prompt = `You are a chief of staff summarizing a generated day plan. Write 3-5 plain sentences:
 the shape of the day, what got prioritized, what got cut and why, and one specific flag if the
@@ -30,8 +60,23 @@ deliberate — never suggest moving work into it, and never call it wasted or av
 PLAN:
 ${summary}
 
-UNPLACED (with reasons):
-${result.unplaced.length === 0 ? "(none)" : result.unplaced.map((u) => `- ${u.task.title}: ${u.reason}`).join("\n")}
+MOVED TO A LATER DAY (these are NOT cut and NOT failures — each one has a deadline window with
+days left in it, so the planner chose to give today's minutes to work that has only today.
+Report each as a deliberate choice and say where it went and how long it still has):
+${
+  moved.length === 0
+    ? "(none)"
+    : moved
+        .map(
+          (u) =>
+            `- ${u.task.title}: moved to ${dayName(nextDayInWindow(u.task))}` +
+            (u.task.windowEnd ? `, has until ${dayName(u.task.windowEnd)} (${u.task.windowEnd})` : "")
+        )
+        .join("\n")
+}
+
+UNPLACED (work that did NOT fit anywhere, with reasons):
+${dropped.length === 0 ? "(none)" : dropped.map((u) => `- ${u.task.title}: ${u.reason}`).join("\n")}
 
 NOTES FROM THE SOLVER:
 ${result.notes.length === 0 ? "(none)" : result.notes.map((n) => `- ${n}`).join("\n")}`;
@@ -65,10 +110,13 @@ export function deterministicNarration(result: SolveResult, doctrine?: Doctrine)
     parts.push("No deep work is scheduled today.");
   }
   if (meetings.length > 0) parts.push(`${meetings.length} meeting${meetings.length > 1 ? "s are" : " is"} on the calendar.`);
-  if (result.unplaced.length > 0) {
+  const deferred = deferralSentence(result);
+  if (deferred) parts.push(deferred);
+  const dropped = result.unplaced.filter((u) => u.reason !== DEFERRED_REASON);
+  if (dropped.length > 0) {
     parts.push(
-      `${result.unplaced.length} task${result.unplaced.length > 1 ? "s" : ""} did not fit: ` +
-        result.unplaced.map((u) => `${u.task.title} (${u.reason.replace(/_/g, " ")})`).join(", ") + "."
+      `${dropped.length} task${dropped.length > 1 ? "s" : ""} did not fit: ` +
+        dropped.map((u) => `${u.task.title} (${u.reason.replace(/_/g, " ")})`).join(", ") + "."
     );
     const closes = doctrine ? shutdownStartMin(doctrine) : null;
     parts.push(

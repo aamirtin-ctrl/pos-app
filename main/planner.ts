@@ -6,7 +6,13 @@ import type { SecretStore } from "./secrets.ts";
 import type { LlmClient } from "./llm/provider.ts";
 import { loadDoctrine, type Doctrine } from "./engine/doctrine.ts";
 import { parseBraindump } from "./engine/parse.ts";
-import { solve, ENGINE_VERSION, type PlannerTask } from "./engine/solver.ts";
+import {
+  solve,
+  ENGINE_VERSION,
+  DEFERRED_REASON,
+  nextDayInWindow,
+  type PlannerTask,
+} from "./engine/solver.ts";
 import type { Anchor } from "./engine/grid.ts";
 import { narrate } from "./engine/narrate.ts";
 import { withPreferences } from "./preferences.ts";
@@ -44,21 +50,28 @@ export async function braindump(db: Db, doctrineDir: string, llm: LlmClient | nu
   const { tasks, usedLlm } = await parseBraindump(
     text,
     doctrine,
-    withPreferences(llm, doctrineDir, ["plan_parse"])
+    withPreferences(llm, doctrineDir, ["plan_parse"]),
+    dateISO
   );
   const ins = db.prepare(
     `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
-       is_mit, hard_deadline_at, status, splittable, estimate_source, plan_date, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'inbox', ?, ?, ?, ?)`
+       is_mit, hard_deadline_at, status, splittable, estimate_source, plan_date, notes,
+       window_start, window_end)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?)`
   );
   const tx = db.transaction(() => {
     for (const t of tasks) {
+      // A window is written ONLY for work he said was flexible across a range (migration 9's
+      // invariant). "Tomorrow" also carries a date, but it is a commitment to a day, and a
+      // window_end there would license the planner to shuffle it — the opposite of what he said.
+      const windowEnd = t.flexible && t.windowEnd && t.windowEnd > dateISO ? t.windowEnd : null;
       ins.run(
         t.title, t.blockType, t.cognitiveLoad, t.estimatedMinutes, t.rawEstimateMinutes,
         t.isMit ? 1 : 0,
         t.hardDeadlineAt ? `${dateISO}T${t.hardDeadlineAt}:00` : null,
         t.splittable ? 1 : 0, t.estimateSource, dateISO,
-        t.personHint ? `person: ${t.personHint}` : null
+        t.personHint ? `person: ${t.personHint}` : null,
+        windowEnd ? dateISO : null, windowEnd
       );
     }
   });
@@ -166,6 +179,22 @@ export async function externalAnchors(
   }));
 }
 
+/**
+ * What a block IS, independent of when it was scheduled — the join that lets a re-plan
+ * recognise a block it already has a Google event for.
+ *
+ * A task-backed block is identified by its task: the whole point is that moving "Stanford
+ * advising" from 10:45 to 14:00 updates one event rather than deleting and recreating it.
+ * Everything else (rituals, breaks, meals, comms windows) has no task, so it falls back to
+ * type + title, which is stable for exactly the blocks doctrine generates every day.
+ */
+export function blockIdentity(b: { task_id: number | null; block_type: string; title: string | null }): string {
+  return b.task_id != null ? `t:${b.task_id}` : `k:${b.block_type}|${(b.title ?? "").trim().toLowerCase()}`;
+}
+
+/** How long the push fired by plan GENERATION may run before the plan is returned anyway. */
+export const GENERATE_PUSH_TIMEOUT_MS = 10_000;
+
 export async function generatePlan(
   db: Db,
   doctrineDir: string,
@@ -227,44 +256,149 @@ export async function generatePlan(
     deadlineMin: r.hard_deadline_at && String(r.hard_deadline_at).startsWith(dateISO) ? fromIso(r.hard_deadline_at) : null,
     project: r.project ?? null,
     splittable: !!r.splittable,
+    // A window makes plan_date a CHOICE rather than a commitment — the solver may hand this
+    // task back as `deferred_within_window` and it is moved below.
+    windowEnd: (r.window_end as string | null) ?? null,
+    planDate: (r.plan_date as string | null) ?? dateISO,
   }));
 
   const result = solve(tasks, doctrine, anchors);
+
+  // ── deadline windows: the task that has all week actually moves ─────────────
+  //
+  // Owner report 2026-08-06. He captured "two hours to go through my Stanford academic
+  // advising stuff — I could do this the rest of the week, it doesn't have to be today" and,
+  // the next day, "two hours for a Stanford math test today". The advising task was pinned to
+  // one day, so it spent that day competing with a test that genuinely had to happen. His
+  // expectation, verbatim: the app should have remembered the work was due anytime this week
+  // and moved it.
+  //
+  // `deferred_within_window` is the solver saying "not today, and it still has time". Acting
+  // on it is what makes the promise real — tomorrow's plan reads plan_date and picks the task
+  // up with no further intervention. Nothing else about the task changes: not its window, not
+  // its estimate, not its status (it stays `inbox` for the day it lands on, which is why this
+  // runs BEFORE the status sweep below).
+  const deferrals = result.unplaced
+    .filter((u) => u.reason === DEFERRED_REASON)
+    .map((u) => ({ task: u.task, movedTo: nextDayInWindow(u.task) }))
+    .filter((d): d is { task: PlannerTask; movedTo: string } => d.movedTo !== null);
   // Same injection for the narration: a chief of staff explaining the day should know the
   // owner's standing preferences, not just the blocks that came out of the solver.
   const narration = await narrate(result, doctrine, withPreferences(llm, doctrineDir, ["narration"]));
 
   // persist: replace any prior un-accepted plan for the date
   const persist = db.transaction(() => {
+    // ── carry Google's event ids across the re-plan ───────────────────────────
+    //
+    // Since pushing became automatic, a re-plan is a calendar edit. Without this map every
+    // regeneration would DELETE the day's events and create fresh ones — the owner would
+    // watch his calendar flicker, and anything he had dragged in Google would lose the
+    // identity that reconcileMovedEvents uses to notice he moved it. Matching on what the
+    // block IS lets an unchanged block keep its event and simply be updated in place.
+    const carry = new Map<string, string>(
+      (
+        db
+          .prepare(
+            `SELECT b.task_id, b.block_type, b.title, b.gcal_event_id
+               FROM block b JOIN plan p ON p.id = b.plan_id
+              WHERE p.plan_date = ? AND b.gcal_event_id IS NOT NULL AND b.is_anchor = 0`
+          )
+          .all(dateISO) as { task_id: number | null; block_type: string; title: string | null; gcal_event_id: string }[]
+      ).map((b) => [blockIdentity(b), b.gcal_event_id])
+    );
+
     const old = db
       .prepare("SELECT id FROM plan WHERE plan_date = ? AND accepted_at IS NULL")
       .all(dateISO) as { id: number }[];
-    for (const o of old) db.prepare("DELETE FROM plan WHERE id = ?").run(o.id); // blocks cascade
+    for (const o of old) db.prepare("DELETE FROM plan WHERE id = ?").run(o.id); // blocks cascade → tombstoned
+
+    // An ACCEPTED plan's row survives (it owns the day's outcome history), but it is no
+    // longer the live schedule, so it must give up its events — otherwise Google would show
+    // this plan and its predecessor stacked on the same hours. Tombstone them explicitly,
+    // since no DELETE fires here for the trigger to catch.
+    db.prepare(
+      `INSERT OR IGNORE INTO gcal_tombstone (event_id, calendar_id)
+       SELECT b.gcal_event_id, (SELECT value FROM setting WHERE key = 'pos_calendar_id')
+         FROM block b JOIN plan p ON p.id = b.plan_id
+        WHERE p.plan_date = ? AND b.gcal_event_id IS NOT NULL`
+    ).run(dateISO);
+    db.prepare(
+      `UPDATE block SET gcal_event_id = NULL
+        WHERE plan_id IN (SELECT id FROM plan WHERE plan_date = ?)`
+    ).run(dateISO);
     // The snapshot is the EFFECTIVE doctrine (observed wake folded in), not the file on
     // disk: it exists to explain why this plan looks the way it does, and a 06:40 wake is
     // the reason half of it moved.
     const { lastInsertRowid } = db
       .prepare("INSERT INTO plan (plan_date, engine_version, doctrine_snapshot, narration, unplaced_tasks) VALUES (?, ?, ?, ?, ?)")
       .run(dateISO, ENGINE_VERSION, JSON.stringify(doctrine), narration,
-        JSON.stringify(result.unplaced.map((u) => ({ taskId: u.task.id, title: u.task.title, reason: u.reason }))));
+        JSON.stringify(result.unplaced.map((u) => ({
+          taskId: u.task.id,
+          title: u.task.title,
+          reason: u.reason,
+          // Only ever present on a deferral: where the work went, so the surface reading this
+          // can say "moved to Friday" instead of listing it as something that fell off.
+          ...(u.reason === DEFERRED_REASON ? { movedTo: nextDayInWindow(u.task) } : {}),
+        }))));
     const planId = Number(lastInsertRowid);
     const ins = db.prepare(
       `INSERT INTO block (task_id, block_type, title, starts_at, ends_at, is_anchor, plan_id,
-         capacity_score_at_placement, flexibility)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         capacity_score_at_placement, flexibility, gcal_event_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
+    const reclaim = db.prepare("DELETE FROM gcal_tombstone WHERE event_id = ?");
     for (const b of result.blocks) {
+      // A block that survived the re-plan takes its predecessor's event back — and with it,
+      // the deletion that was just queued against it. `delete` first, `take` once: the map
+      // entry is consumed so two same-titled blocks can never claim one event.
+      const key = blockIdentity({ task_id: b.taskId ?? null, block_type: b.blockType, title: b.title });
+      const inherited = b.isAnchor ? undefined : carry.get(key);
+      if (inherited) { carry.delete(key); reclaim.run(inherited); }
       ins.run(b.taskId ?? null, b.blockType, b.title, toIso(dateISO, b.startMin), toIso(dateISO, b.endMin),
         b.isAnchor ? 1 : 0, planId, b.capacityAtPlacement ?? null,
         // The solver stamps every block; the fallback only covers a hand-built PlacedBlock.
-        b.flexibility ?? (b.isAnchor ? "fixed" : "flexible"));
+        b.flexibility ?? (b.isAnchor ? "fixed" : "flexible"),
+        inherited ?? null);
     }
+    // Move the deferred work off this day BEFORE the status sweep, so it lands on its new day
+    // as `inbox` — it was not planned today, it was postponed. The guard clause is the pin: a
+    // task whose placement the owner locked for this date is his decision, never the engine's
+    // to revisit, however much window it has left.
+    const defer = db.prepare(
+      `UPDATE task SET plan_date = ?, window_start = COALESCE(window_start, ?)
+        WHERE id = ? AND plan_date = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM block b
+             WHERE b.task_id = task.id AND b.is_locked = 1 AND date(b.starts_at) = ?
+          )`
+    );
+    for (const d of deferrals) defer.run(d.movedTo, dateISO, d.task.id, dateISO, dateISO);
     db.prepare("UPDATE task SET status = 'planned' WHERE plan_date = ? AND status = 'inbox'").run(dateISO);
     persistDayCache(db, ANCHOR_FINGERPRINT_PREFIX, dateISO, JSON.stringify(externalFingerprint));
     return planId;
   });
   const planId = persist();
-  return getPlan(db, dateISO, planId);
+
+  // ── the plan reaches Google because it exists, not because it was approved ──
+  //
+  // Owner directive 2026-08-06: "it should automatically populate to my Google Calendar, it
+  // shouldn't require me to press a button." Pushing was already automatic — but only from
+  // acceptPlan, and accepting was a button. His plan for the day therefore sat with
+  // accepted_at NULL and never left the laptop.
+  //
+  // Best-effort and time-boxed: a slow or unreachable Google delays the answer by at most
+  // GENERATE_PUSH_TIMEOUT_MS and never costs him the plan itself, because `pushed_at` stays
+  // NULL and workers.sweepAutoPush retries on the next tick.
+  const push: PlanPushResult = autoPushEnabled(db)
+    ? await withTimeout(
+        pushPlanToGoogle(db, secrets, planId, deps?.push),
+        GENERATE_PUSH_TIMEOUT_MS,
+        "Google push timed out"
+      ).catch((e: Error) => ({ pushed: 0, tasks: 0, withdrawn: 0, error: e.message }))
+    : { pushed: 0, tasks: 0, withdrawn: 0, error: "auto_push_off" };
+
+  const view = getPlan(db, dateISO, planId);
+  return view ? { ...view, push } : null;
 }
 
 export function getPlan(db: Db, dateISO: string, planId?: number) {
@@ -319,6 +453,8 @@ export const ANCHOR_FINGERPRINT_PREFIX = "plan_anchors_fp:";
  */
 export interface ReplanDeps {
   anchors?: (dateISO: string) => Promise<Anchor[]>;
+  /** The Google write surface, injected so the generate-time push is testable offline. */
+  push?: Partial<GcalPushDeps>;
 }
 
 /** Live external anchors for a date, honoring an injected reader. */
@@ -701,6 +837,8 @@ export interface PlanPushResult {
   pushed: number;
   /** Google Tasks written. */
   tasks: number;
+  /** Stale events withdrawn — blocks a re-plan removed (see gcal/sync.ts drainTombstones). */
+  withdrawn: number;
   /** Typed failure — `reconsent_required`, "skipped: …", or a raw message. */
   error?: string;
 }
@@ -734,7 +872,7 @@ export async function pushPlanToGoogle(
   planId: number,
   deps?: Partial<GcalPushDeps>
 ): Promise<PlanPushResult> {
-  const out: PlanPushResult = { pushed: 0, tasks: 0 };
+  const out: PlanPushResult = { pushed: 0, tasks: 0, withdrawn: 0 };
   if (!isGoogleConnected(secrets)) return { ...out, error: "not_connected" };
   if (!hasCalendarWriteScope(secrets)) return { ...out, error: RECONSENT_REQUIRED };
   try {
@@ -742,6 +880,7 @@ export async function pushPlanToGoogle(
       (async () => {
         const cal = await pushPlan(db, secrets, planId, deps);
         out.pushed = cal.pushed;
+        out.withdrawn = cal.withdrawn;
         // Tasks are a separate surface: a calendar push that landed must still be
         // reported even if the task push then fails.
         const tasks = await pushTasks(db, secrets, deps);
@@ -770,8 +909,8 @@ export async function acceptPlan(
   deps?: Partial<GcalPushDeps>
 ): Promise<AcceptPlanResult> {
   db.prepare("UPDATE plan SET accepted_at = datetime('now') WHERE id = ?").run(planId);
-  if (!secrets) return { accepted: true, push: { pushed: 0, tasks: 0, error: "not_connected" } };
-  if (!autoPushEnabled(db)) return { accepted: true, push: { pushed: 0, tasks: 0, error: "auto_push_off" } };
+  if (!secrets) return { accepted: true, push: { pushed: 0, tasks: 0, withdrawn: 0, error: "not_connected" } };
+  if (!autoPushEnabled(db)) return { accepted: true, push: { pushed: 0, tasks: 0, withdrawn: 0, error: "auto_push_off" } };
   return { accepted: true, push: await pushPlanToGoogle(db, secrets, planId, deps) };
 }
 

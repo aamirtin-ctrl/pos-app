@@ -10,7 +10,13 @@ export type Block = {
   /** 0-100 energy-curve capacity at the minute the solver placed this block. */
   capacity_score_at_placement?: number | null;
 };
-export type PlanView = { plan: any; blocks: Block[]; unplaced: { title: string; reason: string }[] };
+export type PlanView = {
+  plan: any;
+  blocks: Block[];
+  unplaced: { title: string; reason: string; movedTo?: string }[];
+  /** Only on a freshly GENERATED plan: what its automatic Google push did. */
+  push?: { pushed: number; tasks: number; withdrawn: number; error?: string };
+};
 /** `source` is absent for Google anchors, "ics" for subscribed feeds, "apple" for Calendar.app. */
 export type ExternalEvent = { startMin: number; endMin: number; title: string; blockType: string; source?: string };
 

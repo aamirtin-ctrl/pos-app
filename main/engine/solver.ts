@@ -17,13 +17,73 @@ export interface PlannerTask {
   deadlineMin: number | null; // minutes-since-midnight the task must END by (today), or null
   project: string | null;
   splittable: boolean;
+  /**
+   * The LAST day (ISO date) this work may be scheduled on, or null for same-day-only work.
+   * Set ONLY for work the owner said was flexible across a range — see migration 9. A task
+   * carrying one may be handed back as `deferred_within_window` instead of being crammed in.
+   *
+   * Optional so every existing construction (and every existing test) is byte-identical to
+   * before: no window means the old behavior, exactly.
+   */
+  windowEnd?: string | null;
+  /** The day currently being solved for. With a `windowEnd`, this is a CHOICE, not a commitment. */
+  planDate?: string;
 }
 
 export type UnplacedReason =
   | "exceeded_deep_work_cap"
   | "no_eligible_slot"
   | "deadline_conflict"
-  | "insufficient_contiguous_time";
+  | "insufficient_contiguous_time"
+  /**
+   * NOT a failure. The task has a deadline window with days left in it, today could not seat
+   * it (or seating it would have stranded work that must happen today), so it moves. The
+   * planner advances its plan_date to the next day inside the window; tomorrow picks it up.
+   */
+  | "deferred_within_window";
+
+/** The one reason that means "not today" rather than "not at all". */
+export const DEFERRED_REASON = "deferred_within_window" as const;
+
+/**
+ * Reasons that mean the day genuinely could not seat the work — the only conditions worth
+ * deferring a windowed task to relieve.
+ *
+ * `exceeded_deep_work_cap` is deliberately NOT here. It is a budget, not a clock, and the
+ * ranking below already spends that budget on same-day work first; adding it would make the
+ * withholding pass re-solve the day for a task that a cap, not a competitor, turned away.
+ */
+const PRESSURE_REASONS: ReadonlySet<UnplacedReason> = new Set<UnplacedReason>([
+  "no_eligible_slot",
+  "insufficient_contiguous_time",
+  "deadline_conflict",
+]);
+
+/**
+ * May this task legitimately be moved to a LATER day? True only when it has a window and
+ * today is not the last day of it — on `windowEnd` itself there is nowhere left to go, so a
+ * failure there is a real failure.
+ *
+ * ISO dates compare correctly as strings, which is the whole reason they are stored that way.
+ */
+export function isDeferrable(t: PlannerTask): boolean {
+  const end = t.windowEnd ?? null;
+  const day = t.planDate ?? null;
+  return end !== null && day !== null && day < end;
+}
+
+/**
+ * The day a deferred task moves to: tomorrow, clamped to the window (which `isDeferrable`
+ * already guarantees is reachable). Null when the task is not deferrable at all.
+ *
+ * Exported because THREE places must agree on it — the planner that writes the new plan_date,
+ * the narration that tells the owner where it went, and the tests that pin both.
+ */
+export function nextDayInWindow(t: PlannerTask): string | null {
+  if (!isDeferrable(t)) return null;
+  const next = new Date(Date.parse(`${t.planDate}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
+  return next <= t.windowEnd! ? next : null;
+}
 
 export interface PlacedBlock {
   blockType: BlockType;
@@ -53,6 +113,14 @@ const slotsFor = (minutes: number) => Math.max(1, Math.ceil(minutes / SLOT_MIN))
 /** minutes-since-midnight → "HH:MM" (wraps past-midnight values back into clock time). */
 const fmtMin = (min: number) =>
   `${String(Math.floor(min / 60) % 24).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}`;
+
+/** A duration in the words a person uses: 150 → "2h30", 90 → "1h30", 45 → "45 min". */
+const fmtDur = (minutes: number) => {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  if (h === 0) return `${m} min`;
+  return m === 0 ? `${h}h` : `${h}h${String(m).padStart(2, "0")}`;
+};
 
 /**
  * One anchor the pass must NOT occupy up front, and must re-place after everything else.
@@ -88,6 +156,62 @@ interface PassOptions {
  * deterministic passes and an explicit comparison — same input twice, same output.
  */
 export function solve(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[]): SolveResult {
+  const deferrable = new Set(tasks.filter(isDeferrable).map((t) => t.id));
+
+  // No windows in play → the old function, unchanged, not one branch different.
+  if (deferrable.size === 0) return solveTiered(tasks, doctrine, anchors);
+
+  /** Work that MUST happen today and the day could not seat. The only thing worth deferring for. */
+  const stranded = (r: SolveResult) =>
+    r.unplaced.filter((u) => !deferrable.has(u.task.id) && PRESSURE_REASONS.has(u.reason)).length;
+
+  let active = tasks;
+  let result = solveTiered(active, doctrine, anchors);
+  const withheld: PlannerTask[] = [];
+
+  // ── withhold windowed work that is costing same-day work its place ──
+  //
+  // Ranking (below, in solvePass) already puts same-day tasks first within each placement
+  // phase, which settles the owner's case on its own. This loop is the cross-phase backstop:
+  // a windowed MIT is placed before a same-day deep-work task, and if that inversion strands
+  // the task that genuinely has to be today, the windowed one gives way — it has all week.
+  //
+  // Deterministic and bounded: at most one windowed task leaves per iteration, chosen by an
+  // explicit total order (most slack first, then longest — the one whose removal both costs
+  // least and frees most), and an iteration that does not actually rescue anything is undone.
+  for (;;) {
+    if (stranded(result) === 0) break;
+    const placed = new Set(result.blocks.map((b) => b.taskId).filter((id): id is number => id !== undefined));
+    const victims = active
+      .filter((t) => deferrable.has(t.id) && placed.has(t.id))
+      .sort(
+        (a, b) =>
+          (b.windowEnd ?? "").localeCompare(a.windowEnd ?? "") ||
+          b.estimatedMinutes - a.estimatedMinutes ||
+          a.id - b.id
+      );
+    if (victims.length === 0) break;
+    const victim = victims[0];
+    const next = solveTiered(active.filter((t) => t.id !== victim.id), doctrine, anchors);
+    if (stranded(next) >= stranded(result)) break; // the sacrifice bought nothing — keep the day as is
+    active = active.filter((t) => t.id !== victim.id);
+    withheld.push(victim);
+    result = next;
+  }
+
+  // ── relabel: a windowed task that missed today has not failed, it has moved ──
+  const unplaced = [
+    ...result.unplaced.map((u) =>
+      deferrable.has(u.task.id) ? { task: u.task, reason: DEFERRED_REASON as UnplacedReason } : u
+    ),
+    ...withheld.map((task) => ({ task, reason: DEFERRED_REASON as UnplacedReason })),
+  ].sort((a, b) => a.task.id - b.task.id);
+
+  return { ...result, unplaced };
+}
+
+/** The three-tier anchor logic. `solve` above wraps it with deadline-window deferral. */
+function solveTiered(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[]): SolveResult {
   const byStart = (a: Anchor, b: Anchor) => a.startMin - b.startMin || a.title.localeCompare(b.title);
   const immovable = anchors.filter((a) => !a.movable);
   const fixedAnchors = immovable.filter((a) => flexibilityOf(a) === "fixed");
@@ -118,11 +242,14 @@ export function solve(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[
   // two reasons the owner named because it is the same failure wearing a different label:
   // the day has room, just not before the deadline, and a preferred block may be sitting in
   // exactly the window that would work.
+  // Windowed work is excluded on purpose: displacing the owner's own `preferred` block to
+  // seat something that has until Sunday is a bad trade. It defers instead (see `solve`).
   const pressured = first.unplaced.filter(
     (u) =>
-      u.reason === "no_eligible_slot" ||
-      u.reason === "insufficient_contiguous_time" ||
-      u.reason === "deadline_conflict"
+      !isDeferrable(u.task) &&
+      (u.reason === "no_eligible_slot" ||
+        u.reason === "insufficient_contiguous_time" ||
+        u.reason === "deadline_conflict")
   );
   if (pressured.length === 0) return first;
 
@@ -279,7 +406,14 @@ function solvePass(
   }
 
   // task ordering helpers
-  const byId = (a: PlannerTask, b: PlannerTask) => a.id - b.id;
+  //
+  // `windowRank` is the LEADING key of every placement order below: work that must happen
+  // today is offered the day before work that merely may. Without it the math test and the
+  // advising block compete as equals for the same two hours, and the tiebreak that decides
+  // which of them the owner loses is cognitive load — which is not the question he asked.
+  // With no windowed tasks present it is 0 for everything, so ordering is bit-for-bit as before.
+  const windowRank = (t: PlannerTask) => (isDeferrable(t) ? 1 : 0);
+  const byId = (a: PlannerTask, b: PlannerTask) => windowRank(a) - windowRank(b) || a.id - b.id;
   const remaining = new Set(tasks.map((t) => t.id));
   const take = (t: PlannerTask) => remaining.delete(t.id);
 
@@ -379,12 +513,37 @@ function solvePass(
   let deepMinutes = 0;
   let deepBlocks = 0;
 
+  /**
+   * How to cut this deep-work task into blocks.
+   *
+   * Owner report 2026-08-06: "I don't get why that exceeded the deep work cap for today
+   * because I didn't do any deep work today." He was right, and the narration agreed with
+   * him in the same breath — "No deep work is scheduled today. 1 task did not fit: Take
+   * Stanford math test (exceeded deep work cap)."
+   *
+   * Nothing about his DAY was full. His math test was 2h stated, buffered to 2h30, and
+   * marked not splittable (correctly — you do not take half a test). That is 30 minutes over
+   * `max_deep_work_block_minutes`, so this function returned null and the test was dropped.
+   *
+   * That cap is doctrine about how POS should CHUNK work — BRAC cycles run 90-120 minutes
+   * and alertness decays after — not a claim that longer sessions are impossible. Applying it
+   * to indivisible work inverted its purpose: a sound recommendation about pacing silently
+   * deleted a real obligation. Work the owner says cannot be split is placed whole, and the
+   * overrun is NARRATED instead. The daily budget still binds, because that one really is a
+   * ceiling on how much focus a day holds.
+   */
   function deepChunks(t: PlannerTask): number[] | null {
     const est = t.estimatedMinutes;
     const max = hc.max_deep_work_block_minutes;
     const min = hc.min_deep_work_block_minutes;
     if (est <= max) return [Math.max(est, min)];
-    if (!t.splittable) return null;
+    if (!t.splittable) {
+      notes.push(
+        `"${t.title}" runs ${fmtDur(est)} in one sitting, past the ${fmtDur(max)} focus cap, and can't be split — ` +
+          `plan a stretch at the ${fmtDur(max - 30)} mark.`
+      );
+      return [est];
+    }
     // split into 2 (default max) — long deep work almost always splits
     const half = Math.ceil(est / 2 / SLOT_MIN) * SLOT_MIN;
     const c1 = Math.min(max, half);
@@ -487,7 +646,7 @@ function solvePass(
   // ── 4. MIT first — into the highest-capacity eligible slot ──
   const mits = tasks
     .filter((t) => remaining.has(t.id) && t.isMit)
-    .sort((a, b) => b.cognitiveLoad - a.cognitiveLoad || a.id - b.id);
+    .sort((a, b) => windowRank(a) - windowRank(b) || b.cognitiveLoad - a.cognitiveLoad || a.id - b.id);
   for (const t of mits) {
     take(t);
     placeDeepOrFocused(t, true);
@@ -496,7 +655,13 @@ function solvePass(
   // ── 5. Remaining deep work, descending by load ──
   const deeps = tasks
     .filter((t) => remaining.has(t.id) && t.blockType === "deep_work")
-    .sort((a, b) => b.cognitiveLoad - a.cognitiveLoad || b.estimatedMinutes - a.estimatedMinutes || a.id - b.id);
+    .sort(
+      (a, b) =>
+        windowRank(a) - windowRank(b) ||
+        b.cognitiveLoad - a.cognitiveLoad ||
+        b.estimatedMinutes - a.estimatedMinutes ||
+        a.id - b.id
+    );
   for (const t of deeps) {
     take(t);
     placeDeepOrFocused(t, false);
@@ -509,6 +674,7 @@ function solvePass(
     .filter((t) => remaining.has(t.id))
     .sort(
       (a, b) =>
+        windowRank(a) - windowRank(b) ||
         (a.project ?? "~").localeCompare(b.project ?? "~") ||
         a.title.localeCompare(b.title) ||
         a.id - b.id
@@ -555,7 +721,11 @@ function solvePass(
   // cut while time remains AFTER the shutdown boundary, say so — that free time is a
   // deliberate choice, not an oversight the owner should try to fill.
   if (grid.shutdownMin !== null) {
-    const cut = unplaced.filter((u) => u.reason === "no_eligible_slot" && WORK_TYPES.has(u.task.blockType));
+    // Windowed work excluded: it did not hit the wall, it moved to another day, and the
+    // narration says so. Counting it here would contradict that in the same breath.
+    const cut = unplaced.filter(
+      (u) => u.reason === "no_eligible_slot" && WORK_TYPES.has(u.task.blockType) && !isDeferrable(u.task)
+    );
     const eveningFree = slots.some((s, i) => s.startMin >= grid.shutdownMin! && occ[i] === null);
     if (cut.length > 0 && eveningFree) {
       notes.push(
@@ -572,6 +742,6 @@ function solvePass(
 }
 
 /** Engine version stamped onto plans — bump when solver behavior changes. */
-export const ENGINE_VERSION = "1.0.0";
+export const ENGINE_VERSION = "1.1.0"; // 1.1.0: deadline windows (deferred_within_window)
 
 export { hhmmToMin };
