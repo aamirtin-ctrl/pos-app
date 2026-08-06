@@ -468,4 +468,42 @@ BEGIN
 END;
 `,
   },
+  {
+    version: 12,
+    name: "capture_inbox",
+    sql: `
+-- Nothing he says is allowed to evaporate (owner ask 2026-08-06: "the system should be able to
+-- take info from my emails to myself, sparkle button, and personal texts and all that should
+-- run through a tasks/calendar event/personal info gleaning pipeline").
+--
+-- The pipeline already existed at all three entry points. What it did not have was DURABILITY.
+-- Every one of them classified with the model and acted on the answer in a single pass, so a
+-- provider that was down meant the input was read, misrouted or ignored, and then gone — there
+-- was no record that he had ever said it.
+--
+-- That is not hypothetical: his Gemini quota ran out at 18:18 today, and the things he typed
+-- into the sparkle box afterwards produced no task, no event, no note, and no error he could
+-- see. The only evidence they ever happened is that he remembered.
+--
+-- So the raw text is written HERE first, before anything is interpreted, and the interpretation
+-- becomes a separate step that may fail and be retried. A NULL processed_at IS the queue;
+-- attempts stops a permanently unparseable line from being retried forever; result is what the
+-- pipeline decided, kept for audit so a wrong routing can be found and explained.
+CREATE TABLE capture_inbox (
+  id INTEGER PRIMARY KEY,
+  -- Where he said it: 'sparkle' | 'self_email' | 'imessage' | 'alexa'.
+  source TEXT NOT NULL,
+  -- Exactly what he said. Never rewritten — this is the record of the input itself.
+  raw_text TEXT NOT NULL,
+  received_at TEXT NOT NULL DEFAULT (datetime('now')),
+  processed_at TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  -- What the pipeline made of it once it succeeded (JSON: intent + what was created).
+  result TEXT,
+  -- Why the last attempt failed, when it did.
+  error TEXT
+);
+CREATE INDEX idx_capture_pending ON capture_inbox(processed_at, id) WHERE processed_at IS NULL;
+`,
+  },
 ];

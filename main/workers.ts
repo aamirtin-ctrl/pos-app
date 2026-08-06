@@ -39,6 +39,8 @@ import { syncLinkedin } from "./connectors/linkedin.ts";
 import { syncLinkedinEmail } from "./connectors/linkedin-email.ts";
 import { syncMailfile } from "./connectors/mailfile.ts";
 import { runCapture, resolveDoctrineDir } from "./capture.ts";
+import { drainCaptures } from "./capture-inbox.ts";
+import { handleCommand } from "./assistant.ts";
 import { sendMorningDigest, shouldSendDigest } from "./digest.ts";
 import { loadDoctrine } from "./engine/doctrine.ts";
 import { runMsgPlans } from "./msgplans.ts";
@@ -1037,6 +1039,27 @@ export function startWorkers(
         }
       } catch (e) {
         console.warn(`workers: degraded backfill failed: ${(e as Error).message}`);
+      }
+
+      // Anything he said while the model was down is still waiting to be understood. Gated on
+      // health so an outage cannot burn every queued line's attempts (owner ask 2026-08-06:
+      // his sparkle input vanished when the Gemini quota ran out).
+      try {
+        if (llm) {
+          const cap = await drainCaptures(
+            db,
+            async (text) => {
+              const r = await handleCommand({ db, secrets, doctrineDir: resolveDoctrineDir(), llm }, text);
+              return { kind: r.kind };
+            },
+            { healthy: llmHealth(db, secrets).ok }
+          );
+          if (cap.processed > 0) {
+            notify?.(`Caught up on ${cap.processed} thing${cap.processed === 1 ? "" : "s"} you said earlier`);
+          }
+        }
+      } catch (e) {
+        console.warn(`workers: capture drain failed: ${(e as Error).message}`);
       }
 
       // An undated commitment can never be scheduled, so it just reappears every morning

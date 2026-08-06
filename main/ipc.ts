@@ -65,6 +65,7 @@ import { readPreferences, writePreferences, preferencesPath } from "./preference
 import { embedProfiles, makeQueryEmbedder } from "./llm/embeddings.ts";
 import * as planner from "./planner.ts";
 import { handleCommand } from "./assistant.ts";
+import { recordCapture, markCaptureDone, markCaptureFailed, pendingCaptureCount } from "./capture-inbox.ts";
 import { transcribe } from "./stt.ts";
 import { generateDrafts, listDrafts, setDraftStatus, synthesizeVoices, getVoices } from "./crm/drafts.ts";
 import {
@@ -748,9 +749,23 @@ export function registerIpc(deps: IpcDeps) {
   });
 
   // ── unified assistant ──
-  h("assistant.command", (text: string) =>
-    handleCommand({ db, secrets, doctrineDir, llm: deps.llm() }, text)
-  );
+  //
+  // The raw text is recorded BEFORE it is interpreted (owner ask 2026-08-06). His Gemini quota
+  // ran out at 18:18 and everything he typed here afterwards produced no task, no event, no
+  // note and no visible error — the input was simply gone. Now it is on disk first, and a
+  // failed interpretation leaves a queued row the worker re-runs once the model is back.
+  h("assistant.command", async (text: string) => {
+    const captureId = recordCapture(db, "sparkle", text);
+    try {
+      const res = await handleCommand({ db, secrets, doctrineDir, llm: deps.llm() }, text);
+      if (captureId !== null) markCaptureDone(db, captureId, { kind: res.kind });
+      return res;
+    } catch (e) {
+      if (captureId !== null) markCaptureFailed(db, captureId, (e as Error).message);
+      throw e;
+    }
+  });
+  h("capture.pending", () => pendingCaptureCount(db));
 
   // ── settings ──
   h("settings.keys", () => {
