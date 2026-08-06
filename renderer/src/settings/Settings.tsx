@@ -6,7 +6,9 @@ import { useCallback, useEffect, useState } from "react";
 
 type KeyRow = { name: string; present: boolean };
 type Spend = { total: number; byFeature: Record<string, number>; ceiling: number };
-type GcalState = { connected: boolean; hasCreds: boolean };
+// canWrite is false when the stored token predates the calendar-write scope widening:
+// it still refreshes, so nothing looks disconnected, but every push is refused with 403.
+type GcalState = { connected: boolean; hasCreds: boolean; canWrite: boolean };
 type AdherenceRow = { blockType: string; planned: number; completed: number; rate: number };
 
 // workers.ts is still landing — normalize whatever row shape sync.status() returns.
@@ -186,7 +188,7 @@ function Integrations() {
   }, []);
 
   const refetchGcal = useCallback(async () => {
-    const r = await window.pos.gcal.connected();
+    const r = await window.pos.gcal.scopeStatus();
     if (r.ok) setGcal(r.data as GcalState);
   }, []);
 
@@ -654,6 +656,25 @@ function GoogleCard({
 }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
+  // Auto-push (setting `auto_push`, absent = on) is read here so the toggle reflects the
+  // same default the main process applies.
+  const [autoPush, setAutoPush] = useState(true);
+  const [autoPushLoaded, setAutoPushLoaded] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const r = await window.pos.settings.get("auto_push");
+      if (r.ok) setAutoPush(r.data !== "0");
+      setAutoPushLoaded(true);
+    })();
+  }, []);
+
+  const toggleAutoPush = async () => {
+    const next = !autoPush;
+    const r = await window.pos.settings.set("auto_push", next ? "1" : "0");
+    if (r.ok) setAutoPush(next);
+    else setMsg(r.error ?? "could not save");
+  };
 
   const connect = async () => {
     setBusy("connect");
@@ -729,8 +750,41 @@ function GoogleCard({
         </div>
       ) : (
         <>
+          {!gcal.canWrite && (
+            // Connected but the grant is too narrow — the exact reason "Push to Google"
+            // silently did nothing. Nothing else in the app could say this.
+            <div
+              className="mb-3 rounded-md border px-3 py-2"
+              style={{ borderColor: "var(--danger)", background: "color-mix(in srgb, var(--danger) 8%, white)" }}
+            >
+              <p className="text-sm font-medium" style={{ color: "var(--danger)" }}>
+                Google needs re-authorizing
+              </p>
+              <p className="text-xs mt-1" style={{ color: "var(--muted)" }}>
+                POS&rsquo;s calendar permissions changed — it now creates its own
+                &lsquo;POS — Planned&rsquo; calendar, which the older sign-in did not allow. Pushes are
+                refused until you reconnect. Nothing is lost; this just re-grants access.
+              </p>
+              <button
+                onClick={connect}
+                disabled={busy === "connect"}
+                className="mt-2 px-3 py-1.5 rounded-md text-sm text-white disabled:opacity-50"
+                style={{ background: "var(--accent)" }}
+              >
+                {busy === "connect" ? "Waiting for browser…" : "Reconnect Google"}
+              </button>
+            </div>
+          )}
           <p className="text-sm mb-2">
             Connected — blocks push to &lsquo;POS — Planned&rsquo;, tasks to the &lsquo;POS&rsquo; list
+          </p>
+          <label className="flex items-center gap-2 text-sm mb-2 no-drag" style={{ color: "var(--ink)" }}>
+            <input type="checkbox" checked={autoPush} onChange={toggleAutoPush} disabled={!autoPushLoaded} />
+            Automatically push accepted plans
+          </label>
+          <p className="text-xs mb-2" style={{ color: "var(--muted)" }}>
+            On: accepting a plan sends it straight to Google, and anything that didn&rsquo;t get
+            through is retried in the background every 15 minutes.
           </p>
           <button
             onClick={reconcile}

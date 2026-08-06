@@ -14,7 +14,7 @@ import { google, type calendar_v3, type tasks_v1 } from "googleapis";
 import type { Db } from "../db/db.ts";
 import { getSetting, setSetting } from "../db/db.ts";
 import type { SecretStore } from "../secrets.ts";
-import { isGoogleConnected, oauthClient } from "./auth.ts";
+import { isGoogleConnected, needsReconsent, oauthClient, RECONSENT_REQUIRED } from "./auth.ts";
 import { confirmCommitment, dropCommitment } from "../crm/commitments.ts";
 import { resolveNamedDate } from "../context.ts";
 
@@ -28,27 +28,108 @@ function tasksApi(secrets: SecretStore): tasks_v1.Tasks {
   return google.tasks({ version: "v1", auth: oauthClient(secrets) });
 }
 
+// ── the injectable push surface ──────────────────────────────────────────────
+//
+// Everything that WRITES to Google goes through these two narrow interfaces, so the push
+// path is testable without the network (same seam as gtasks-sync.ts's GoogleTasksDeps).
+// Production wires them straight to googleapis via realPushDeps.
+
+/** The slice of Google Calendar the push path uses. */
+export interface PushCalendarApi {
+  calendars: {
+    get(args: { calendarId: string }): Promise<{ data: { id?: string | null; summary?: string | null } }>;
+    insert(args: { requestBody: { summary: string } }): Promise<{ data: { id?: string | null } }>;
+  };
+  calendarList: {
+    list(args: { maxResults: number }): Promise<{ data: { items?: { id?: string | null; summary?: string | null }[] } }>;
+  };
+  events: {
+    insert(args: { calendarId: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
+    update(args: { calendarId: string; eventId: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
+  };
+}
+
+/** The slice of Google Tasks the push path uses. */
+export interface PushTasksApi {
+  tasklists: {
+    get(args: { tasklist: string }): Promise<{ data: { id?: string | null } }>;
+    list(args: { maxResults: number }): Promise<{ data: { items?: { id?: string | null; title?: string | null }[] } }>;
+    insert(args: { requestBody: { title: string } }): Promise<{ data: { id?: string | null } }>;
+  };
+  tasks: {
+    list(args: { tasklist: string; maxResults: number; showCompleted?: boolean }): Promise<{
+      data: { items?: { id?: string | null; notes?: string | null }[] };
+    }>;
+    insert(args: { tasklist: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
+    update(args: { tasklist: string; task: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
+  };
+}
+
+export interface GcalPushDeps {
+  calendar(): PushCalendarApi;
+  tasks(): PushTasksApi;
+}
+
+/** The production surface: plain googleapis clients behind the narrow interfaces. */
+export function realPushDeps(secrets: SecretStore): GcalPushDeps {
+  return {
+    calendar: () => calApi(secrets) as unknown as PushCalendarApi,
+    tasks: () => tasksApi(secrets) as unknown as PushTasksApi,
+  };
+}
+
+const pushDeps = (secrets: SecretStore, overrides?: Partial<GcalPushDeps>): GcalPushDeps => ({
+  ...realPushDeps(secrets),
+  ...overrides,
+});
+
+/**
+ * Map the scope-drift family of Google failures to the single typed string
+ * `reconsent_required`, so no caller has to pattern-match a raw Google message and the UI
+ * can render one actionable line ("re-authorize Google") instead of "Insufficient
+ * Permission". Everything else propagates untouched — an already-mapped error included,
+ * since `needsReconsent` does not match its own output.
+ */
+export async function withReconsentMapping<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e) {
+    if (needsReconsent(e)) throw new Error(RECONSENT_REQUIRED);
+    throw e;
+  }
+}
+
 /** Find-or-create the dedicated POS calendar; id cached in settings. */
-export async function ensurePosCalendar(db: Db, secrets: SecretStore): Promise<string> {
-  const cached = getSetting(db, "pos_calendar_id");
-  const cal = calApi(secrets);
-  if (cached) {
-    try {
-      await cal.calendars.get({ calendarId: cached });
-      return cached;
-    } catch {
-      /* recreate below */
+export async function ensurePosCalendar(
+  db: Db,
+  secrets: SecretStore,
+  deps?: Partial<GcalPushDeps>
+): Promise<string> {
+  return withReconsentMapping(async () => {
+    const cached = getSetting(db, "pos_calendar_id");
+    const cal = pushDeps(secrets, deps).calendar();
+    if (cached) {
+      try {
+        await cal.calendars.get({ calendarId: cached });
+        return cached;
+      } catch (e) {
+        // A scope failure here is NOT "the calendar is gone" — falling through would call
+        // calendars.insert and fail again with the same 403. Surface it as-is.
+        if (needsReconsent(e)) throw e;
+        /* recreate below */
+      }
     }
-  }
-  const list = await cal.calendarList.list({ maxResults: 250 });
-  const existing = list.data.items?.find((c) => c.summary === POS_CALENDAR_NAME);
-  if (existing?.id) {
-    setSetting(db, "pos_calendar_id", existing.id);
-    return existing.id;
-  }
-  const created = await cal.calendars.insert({ requestBody: { summary: POS_CALENDAR_NAME } });
-  setSetting(db, "pos_calendar_id", created.data.id!);
-  return created.data.id!;
+    const list = await cal.calendarList.list({ maxResults: 250 });
+    const existing = list.data.items?.find((c) => c.summary === POS_CALENDAR_NAME);
+    if (existing?.id) {
+      setSetting(db, "pos_calendar_id", existing.id);
+      return existing.id;
+    }
+    const created = await cal.calendars.insert({ requestBody: { summary: POS_CALENDAR_NAME } });
+    if (!created.data.id) throw new Error("Google returned no calendar id");
+    setSetting(db, "pos_calendar_id", created.data.id);
+    return created.data.id;
+  });
 }
 
 // ── "POS — From Messages": the ONLY calendar main/msgplans.ts may touch ──────
@@ -89,30 +170,37 @@ export function assertMessagesCalendarId(db: Db, id: string | null | undefined):
  * Find-or-create "POS — From Messages"; id cached in setting `msgplans_calendar_id`.
  * Every return path passes through assertMessagesCalendarId.
  */
-export async function ensureMessagesCalendar(db: Db, secrets: SecretStore): Promise<string> {
-  const cal = calApi(secrets);
-  const cached = getSetting(db, MSGPLANS_SETTING_KEY);
-  if (cached) {
-    const id = assertMessagesCalendarId(db, cached);
-    try {
-      const got = await cal.calendars.get({ calendarId: id });
-      // A cached id whose calendar was renamed/replaced is not ours — fall through.
-      if (got.data.summary === MSGPLANS_CALENDAR_NAME) return id;
-    } catch {
-      /* deleted upstream — recreate below */
+export async function ensureMessagesCalendar(
+  db: Db,
+  secrets: SecretStore,
+  deps?: Partial<GcalPushDeps>
+): Promise<string> {
+  return withReconsentMapping(async () => {
+    const cal = pushDeps(secrets, deps).calendar();
+    const cached = getSetting(db, MSGPLANS_SETTING_KEY);
+    if (cached) {
+      const id = assertMessagesCalendarId(db, cached);
+      try {
+        const got = await cal.calendars.get({ calendarId: id });
+        // A cached id whose calendar was renamed/replaced is not ours — fall through.
+        if (got.data.summary === MSGPLANS_CALENDAR_NAME) return id;
+      } catch (e) {
+        if (needsReconsent(e)) throw e; // scope failure, not a deleted calendar
+        /* deleted upstream — recreate below */
+      }
     }
-  }
-  const list = await cal.calendarList.list({ maxResults: 250 });
-  const existing = list.data.items?.find((c) => c.summary === MSGPLANS_CALENDAR_NAME);
-  if (existing?.id) {
-    const id = assertMessagesCalendarId(db, existing.id);
+    const list = await cal.calendarList.list({ maxResults: 250 });
+    const existing = list.data.items?.find((c) => c.summary === MSGPLANS_CALENDAR_NAME);
+    if (existing?.id) {
+      const id = assertMessagesCalendarId(db, existing.id);
+      setSetting(db, MSGPLANS_SETTING_KEY, id);
+      return id;
+    }
+    const created = await cal.calendars.insert({ requestBody: { summary: MSGPLANS_CALENDAR_NAME } });
+    const id = assertMessagesCalendarId(db, created.data.id);
     setSetting(db, MSGPLANS_SETTING_KEY, id);
     return id;
-  }
-  const created = await cal.calendars.insert({ requestBody: { summary: MSGPLANS_CALENDAR_NAME } });
-  const id = assertMessagesCalendarId(db, created.data.id);
-  setSetting(db, MSGPLANS_SETTING_KEY, id);
-  return id;
+  });
 }
 
 export interface MessagesEventInput {
@@ -481,34 +569,48 @@ export function mergeCalendarSources(
   return { anchors, skipped };
 }
 
-/** Explicit push: write every non-anchor block of a plan into the POS calendar. */
-export async function pushPlan(db: Db, secrets: SecretStore, planId: number): Promise<{ pushed: number }> {
-  const calId = await ensurePosCalendar(db, secrets);
-  const cal = calApi(secrets);
+/**
+ * Push: write every non-anchor block of a plan into the POS calendar.
+ *
+ * `pushed_at` is stamped ONLY on a clean run. A scope failure (mapped to
+ * `reconsent_required`) leaves it NULL, so the plan stays in the worker's auto-push sweep
+ * and the UI keeps offering the retry — the old code could never distinguish "pushed" from
+ * "tried and was refused".
+ */
+export async function pushPlan(
+  db: Db,
+  secrets: SecretStore,
+  planId: number,
+  deps?: Partial<GcalPushDeps>
+): Promise<{ pushed: number }> {
   const plan = db.prepare("SELECT plan_date FROM plan WHERE id = ?").get(planId) as { plan_date: string } | undefined;
   if (!plan) throw new Error(`plan ${planId} not found`);
-  const blocks = db
-    .prepare("SELECT id, block_type, title, starts_at, ends_at, gcal_event_id FROM block WHERE plan_id = ? AND is_anchor = 0")
-    .all(planId) as { id: number; block_type: string; title: string; starts_at: string; ends_at: string; gcal_event_id: string | null }[];
-  let pushed = 0;
-  for (const b of blocks) {
-    const body = {
-      summary: b.title || b.block_type,
-      description: `POS ${b.block_type} block`,
-      start: { dateTime: new Date(b.starts_at).toISOString() },
-      end: { dateTime: new Date(b.ends_at).toISOString() },
-    };
-    if (b.gcal_event_id) {
-      await cal.events.update({ calendarId: calId, eventId: b.gcal_event_id, requestBody: body });
-    } else {
-      const created = await cal.events.insert({ calendarId: calId, requestBody: body });
-      db.prepare("UPDATE block SET gcal_event_id = ? WHERE id = ?").run(created.data.id, b.id);
+  return withReconsentMapping(async () => {
+    const calId = await ensurePosCalendar(db, secrets, deps);
+    const cal = pushDeps(secrets, deps).calendar();
+    const blocks = db
+      .prepare("SELECT id, block_type, title, starts_at, ends_at, gcal_event_id FROM block WHERE plan_id = ? AND is_anchor = 0")
+      .all(planId) as { id: number; block_type: string; title: string; starts_at: string; ends_at: string; gcal_event_id: string | null }[];
+    let pushed = 0;
+    for (const b of blocks) {
+      const body = {
+        summary: b.title || b.block_type,
+        description: `POS ${b.block_type} block`,
+        start: { dateTime: new Date(b.starts_at).toISOString() },
+        end: { dateTime: new Date(b.ends_at).toISOString() },
+      };
+      if (b.gcal_event_id) {
+        await cal.events.update({ calendarId: calId, eventId: b.gcal_event_id, requestBody: body });
+      } else {
+        const created = await cal.events.insert({ calendarId: calId, requestBody: body });
+        db.prepare("UPDATE block SET gcal_event_id = ? WHERE id = ?").run(created.data.id ?? null, b.id);
+      }
+      pushed++;
     }
-    pushed++;
-  }
-  db.prepare("UPDATE plan SET pushed_at = datetime('now') WHERE id = ?").run(planId);
-  clearAnchorsCache(); // the day just changed in Google — next read must be live
-  return { pushed };
+    db.prepare("UPDATE plan SET pushed_at = datetime('now') WHERE id = ?").run(planId);
+    clearAnchorsCache(); // the day just changed in Google — next read must be live
+    return { pushed };
+  });
 }
 
 /**
@@ -548,35 +650,55 @@ export async function reconcileMovedEvents(db: Db, secrets: SecretStore): Promis
 }
 
 /** Find-or-create the POS Google Tasks list. */
-export async function ensurePosTasklist(db: Db, secrets: SecretStore): Promise<string> {
-  const cached = getSetting(db, "pos_tasklist_id");
-  const api = tasksApi(secrets);
-  if (cached) {
-    try {
-      await api.tasklists.get({ tasklist: cached });
-      return cached;
-    } catch {
-      /* recreate */
+export async function ensurePosTasklist(
+  db: Db,
+  secrets: SecretStore,
+  deps?: Partial<GcalPushDeps>
+): Promise<string> {
+  return withReconsentMapping(async () => {
+    const cached = getSetting(db, "pos_tasklist_id");
+    const api = pushDeps(secrets, deps).tasks();
+    if (cached) {
+      try {
+        await api.tasklists.get({ tasklist: cached });
+        return cached;
+      } catch (e) {
+        if (needsReconsent(e)) throw e; // scope failure, not a deleted list
+        /* recreate */
+      }
     }
-  }
-  const lists = await api.tasklists.list({ maxResults: 100 });
-  const existing = lists.data.items?.find((l) => l.title === POS_TASKLIST_NAME);
-  if (existing?.id) {
-    setSetting(db, "pos_tasklist_id", existing.id);
-    return existing.id;
-  }
-  const created = await api.tasklists.insert({ requestBody: { title: POS_TASKLIST_NAME } });
-  setSetting(db, "pos_tasklist_id", created.data.id!);
-  return created.data.id!;
+    const lists = await api.tasklists.list({ maxResults: 100 });
+    const existing = lists.data.items?.find((l) => l.title === POS_TASKLIST_NAME);
+    if (existing?.id) {
+      setSetting(db, "pos_tasklist_id", existing.id);
+      return existing.id;
+    }
+    const created = await api.tasklists.insert({ requestBody: { title: POS_TASKLIST_NAME } });
+    if (!created.data.id) throw new Error("Google returned no tasklist id");
+    setSetting(db, "pos_tasklist_id", created.data.id);
+    return created.data.id;
+  });
 }
 
 /**
  * Push open planner tasks + open confirmed commitments to Google Tasks (phone sync).
  * Completed/dropped local items complete their Google counterpart.
  */
-export async function pushTasks(db: Db, secrets: SecretStore): Promise<{ pushed: number; completed: number }> {
-  const listId = await ensurePosTasklist(db, secrets);
-  const api = tasksApi(secrets);
+export async function pushTasks(
+  db: Db,
+  secrets: SecretStore,
+  deps?: Partial<GcalPushDeps>
+): Promise<{ pushed: number; completed: number }> {
+  return withReconsentMapping(() => pushTasksInner(db, secrets, deps));
+}
+
+async function pushTasksInner(
+  db: Db,
+  secrets: SecretStore,
+  deps?: Partial<GcalPushDeps>
+): Promise<{ pushed: number; completed: number }> {
+  const listId = await ensurePosTasklist(db, secrets, deps);
+  const api = pushDeps(secrets, deps).tasks();
   let pushed = 0;
   let completed = 0;
 
@@ -593,12 +715,15 @@ export async function pushTasks(db: Db, secrets: SecretStore): Promise<{ pushed:
       try {
         await api.tasks.update({ tasklist: listId, task: t.gtasks_id, requestBody: { ...body, id: t.gtasks_id } });
         continue;
-      } catch {
+      } catch (e) {
+        // Only a MISSING task justifies re-inserting. A scope refusal would fail the
+        // insert identically, so surface it instead of doubling the failed calls.
+        if (needsReconsent(e)) throw e;
         /* fall through to insert */
       }
     }
     const created = await api.tasks.insert({ tasklist: listId, requestBody: body });
-    db.prepare("UPDATE task SET gtasks_id = ? WHERE id = ?").run(created.data.id, t.id);
+    db.prepare("UPDATE task SET gtasks_id = ? WHERE id = ?").run(created.data.id ?? null, t.id);
     pushed++;
   }
 
@@ -638,7 +763,8 @@ export async function pushTasks(db: Db, secrets: SecretStore): Promise<{ pushed:
         requestBody: { id: d.gtasks_id, status: "completed" },
       });
       completed++;
-    } catch {
+    } catch (e) {
+      if (needsReconsent(e)) throw e; // scope failure, not an already-deleted task
       /* already gone */
     }
   }
@@ -737,16 +863,18 @@ export async function commitmentToTask(
         | { title: string; hard_deadline_at: string | null } | undefined;
       if (!t) return { task: true, duplicate, google: false, reason: "task vanished" };
       const listId = await withTimeout(ensurePosTasklist(db, secrets), GOOGLE_PUSH_TIMEOUT_MS, "Google Tasks push timed out");
-      const created = await withTimeout(
-        tasksApi(secrets).tasks.insert({
-          tasklist: listId,
-          requestBody: {
-            title: `Tentative: ${t.title}`,
-            due: t.hard_deadline_at ? new Date(t.hard_deadline_at).toISOString() : undefined,
-          },
-        }),
-        GOOGLE_PUSH_TIMEOUT_MS,
-        "Google Tasks push timed out"
+      const created = await withReconsentMapping(() =>
+        withTimeout(
+          tasksApi(secrets).tasks.insert({
+            tasklist: listId,
+            requestBody: {
+              title: `Tentative: ${t.title}`,
+              due: t.hard_deadline_at ? new Date(t.hard_deadline_at).toISOString() : undefined,
+            },
+          }),
+          GOOGLE_PUSH_TIMEOUT_MS,
+          "Google Tasks push timed out"
+        )
       );
       db.prepare("UPDATE task SET gtasks_id = ? WHERE id = ?").run(created.data.id, taskId);
       return { task: true, duplicate, google: true, pushed: 1, completed: 0 };

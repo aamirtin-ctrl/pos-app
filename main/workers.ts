@@ -20,7 +20,9 @@ import {
 } from "./crm/commitments.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { runEnrichment } from "./crm/enrich.ts";
-import { commitmentToTask, closeGoogleTask, readAnchors } from "./gcal/sync.ts";
+import { commitmentToTask, closeGoogleTask, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
+import { hasCalendarWriteScope, isGoogleConnected } from "./gcal/auth.ts";
+import { autoPushEnabled, pushPlanToGoogle } from "./planner.ts";
 import { eventsForDate as icsEventsForDate } from "./icscal.ts";
 import { distillWeek, distillWeekKey } from "./worklog.ts";
 import type { ConnectorDeps, SyncReport } from "./connectors/common.ts";
@@ -645,6 +647,82 @@ export function enrichDayKey(now: Date = new Date()): string {
   return `enrich_day:${now.toISOString().slice(0, 10)}`;
 }
 
+// ── auto-push sweep ──────────────────────────────────────────────────────────
+//
+// Accepting a plan pushes it (planner.acceptPlan). This is the safety net for every plan
+// that did NOT get out: the app was offline, Google was slow, the push timed out, or the
+// plan was accepted before this feature existed. Runs on the same 15-minute tick.
+
+/** How far back the sweep looks. Older accepted plans are history, not pending work. */
+export const AUTO_PUSH_WINDOW_DAYS = 7;
+
+export interface AutoPushSweepResult {
+  /** Plans that pushed cleanly. */
+  plans: number;
+  /** Calendar blocks written across them. */
+  pushed: number;
+  /** Why the sweep did nothing, when it did nothing on purpose. */
+  skipped?: "auto_push_off" | "not_connected" | "no_write_scope";
+  /** First real push failure encountered (the sweep still tries the rest). */
+  error?: string;
+}
+
+/**
+ * Accepted plans within the window that Google does not have in full:
+ *   - never pushed (`pushed_at IS NULL`), or
+ *   - carrying a non-anchor block Google has no event for, or one created after the last
+ *     push (the plan changed since it went out).
+ */
+export function plansNeedingPush(db: Db, windowDays = AUTO_PUSH_WINDOW_DAYS): number[] {
+  return (
+    db
+      .prepare(
+        `SELECT p.id FROM plan p
+          WHERE p.accepted_at IS NOT NULL
+            AND p.plan_date >= date('now', ?)
+            AND (
+              p.pushed_at IS NULL
+              OR EXISTS (
+                SELECT 1 FROM block b
+                 WHERE b.plan_id = p.id AND b.is_anchor = 0
+                   AND (b.gcal_event_id IS NULL OR b.created_at > p.pushed_at)
+              )
+            )
+          ORDER BY p.id`
+      )
+      .all(`-${windowDays} day`) as { id: number }[]
+  ).map((r) => r.id);
+}
+
+/**
+ * Push every accepted-but-unpushed plan. Silent no-op when auto-push is off, Google is not
+ * connected, or the stored grant predates the calendar-write scope widening — that last
+ * case would otherwise fail identically on every tick forever, which is exactly the noise
+ * the Settings warning exists to replace.
+ */
+export async function sweepAutoPush(
+  db: Db,
+  secrets: SecretStore,
+  deps?: Partial<GcalPushDeps>
+): Promise<AutoPushSweepResult> {
+  const out: AutoPushSweepResult = { plans: 0, pushed: 0 };
+  if (!autoPushEnabled(db)) return { ...out, skipped: "auto_push_off" };
+  if (!isGoogleConnected(secrets)) return { ...out, skipped: "not_connected" };
+  if (!hasCalendarWriteScope(secrets)) return { ...out, skipped: "no_write_scope" };
+
+  for (const planId of plansNeedingPush(db)) {
+    const res = await pushPlanToGoogle(db, secrets, planId, deps);
+    if (res.error) {
+      out.error ??= res.error;
+      console.warn(`workers: auto-push of plan ${planId} failed: ${res.error}`);
+      continue;
+    }
+    out.plans++;
+    out.pushed += res.pushed;
+  }
+  return out;
+}
+
 export interface WorkersHandle {
   stop(): void;
 }
@@ -714,6 +792,19 @@ export function startWorkers(
         }
       } catch (e) {
         console.warn(`gtasks reconcile failed: ${(e as Error).message}`);
+      }
+
+      // Auto-push: any accepted plan Google doesn't have yet goes out now. Silent when
+      // auto-push is off, Google isn't connected, or the grant is too narrow.
+      try {
+        const ap = await sweepAutoPush(db, secrets);
+        if (ap.plans > 0) {
+          notify?.(
+            `Pushed ${ap.pushed} block${ap.pushed === 1 ? "" : "s"} to Google (${ap.plans} plan${ap.plans === 1 ? "" : "s"})`
+          );
+        }
+      } catch (e) {
+        console.warn(`workers: auto-push sweep failed: ${(e as Error).message}`);
       }
 
       if (gmailConfigured({ secrets })) {

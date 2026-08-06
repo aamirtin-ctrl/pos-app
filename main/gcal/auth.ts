@@ -35,6 +35,138 @@ export function isGoogleConnected(secrets: SecretStore): boolean {
   return !!secrets.get("GOOGLE_OAUTH_TOKENS");
 }
 
+// ── scope drift: the "Push to Google does nothing" failure ───────────────────
+//
+// GOOGLE_SCOPES was widened to the full .../auth/calendar scope because creating the
+// dedicated "POS — Planned" calendar needs calendars.insert. A token minted BEFORE that
+// change still carries only calendar.events + calendar.readonly, and Google refuses the
+// insert with HTTP 403 "Insufficient Permission". The refresh token keeps working, so
+// nothing looks disconnected — the push just fails, forever, with a raw Google message.
+//
+// The two halves of the fix live here: classify the failure (needsReconsent) and read
+// what the stored grant actually covers (grantedScopes / hasCalendarWriteScope) so the
+// UI can say "re-authorize" and the background sweep can skip instead of spamming.
+
+/** The one typed error string every push entry point maps a scope failure to. */
+export const RECONSENT_REQUIRED = "reconsent_required";
+
+/** Every string in an unknown error that could carry Google's reason. */
+function errorText(err: unknown): string {
+  if (err == null) return "";
+  if (typeof err === "string") return err;
+  const e = err as {
+    message?: unknown;
+    errors?: unknown;
+    response?: { data?: unknown };
+  };
+  const parts: string[] = [];
+  if (typeof e.message === "string") parts.push(e.message);
+  // googleapis (Gaxios) shape: response.data.error.{message,status,errors[].reason}
+  const data = e.response?.data as
+    | { error?: unknown; error_description?: unknown }
+    | undefined;
+  if (data) {
+    if (typeof data.error_description === "string") parts.push(data.error_description);
+    const inner = data.error;
+    if (typeof inner === "string") parts.push(inner);
+    else if (inner && typeof inner === "object") {
+      const o = inner as { message?: unknown; status?: unknown; errors?: unknown };
+      if (typeof o.message === "string") parts.push(o.message);
+      if (typeof o.status === "string") parts.push(o.status);
+      if (Array.isArray(o.errors)) {
+        for (const x of o.errors as { reason?: unknown; message?: unknown }[]) {
+          if (typeof x?.reason === "string") parts.push(x.reason);
+          if (typeof x?.message === "string") parts.push(x.message);
+        }
+      }
+    }
+  }
+  if (Array.isArray(e.errors)) {
+    for (const x of e.errors as { reason?: unknown; message?: unknown }[]) {
+      if (typeof x?.reason === "string") parts.push(x.reason);
+      if (typeof x?.message === "string") parts.push(x.message);
+    }
+  }
+  return parts.join(" ");
+}
+
+/**
+ * Does this failure mean "the stored Google grant no longer covers what POS needs"?
+ *
+ * True for the scope-drift family only:
+ *   - 403 with reason `insufficientPermissions` / message "Insufficient Permission"
+ *   - "Request had insufficient authentication scopes" (the API-gateway wording)
+ *   - `insufficient_scope` (OAuth bearer challenge)
+ *   - `invalid_grant` (the grant itself was revoked/expired — same user action fixes it)
+ *
+ * Deliberately NOT true for a bare 403 (quota, calendar sharing refusals), a 404, or a
+ * transport error: those are real, different problems and must not tell the owner to
+ * re-authorize.
+ */
+export function needsReconsent(err: unknown): boolean {
+  const text = errorText(err).toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes("insufficientpermissions") ||
+    text.includes("insufficient permission") ||
+    text.includes("insufficient authentication scopes") ||
+    text.includes("insufficient_scope") ||
+    text.includes("invalid_grant")
+  );
+}
+
+/**
+ * The scopes the STORED token set was actually granted, from the `scope` string Google
+ * returns with every token/refresh response. Empty when nothing is connected, the JSON is
+ * unreadable, or the stored set predates POS recording a scope string at all.
+ */
+export function grantedScopes(secrets: SecretStore, key?: string): string[] {
+  const raw = secrets.get(googleTokenSecret(key));
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as { scope?: unknown };
+    return typeof parsed.scope === "string" ? parsed.scope.split(/\s+/).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Can the stored grant CREATE calendars (calendars.insert), not just events?
+ *
+ * Matches the full `.../auth/calendar` scope exactly. A substring test would wrongly pass
+ * on `.../auth/calendar.events`, which is precisely the old, insufficient grant this
+ * exists to detect.
+ *
+ * A connected account whose token set carries NO scope string is treated as writable:
+ * that is unknowable here, and refusing to push on a guess would break a working setup.
+ * The 403 path (needsReconsent) classifies that case at the point of failure instead.
+ */
+export function hasCalendarWriteScope(secrets: SecretStore, key?: string): boolean {
+  const raw = secrets.get(googleTokenSecret(key));
+  if (!raw) return false; // nothing connected at all
+  const scopes = grantedScopes(secrets, key);
+  if (scopes.length === 0) return true; // unknowable — let the API answer
+  return scopes.some((s) => /(^|\/)auth\/calendar$/.test(s.trim()));
+}
+
+export interface GoogleScopeStatus {
+  connected: boolean;
+  hasCreds: boolean;
+  /** Connected AND the grant covers calendar writes (calendars.insert). */
+  canWrite: boolean;
+}
+
+/** One read for the UI: connected / creds present / grant wide enough to push. */
+export function googleScopeStatus(secrets: SecretStore): GoogleScopeStatus {
+  const connected = isGoogleConnected(secrets);
+  return {
+    connected,
+    hasCreds: hasGoogleCreds(secrets),
+    canWrite: connected && hasCalendarWriteScope(secrets),
+  };
+}
+
 function oauthClientForSecret(secrets: SecretStore, secretName: string, redirectUri?: string) {
   const client = new google.auth.OAuth2(
     secrets.get("GOOGLE_OAUTH_CLIENT_ID") ?? undefined,

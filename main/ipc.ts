@@ -91,9 +91,12 @@ import {
   cancelLoopbackAuth,
   isGoogleConnected,
   hasGoogleCreds,
+  googleScopeStatus,
+  needsReconsent,
+  RECONSENT_REQUIRED,
 } from "./gcal/auth.ts";
 import { google } from "googleapis";
-import { pushPlan, pushTasks, reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent, dropCommitmentCascade } from "./gcal/sync.ts";
+import { reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent, dropCommitmentCascade } from "./gcal/sync.ts";
 import { listSubscriptions, addSubscription, removeSubscription, eventsForDate as icsEventsForDate, icsBlockType } from "./icscal.ts";
 import { notionAvailable, searchTargets, syncNotion, PARENT_PAGE_KEY } from "./notion.ts";
 import {
@@ -283,12 +286,11 @@ export function registerIpc(deps: IpcDeps) {
   });
   h("plan.generate", (dateISO: string) => planner.generatePlan(db, doctrineDir, secrets, deps.llm(), dateISO));
   h("plan.get", (dateISO: string) => planner.getPlan(db, dateISO));
-  h("plan.accept", (planId: number) => planner.acceptPlan(db, planId));
-  h("plan.push", async (planId: number) => {
-    const cal = await pushPlan(db, secrets, planId);
-    const tasks = await pushTasks(db, secrets);
-    return { ...cal, ...tasks };
-  });
+  // Accept IS the push (owner directive 2026-08-05). The local accept commits first; the
+  // Google push is time-boxed and reported in `push`, never thrown.
+  h("plan.accept", (planId: number) => planner.acceptPlan(db, planId, secrets));
+  // Manual retry affordance only — the automatic paths are acceptPlan and the worker sweep.
+  h("plan.push", (planId: number) => planner.pushPlanToGoogle(db, secrets, planId));
 
   // ── outcomes / learning ──
   h("outcomes.needed", (dateISO: string) => planner.outcomesNeeded(db, dateISO));
@@ -367,6 +369,9 @@ export function registerIpc(deps: IpcDeps) {
     return { canceled: true };
   });
   h("gcal.connected", () => ({ connected: isGoogleConnected(secrets), hasCreds: hasGoogleCreds(secrets) }));
+  // Same three facts plus canWrite: tokens minted before the calendar scope widened still
+  // refresh fine but cannot create calendars, so "connected" alone is not enough to push.
+  h("gcal.scopeStatus", () => googleScopeStatus(secrets));
   h("gcal.reconcile", () => reconcileMovedEvents(db, secrets));
   // Day-view events: Google anchors + subscribed webcal/ICS feeds, one list.
   // Appending here means the renderer needs zero changes to show ICS events.
@@ -416,7 +421,16 @@ export function registerIpc(deps: IpcDeps) {
   // names for the Settings picker; POS's own mirror calendars are never listed
   h("applecal.calendars", () => listAppleCalendars());
   h("applecal.events", (dateISO: string) => readAppleEvents(dateISO, { exclude: excludedCalendarNames(db) }));
-  h("applecal.mirror", (dateISO: string) => mirrorToGoogle(db, secrets, dateISO));
+  // The mirror writes to Google too, so it hits the same stale-scope wall — map it to the
+  // one typed string the UI knows how to act on. (applecal.ts stays free of auth policy.)
+  h("applecal.mirror", async (dateISO: string) => {
+    try {
+      return await mirrorToGoogle(db, secrets, dateISO);
+    } catch (e) {
+      if (needsReconsent(e)) throw new Error(RECONSENT_REQUIRED);
+      throw e;
+    }
+  });
 
   // ── plans from messages ──
   // Manual trigger; the same connector also runs on the 15-min cron.

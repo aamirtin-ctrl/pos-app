@@ -9,6 +9,24 @@ export interface IpcResult<T = unknown> {
 
 type Call<T = unknown> = (...args: unknown[]) => Promise<IpcResult<T>>;
 
+/**
+ * What `plan.accept` and `plan.push` report. `error` is a typed string, not a Google
+ * message: "reconsent_required" (the stored grant predates POS's calendar-write scope —
+ * the owner must re-authorize), "not_connected", "auto_push_off", or a raw failure.
+ */
+export interface PlanPushResult {
+  pushed: number;
+  tasks: number;
+  error?: string;
+}
+
+/** `gcal.scopeStatus`: canWrite is false when the grant cannot create calendars. */
+export interface GoogleScopeStatus {
+  connected: boolean;
+  hasCreds: boolean;
+  canWrite: boolean;
+}
+
 declare global {
   interface Window {
     pos: {
@@ -33,7 +51,7 @@ declare global {
       outcomes: { needed: Call; capture: Call; adherence: Call };
       sync: { run: Call; status: Call; embed: Call; pickAndRun: Call };
       mail: { list: Call; add: Call; remove: Call; connectOAuth: Call };
-      gcal: { connect: Call; cancel: Call; connected: Call; reconcile: Call; events: Call };
+      gcal: { connect: Call; cancel: Call; connected: Call; scopeStatus: Call; reconcile: Call; events: Call };
       ics: { list: Call; add: Call; remove: Call };
       notion: { available: Call; targets: Call; setParent: Call; sync: Call };
       applecal: { available: Call; calendars: Call; events: Call; mirror: Call };

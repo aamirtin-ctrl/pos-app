@@ -9,8 +9,17 @@ import { parseBraindump } from "./engine/parse.ts";
 import { solve, ENGINE_VERSION, type PlannerTask } from "./engine/solver.ts";
 import type { Anchor } from "./engine/grid.ts";
 import { narrate } from "./engine/narrate.ts";
-import { readAnchors, mergeCalendarSources, type MergeableGoogleAnchor, type MergeableAppleEvent } from "./gcal/sync.ts";
-import { isGoogleConnected } from "./gcal/auth.ts";
+import {
+  readAnchors,
+  mergeCalendarSources,
+  pushPlan,
+  pushTasks,
+  type GcalPushDeps,
+  type MergeableGoogleAnchor,
+  type MergeableAppleEvent,
+} from "./gcal/sync.ts";
+import { getSetting } from "./db/db.ts";
+import { hasCalendarWriteScope, isGoogleConnected, RECONSENT_REQUIRED } from "./gcal/auth.ts";
 import { readAppleEvents, appleBlockType, excludedCalendarNames } from "./applecal.ts";
 import { eventsForDate as icsEventsForDate, icsBlockType } from "./icscal.ts";
 
@@ -182,9 +191,102 @@ export function getPlan(db: Db, dateISO: string, planId?: number) {
   return { plan, blocks, unplaced: JSON.parse((plan.unplaced_tasks as string) ?? "[]") };
 }
 
-export function acceptPlan(db: Db, planId: number) {
+// ── accepting a plan pushes it (owner directive 2026-08-05) ──────────────────
+//
+// "It should push AUTOMATICALLY — I shouldn't have to press anything." Accept is now the
+// whole gesture: the local accept commits first and unconditionally, then the Google push
+// runs time-boxed and best-effort. A push failure NEVER un-accepts the plan; it comes back
+// in `push.error` so the UI can explain it and offer a retry, and `pushed_at` stays NULL so
+// the worker sweep picks the plan up on the next tick.
+
+/** Setting key gating every automatic push. Absent = on. */
+export const AUTO_PUSH_KEY = "auto_push";
+
+/** Auto-push is on unless the owner explicitly turned it off ("0"). */
+export function autoPushEnabled(db: Db): boolean {
+  return (getSetting(db, AUTO_PUSH_KEY) ?? "1") !== "0";
+}
+
+/** How long an automatic push may run before we give up and report it. */
+export const AUTO_PUSH_TIMEOUT_MS = 30_000;
+
+export interface PlanPushResult {
+  /** Calendar blocks written. */
+  pushed: number;
+  /** Google Tasks written. */
+  tasks: number;
+  /** Typed failure — `reconsent_required`, "skipped: …", or a raw message. */
+  error?: string;
+}
+
+export interface AcceptPlanResult {
+  accepted: true;
+  push: PlanPushResult;
+}
+
+/** Reject-after-timeout. Does not cancel `p` — the local DB state is already consistent. */
+function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(message)), ms);
+    (t as unknown as { unref?: () => void }).unref?.();
+    p.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); }
+    );
+  });
+}
+
+/**
+ * Push one plan's blocks AND the task list to Google, best-effort. Never throws: every
+ * failure — not connected, auto-push off, a stale grant, a timeout — is reported in
+ * `error`. Calendar and tasks are counted separately so a partial success still shows what
+ * landed.
+ */
+export async function pushPlanToGoogle(
+  db: Db,
+  secrets: SecretStore,
+  planId: number,
+  deps?: Partial<GcalPushDeps>
+): Promise<PlanPushResult> {
+  const out: PlanPushResult = { pushed: 0, tasks: 0 };
+  if (!isGoogleConnected(secrets)) return { ...out, error: "not_connected" };
+  if (!hasCalendarWriteScope(secrets)) return { ...out, error: RECONSENT_REQUIRED };
+  try {
+    await withTimeout(
+      (async () => {
+        const cal = await pushPlan(db, secrets, planId, deps);
+        out.pushed = cal.pushed;
+        // Tasks are a separate surface: a calendar push that landed must still be
+        // reported even if the task push then fails.
+        const tasks = await pushTasks(db, secrets, deps);
+        out.tasks = tasks.pushed;
+      })(),
+      AUTO_PUSH_TIMEOUT_MS,
+      "Google push timed out"
+    );
+  } catch (e) {
+    out.error = (e as Error).message;
+  }
+  return out;
+}
+
+/**
+ * Mark a plan accepted, then push it. The accept is committed before any network work, so
+ * a Google outage can never cost the owner his decision.
+ *
+ * `secrets` omitted (or auto-push turned off) → the accept still happens and `push` reports
+ * why nothing went out.
+ */
+export async function acceptPlan(
+  db: Db,
+  planId: number,
+  secrets?: SecretStore,
+  deps?: Partial<GcalPushDeps>
+): Promise<AcceptPlanResult> {
   db.prepare("UPDATE plan SET accepted_at = datetime('now') WHERE id = ?").run(planId);
-  return { accepted: true };
+  if (!secrets) return { accepted: true, push: { pushed: 0, tasks: 0, error: "not_connected" } };
+  if (!autoPushEnabled(db)) return { accepted: true, push: { pushed: 0, tasks: 0, error: "auto_push_off" } };
+  return { accepted: true, push: await pushPlanToGoogle(db, secrets, planId, deps) };
 }
 
 /** Yesterday's (or any day's) accepted blocks needing outcome capture — one prompt, not per block. */
