@@ -126,6 +126,37 @@ describe("re-solving today at 11:40", () => {
     expect(after).toEqual(before);
   });
 
+  // Owner report 2026-08-06, after I had manually deleted his plan to clear a duplicate:
+  // "right now im in the middle of going through my stanford academic advising per your
+  // previous schedule. it shouldnt have deleted that nor my morning routine from this
+  // morning."
+  //
+  // The block he was INSIDE — started at 10:00, still running at 11:57 — is the sharpest case:
+  // it is neither wholly past nor available to re-place. It is what he is doing.
+  it("never disturbs a block that is currently running", async () => {
+    const id = addTask("Go through my Stanford academic advising stuff", 150, "focused_work");
+    // A plan built this morning, with the advising block from 10:00 to 12:30.
+    const planId = Number(
+      db.prepare(
+        `INSERT INTO plan (plan_date, engine_version, doctrine_snapshot, narration, unplaced_tasks)
+         VALUES (?, 'test', '{}', '', '[]')`
+      ).run(DATE).lastInsertRowid
+    );
+    db.prepare(
+      `INSERT INTO block (task_id, block_type, title, starts_at, ends_at, is_anchor, plan_id)
+       VALUES (?, 'focused_work', 'Go through my Stanford academic advising stuff',
+               ?, ?, 0, ?)`
+    ).run(id, `${DATE}T10:00:00`, `${DATE}T12:30:00`, planId);
+
+    // Re-solve at 11:40, mid-block.
+    await generatePlan(db, dir, secrets, null, DATE, deps(AT_1140));
+
+    const mine = blocks().filter((b) => b.title.startsWith("Go through my Stanford"));
+    expect(mine).toHaveLength(1); // not dropped, not duplicated
+    expect(minsOf(mine[0].starts_at)).toBe(10 * 60); // and not moved out from under him
+    expect(minsOf(mine[0].ends_at)).toBe(12 * 60 + 30);
+  });
+
   it("does not re-place a task whose block has already begun", async () => {
     const id = addTask("Unpack travel bag", 30);
     await generatePlan(db, dir, secrets, null, DATE, deps(new Date("2026-08-06T06:00:00")));
