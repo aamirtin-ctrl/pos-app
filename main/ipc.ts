@@ -61,6 +61,7 @@ import {
 } from "./undo.ts";
 import { addManual, entriesSince, catchUpParagraph } from "./worklog.ts";
 import { listFacts, setFact, deleteFact, resolveNamedDate, type SetFactInput } from "./context.ts";
+import { readPreferences, writePreferences, preferencesPath } from "./preferences.ts";
 import { embedProfiles, makeQueryEmbedder } from "./llm/embeddings.ts";
 import * as planner from "./planner.ts";
 import { handleCommand } from "./assistant.ts";
@@ -488,6 +489,22 @@ export function registerIpc(deps: IpcDeps) {
   // The commitment date picker asks this before prefilling: "meetup at the start of
   // school" resolves to the user's term-start anchor instead of defaulting to today.
   h("context.resolveDate", (phrase: string) => ({ date: resolveNamedDate(db, phrase) }));
+
+  // ── personal preferences (the free-text half of the same memory) ──
+  // A plain Markdown file next to doctrine.yaml, owned by the user. get() seeds the
+  // commented template on a first-ever read; set() validates nothing but non-empty,
+  // because there is no schema he can get wrong in his own prose.
+  h("prefs.get", () => readPreferences(doctrineDir));
+  h("prefs.set", (md: string) => {
+    writePreferences(doctrineDir, md);
+    return { saved: true };
+  });
+  // "Reveal in Finder" is the proof it is really a file he owns, not app state.
+  h("prefs.reveal", () => {
+    readPreferences(doctrineDir); // never reveal a path that doesn't exist yet
+    shell.showItemInFolder(preferencesPath(doctrineDir));
+    return { revealed: true };
+  });
 
   // ── unified assistant ──
   h("assistant.command", (text: string) =>

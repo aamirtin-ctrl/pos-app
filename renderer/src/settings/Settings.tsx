@@ -68,6 +68,7 @@ export default function Settings() {
       <h1 className="font-display text-2xl font-semibold mb-5 no-drag">Settings</h1>
       <Integrations />
       <AboutYou />
+      <Preferences />
       <SpendMeter />
       <Doctrine />
       <Adherence />
@@ -2160,6 +2161,89 @@ function AboutYou() {
           </div>
         </div>
       )}
+    </Section>
+  );
+}
+
+// ── a3. Preferences ──────────────────────────────────────────────────────────
+//
+// The free-text companion to About you (main/preferences.ts). About you holds facts the
+// app RESOLVES ("start of school" → a date); this holds prose the app READS — how he wants
+// his mornings, his focus, his meetings and his messages handled. It is a real Markdown
+// file next to doctrine.yaml, which is why the card ships a Reveal in Finder button: the
+// file is his, and he should be able to open it in any editor he likes.
+
+function Preferences() {
+  const [text, setText] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      const r = await window.pos.prefs.get();
+      if (r.ok) setText(r.data as string);
+      else setError(r.error ?? "Couldn't read your preferences file.");
+      setLoaded(true);
+    })();
+  }, []);
+
+  const save = async () => {
+    if (!text.trim() || saving) return;
+    setSaving(true);
+    setError(null);
+    setSavedAt(null);
+    const r = await window.pos.prefs.set(text);
+    if (!r.ok) setError(r.error ?? "Couldn't save — the file was left untouched.");
+    else setSavedAt(Date.now());
+    setSaving(false);
+  };
+
+  const reveal = async () => {
+    const r = await window.pos.prefs.reveal();
+    if (!r.ok) setError(r.error ?? "Couldn't open Finder.");
+  };
+
+  return (
+    <Section title="Preferences">
+      <p className="text-[12px] mb-3" style={{ color: "var(--muted)" }}>
+        How you want your time handled, in your own words — read by the planner and the assistant.
+        Say "prefer: …" in the command box to append a line, or edit the file directly. Dated facts
+        belong in About you.
+      </p>
+      <textarea
+        value={text}
+        onChange={(e) => { setText(e.target.value); setSavedAt(null); }}
+        spellCheck={false}
+        disabled={!loaded}
+        className="w-full min-h-[260px] border rounded-lg p-3 text-[12px] leading-relaxed bg-white font-mono resize-y"
+        style={{ borderColor: "var(--line)" }}
+      />
+      <div className="flex items-center gap-3 mt-2">
+        <button
+          onClick={save}
+          disabled={saving || !loaded || !text.trim()}
+          className="px-3 py-1.5 rounded-md text-sm text-white disabled:opacity-50"
+          style={{ background: "var(--accent)" }}
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+        <button
+          onClick={reveal}
+          disabled={!loaded}
+          className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-50"
+          style={{ borderColor: "var(--line)" }}
+        >
+          Reveal in Finder
+        </button>
+        {savedAt && !error && (
+          <span className="text-[12px]" style={{ color: "var(--muted)" }}>Saved</span>
+        )}
+        {error && (
+          <span className="text-[12px]" style={{ color: "var(--danger)" }}>{error}</span>
+        )}
+      </div>
     </Section>
   );
 }

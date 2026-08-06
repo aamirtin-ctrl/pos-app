@@ -65,6 +65,8 @@ declare global {
       undo: { do: Call; redo: Call };
       worklog: { list: Call; add: Call; catchUp: Call };
       context: { list: Call; set: Call; delete: Call; resolveDate: Call };
+      /** The user-owned preferences.md next to doctrine.yaml (main/preferences.ts). */
+      prefs: { get: Call; set: Call; reveal: Call };
       assistant: { command: Call };
       stt: { transcribe: Call };
       inbox: { list: Call; sendEmail: Call; sendIMessage: Call; sendIMessageChat: Call; handles: Call };

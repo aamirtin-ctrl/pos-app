@@ -119,6 +119,7 @@ contextBridge.exposeInMainWorld("pos", {
     delete: call("context.delete"),
     resolveDate: call("context.resolveDate"),
   },
+  prefs: { get: call("prefs.get"), set: call("prefs.set"), reveal: call("prefs.reveal") },
   assistant: { command: call("assistant.command") },
   stt: { transcribe: call("stt.transcribe") },
   inbox: {

@@ -21,6 +21,12 @@ import {
   type FactKind,
   type FactRequest,
 } from "./context.ts";
+import {
+  appendPreference,
+  preferencesBlock,
+  PREFERENCE_SECTIONS,
+  PREFERENCES_FILE,
+} from "./preferences.ts";
 
 export interface AssistantResult {
   kind: "plan" | "people" | "note" | "answer" | "search" | "event" | "rule" | "error";
@@ -198,6 +204,134 @@ export function applyFact(db: Db, req: FactRequest): AssistantResult {
   };
 }
 
+// ── "prefer: …" → a personal preference (main/preferences.ts) ────────────────
+//
+// THE BOUNDARY WITH "remember" (facts, main/context.ts). The two intents look alike in the
+// command box and must never swallow each other:
+//
+//   remember → a FACT. Keyed, usually dated, and stored so it can be RESOLVED later:
+//     "remember: school starts Sept 22", "I go to Stanford", "my birthday is March 4".
+//     It becomes a row because "the start of school" has to turn into 2026-09-22.
+//   prefer   → a PREFERENCE. A habit, taste or standing rule that informs JUDGMENT and
+//     resolves to nothing: "I'd like half an hour to shower and read before starting
+//     anything", "no meetings before 10". It becomes a line in his own Markdown file.
+//
+// The test is whether the statement names something the app will later be asked to look up.
+// If it does, it is a fact — even when it arrives dressed as a wish. So an explicit
+// "remember" prefix always wins here, and a date-shaped statement is refused by the
+// deterministic preference parser and left to the fact parser.
+
+/** Deterministic entry point for a preference statement. */
+export const PREFER_PREFIX = /^(prefer|preference|i like|i want|i'd like|remind me that i)\b/i;
+
+/** One parsed preference, ready for appendPreference. */
+export interface PreferenceRequest {
+  section: string;
+  line: string;
+}
+
+/**
+ * Which section a preference belongs under. Keyword routing, first match wins; anything
+ * unrecognized is Personal, which is the honest answer for "I don't cook on Sundays".
+ */
+const SECTION_HINTS: [RegExp, string][] = [
+  [/\b(morning|wake|wake\s*up|shower|breakfast|first thing|before\s+(?:i\s+)?start|early)\b/i, "Mornings"],
+  [/\b(deep work|focus|focused|uninterrupted|study|studying|problem set|writing|coding|essay|research)\b/i, "Deep work"],
+  [/\b(meeting|meetings|call|calls|1:1|zoom|sync|standup|back to back|back-to-back)\b/i, "Meetings"],
+  [/\b(email|inbox|reply|replies|respond|text|texts|imessage|slack|message|messages|comms|dm)\b/i, "Communication"],
+  [/\b(evening|night|dinner|gym|workout|weekend|sleep|family|friends)\b/i, "Personal"],
+];
+
+export function sectionForPreference(text: string): string {
+  for (const [re, section] of SECTION_HINTS) if (re.test(text)) return section;
+  return "Personal";
+}
+
+/** Strip only the routing label — "prefer:" / "preference —". "I like …" reads fine as prose. */
+const stripPreferLabel = (s: string) => s.replace(/^\s*prefer(?:ence)?\b\s*[:—-]?\s*/i, "").trim();
+
+const MONTH = "jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec";
+
+/**
+ * An explicit calendar date ("Sept 22", "22 September", "2026-09-22"). A preference is a
+ * standing habit; a single named day is a FACT, whatever verb introduced it — so this is
+ * the line the preference parser refuses to cross, and main/context.ts takes the statement
+ * instead. Recurring day-of-week phrasing ("not on Fridays") is deliberately NOT a date.
+ */
+const CALENDAR_DATE = new RegExp(
+  `\\b(?:${MONTH})[a-z]*\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?\\b` +
+    `|\\b\\d{1,2}(?:st|nd|rd|th)?\\s+(?:${MONTH})[a-z]*\\b` +
+    `|\\b\\d{4}-\\d{2}-\\d{2}\\b|\\b\\d{1,2}/\\d{1,2}(?:/\\d{2,4})?\\b`,
+  "i"
+);
+
+/**
+ * Regex-only preference parsing. Returns null when the text is not a preference statement
+ * OR when it is really a fact in disguise — both of which mean "let another intent have it".
+ */
+export function parsePreferenceDeterministic(text: string, now: Date = new Date()): PreferenceRequest | null {
+  const t = (text ?? "").trim();
+  if (!t) return null;
+  if (REMEMBER_PREFIX.test(t)) return null; // an explicit "remember: …" is always a fact
+  if (!PREFER_PREFIX.test(t)) return null;
+  const body = stripPreferLabel(t).replace(/\s+/g, " ").trim();
+  if (!body) return null;
+  // "I want school to start Sept 22" is a dated fact wearing a preference's clothes.
+  if (CALENDAR_DATE.test(body)) return null;
+  if (parseFactDeterministic(body, now)?.kind === "date_anchor") return null;
+  return { section: sectionForPreference(body), line: body };
+}
+
+/** LLM parse of a free-form preference statement. Null on no key / bad JSON / no content. */
+export async function parsePreferenceRequest(
+  llm: LlmClient | null,
+  message: string
+): Promise<PreferenceRequest | null> {
+  if (!llm || !message.trim()) return null;
+  const res = await llm.call(
+    "assistant_preference",
+    "fast",
+    `The user is telling their personal assistant how they like their time and work handled — a habit, a taste, or a standing rule. It will be saved as one line in their own preferences file and read back into planning prompts later.
+
+Turn it into ONE preference line:
+- "section": one of ${PREFERENCE_SECTIONS.map((s) => `"${s}"`).join(", ")}. Pick the best fit; use "Personal" when none apply.
+- "line": the preference in the user's own voice, first person, under 160 characters, no leading dash. Keep what makes it specific (times, durations, exceptions). Do not turn it into an instruction to the assistant.
+
+This is NOT for dated facts about the user (a term start, a birthday, where they live) — if the statement is really one of those, return null for "line".
+
+Statement:
+"""${message.slice(0, 300)}"""
+
+Return STRICT JSON ONLY — no prose: { "section": "<section>", "line": "<preference>" | null }`,
+    { json: true }
+  );
+  if (!res) return null;
+  try {
+    const p = extractJson(res.text) as Record<string, unknown>;
+    const line = typeof p.line === "string" ? p.line.replace(/\s+/g, " ").trim() : "";
+    if (!line) return null;
+    const raw = typeof p.section === "string" ? p.section.trim() : "";
+    const section =
+      PREFERENCE_SECTIONS.find((s) => s.toLowerCase() === raw.toLowerCase()) ??
+      (raw ? raw.slice(0, 40) : sectionForPreference(line));
+    return { section, line: line.slice(0, 200) };
+  } catch {
+    return null;
+  }
+}
+
+/** Append a parsed preference to the user's file and say exactly where it went. */
+export function applyPreference(dir: string, req: PreferenceRequest): AssistantResult {
+  const r = appendPreference(dir, req.section, req.line);
+  const body = r.line.replace(/^-\s*/, "");
+  return {
+    kind: "note",
+    reply: r.added
+      ? `Saved under ${r.section}: "${body}". It's in ${PREFERENCES_FILE} — edit it any time in Settings → Preferences.`
+      : `You already have that under ${r.section}: "${body}". Nothing changed in ${PREFERENCES_FILE}.`,
+  };
+}
+
 interface GroupRow {
   id: number;
   name: string;
@@ -274,13 +408,14 @@ export async function handleCommand(
       "assistant_route",
       "fast",
       `Classify this personal-assistant command. STRICT JSON only:
-{"intent":"plan_day"|"add_event"|"find_people"|"add_note"|"log_work"|"remember"|"search"|"rule"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>"}
+{"intent":"plan_day"|"add_event"|"find_people"|"add_note"|"log_work"|"remember"|"prefer"|"search"|"rule"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>"}
 "plan_day" = a braindump of tasks to schedule, or asking to plan the day.
 "add_event" = ONE specific commitment at a stated time ("lunch with Raj Thursday 1pm", "dentist tomorrow at 9"). A time must be stated or clearly implied.
 "find_people" = who should I talk to / reach out to / intro ideas.
 "add_note" = remember/save a fact about a person in the network.
 "log_work" = record something the USER did into their worklog ("log: shipped the deck", "log closed the Series A intro").
 "remember" = a durable fact about the USER THEMSELVES, not about a contact ("remember: school starts Sept 22", "I go to Stanford", "my birthday is March 4", "I live in Dallas"). Facts about someone else in the network are add_note, not remember.
+"prefer" = how the USER likes their time, work or communication handled — a habit, taste or standing rule that has no date and resolves to nothing ("I'd like half an hour to shower and read before starting anything", "no meetings before 10", "I answer email in batches"). A statement that names a DATE the app will look up later is "remember", not "prefer".
 "rule" = change how the CRM behaves for a GROUP of people ("my family group shouldn't show as follow-ups", "stop follow-ups for recruiters", "re-enable follow-ups for investors", "delete the mentors group").
 "search" = find/look up specific info they saved (a person, message, commitment, task, note).
 "question" = anything else about their calendar, commitments, or contacts.
@@ -308,6 +443,11 @@ Command: """${t.slice(0, 600)}"""`,
   if (/^log[:\s]/i.test(t)) intent = "log_work";
   // Same for the "remember: …" prefix — it must never be read as a note about a contact.
   if (REMEMBER_PREFIX.test(t)) intent = "remember";
+  // Preferences are deterministic when they announce themselves ("prefer: …", "I'd like …").
+  // parsePreferenceDeterministic refuses anything with an explicit "remember" prefix or a
+  // resolvable date, so a fact can never be filed away as a taste.
+  const prefReq = parsePreferenceDeterministic(t);
+  if (prefReq) intent = "prefer";
   // Group rules are unambiguous when a pattern matches, so they win over the classifier.
   const ruleReq = parseRuleDeterministic(t);
   if (ruleReq) intent = "rule";
@@ -330,6 +470,19 @@ Command: """${t.slice(0, 600)}"""`,
       return applyFact(db, req);
     }
 
+    if (intent === "prefer") {
+      // Deterministic first, LLM only for phrasings the prefixes miss ("mornings are for
+      // reading, not email"). Same two-layer shape as remember/rule.
+      const req = prefReq ?? (await parsePreferenceRequest(llm, t));
+      if (!req) {
+        return {
+          kind: "error",
+          reply: "What should I note as a preference? Try: \"prefer: no meetings before 10\".",
+        };
+      }
+      return applyPreference(doctrineDir, req);
+    }
+
     if (intent === "log_work") {
       const line = t.replace(/^log[:\s]+/i, "").trim();
       if (!line) return { kind: "error", reply: "What should I log? Try: 'log: shipped the deck'." };
@@ -338,6 +491,9 @@ Command: """${t.slice(0, 600)}"""`,
     }
 
     if (intent === "plan_day") {
+      // Both calls carry the preferences block into their prompts already — planner.ts
+      // wraps the LLM client for the braindump parse and the narration (withPreferences),
+      // so there is nothing to prepend here and no chance of sending it twice.
       await planner.braindump(db, doctrineDir, llm, t, today());
       const view = await planner.generatePlan(db, doctrineDir, secrets, llm, today());
       const n = view?.blocks.filter((b: any) => !b.is_anchor).length ?? 0;
@@ -458,7 +614,15 @@ Command: """${t.slice(0, 600)}"""`,
     // Personal context first (main/context.ts): "what do I have when school starts" is
     // unanswerable without knowing when the user's school starts.
     const about = contextBlock(db);
-    const context = `${about ? `${about}\n\n` : ""}TODAY'S PLAN: ${blocks || "(none generated)"}\nOPEN COMMITMENTS: ${commitments || "(none)"}\nRECONNECT DUE: ${due || "(none)"}\nRECENT MESSAGES: ${recent || "(none)"}\nRECENT WORKLOG: ${worklog || "(none)"}`;
+    // …and his preferences right after them (main/preferences.ts): "should I take this
+    // meeting Thursday morning" is answerable only if you know he keeps mornings clear.
+    let prefs = "";
+    try {
+      prefs = preferencesBlock(doctrineDir);
+    } catch {
+      /* no preferences file yet — the answer just loses that colour */
+    }
+    const context = `${about ? `${about}\n\n` : ""}${prefs ? `${prefs}\n\n` : ""}TODAY'S PLAN: ${blocks || "(none generated)"}\nOPEN COMMITMENTS: ${commitments || "(none)"}\nRECONNECT DUE: ${due || "(none)"}\nRECENT MESSAGES: ${recent || "(none)"}\nRECENT WORKLOG: ${worklog || "(none)"}`;
     if (llm) {
       const res = await llm.call(
         "assistant_answer",

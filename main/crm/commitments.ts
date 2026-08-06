@@ -54,6 +54,9 @@
 //      block, and any survivor the model left undated gets resolveNamedDate() run over
 //      its title + raw text. That is what turns "meetup at the start of school" into the
 //      user's actual term-start date instead of leaving it undated (or, worse, today).
+//   4c. Personal preferences (main/preferences.ts): the free-text companion to 4b, appended
+//      directly after the facts in both prompts. The facts say who he is; the preferences
+//      say how he wants his time handled.
 //   5. Thread-resolution awareness (owner spec 2026-08-05 #3): something resolved IN
 //      the message chain must not live on as an open commitment. The prompt closes
 //      ask→fulfilled/cancelled pairs at extraction time, and threadResolves() — a
@@ -65,6 +68,7 @@
 import { createHash } from "node:crypto";
 import type { Db } from "../db/db.ts";
 import { contextBlock, resolveNamedDate } from "../context.ts";
+import { preferencesBlock, resolvePreferencesDir } from "../preferences.ts";
 import { extractJson, type LlmClient } from "../llm/provider.ts";
 import { extractFollowups } from "./followups.ts";
 import { parseWhen } from "./when.ts";
@@ -459,6 +463,17 @@ function aboutPreamble(about: string | undefined): string {
   return block ? `${block}\n\n` : "";
 }
 
+/**
+ * The USER PREFERENCES block (main/preferences.ts), rendered directly AFTER the facts. Two
+ * layers of the same memory: the facts say who he is, the preferences say how he wants his
+ * time and attention handled — which is what decides whether a "let's grab lunch sometime"
+ * is worth turning into an obligation at all. Empty when the file has no content lines.
+ */
+function preferencesPreamble(prefs: string | undefined): string {
+  const block = (prefs ?? "").trim();
+  return block ? `${block}\n\n` : "";
+}
+
 /** One date-reference line per distinct sent DATE in the batch (msgplans technique). */
 function dateReferenceLines(cands: Candidate[]): string {
   const seen = new Set<string>();
@@ -482,9 +497,10 @@ function dateReferenceLines(cands: Candidate[]): string {
 export function buildClassifyPrompt(
   cands: Candidate[],
   contexts: Map<number, PersonContext>,
-  about?: string
+  about?: string,
+  prefs?: string
 ): string {
-  return `${aboutPreamble(about)}Decide which of these numbered message snippets contain a REAL commitment between the user and a contact. Classify only — do not rewrite anything.
+  return `${aboutPreamble(about)}${preferencesPreamble(prefs)}Decide which of these numbered message snippets contain a REAL commitment between the user and a contact. Classify only — do not rewrite anything.
 
 WHAT COUNTS AS A COMMITMENT — every one of these must hold:
 - A concrete action the USER owes a contact, or a contact owes the user.
@@ -531,9 +547,10 @@ Return STRICT JSON ONLY — no prose, no markdown fences — one object per snip
 export function buildNormalizePrompt(
   cands: Candidate[],
   contexts: Map<number, PersonContext>,
-  about?: string
+  about?: string,
+  prefs?: string
 ): string {
-  return `${aboutPreamble(about)}These numbered snippets each contain a real commitment. For each one, write the HEADLINE TITLE it should be called in a to-do app, the date it belongs on, and whether it is a TASK or a CALENDAR EVENT.
+  return `${aboutPreamble(about)}${preferencesPreamble(prefs)}These numbered snippets each contain a real commitment. For each one, write the HEADLINE TITLE it should be called in a to-do app, the date it belongs on, and whether it is a TASK or a CALENDAR EVENT.
 
 TITLE — the headline, never a quote (this exact string becomes the task in the app and in Google Tasks):
 - "title" MUST be a rewritten imperative headline, NOT a copied message fragment. Copying the snippet is a failure.
@@ -754,11 +771,20 @@ export async function extractCommitmentsLlm(
   // dates in their life. Carried by BOTH queries so "start of school" is resolvable text
   // rather than a phrase the model has to guess at.
   const about = contextBlock(db);
+  // The free-text half of the same memory (main/preferences.ts). Read-only and best-effort:
+  // this path takes no directory argument, and a missing/unreadable file must never stop an
+  // extraction run — it just means there is nothing to say about how he likes things.
+  let prefs = "";
+  try {
+    prefs = preferencesBlock(resolvePreferencesDir());
+  } catch {
+    /* no preferences file — extraction proceeds without it */
+  }
   const now = new Date();
 
   if (llm) {
     // ── query 1 (ONE call): which candidates are commitments at all? ────────
-    const res1 = await llm.call("commitments-classify", "fast", buildClassifyPrompt(candidates, contexts, about), {
+    const res1 = await llm.call("commitments-classify", "fast", buildClassifyPrompt(candidates, contexts, about, prefs), {
       json: true,
     });
     let survivors: Candidate[] | null = null;
@@ -794,7 +820,7 @@ export async function extractCommitmentsLlm(
 
       if (survivors.length > 0) {
         // ── query 2 (ONE call): normalize survivors into headlines + dates ──
-        const res2 = await llm.call("commitments-normalize", "fast", buildNormalizePrompt(survivors, contexts, about), {
+        const res2 = await llm.call("commitments-normalize", "fast", buildNormalizePrompt(survivors, contexts, about, prefs), {
           json: true,
         });
         let normalized = false;
