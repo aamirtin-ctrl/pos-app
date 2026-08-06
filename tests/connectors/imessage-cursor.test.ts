@@ -11,7 +11,12 @@ import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { openDb, type Db } from "../../main/db/db.ts";
-import { parseImessageCursor, syncImessage } from "../../main/connectors/imessage.ts";
+import {
+  parseImessageCursor,
+  syncImessage,
+  backfillMissingSenders,
+  isAutomatedImessageHandle,
+} from "../../main/connectors/imessage.ts";
 import { setCursor, getCursor, type ConnectorDeps } from "../../main/connectors/common.ts";
 import type { SecretStore } from "../../main/secrets.ts";
 
@@ -162,5 +167,129 @@ describe("syncImessage with a migrated date-shaped cursor", () => {
       .get() as { tier: number; unv: number };
     expect(p.tier).toBe(3);       // archive tier — never surfaces in Reconnect
     expect(p.unv).toBe(1);        // tagged for easy triage/delete
+  });
+
+  it("never invents a contact for a short code / OTP or no-reply sender", async () => {
+    const DAY = 86_400_000;
+    buildChatDb([{ rowid: 1, guid: "g-known", text: "hi", atMs: Date.now() - 1 * DAY }]);
+    const chat = new Database(chatDbPath);
+    // 262966 = an Amazon-style short code; noreply@ = Business Chat automation.
+    const junk: [number, string, string][] = [
+      [2, "262966", "g-shortcode"],
+      [3, "noreply@bigco.com", "g-noreply"],
+    ] as [number, string, string][];
+    for (const [id, handle, guid] of junk) {
+      chat.prepare("INSERT INTO handle (ROWID, id) VALUES (?, ?)").run(id, handle);
+      chat.prepare("INSERT INTO chat (ROWID, guid) VALUES (?, ?)").run(id, `iMessage;-;${handle}`);
+      chat.prepare("INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (?, ?)").run(id, id);
+      chat
+        .prepare("INSERT INTO message (ROWID, guid, text, attributedBody, date, is_from_me) VALUES (?, ?, 'your code is 123456', NULL, ?, 0)")
+        .run(id, guid, nsAt(Date.now() - 1 * DAY));
+      chat.prepare("INSERT INTO chat_message_join (chat_id, message_id) VALUES (?, ?)").run(id, id);
+    }
+    chat.close();
+
+    const report = await syncImessage(deps(), { chatDbPath });
+    expect(report.error).toBeUndefined();
+    expect(report.ingested).toBe(1); // only the known friend's message
+    expect(report.created).toBe(0);
+    expect(
+      db.prepare("SELECT COUNT(*) AS n FROM alias WHERE value LIKE '%262966%' OR value LIKE 'noreply%'").get()
+    ).toEqual({ n: 0 });
+  });
+});
+
+describe("isAutomatedImessageHandle", () => {
+  it("rejects short codes and automated addresses, keeps real humans", () => {
+    expect(isAutomatedImessageHandle("262966", null)).toBe(true);
+    expect(isAutomatedImessageHandle("22395", null)).toBe(true);
+    expect(isAutomatedImessageHandle("noreply@bigco.com", "noreply@bigco.com")).toBe(true);
+    expect(isAutomatedImessageHandle("notifications@x.com", "notifications@x.com")).toBe(true);
+    expect(isAutomatedImessageHandle("+14155550123", null)).toBe(false);
+    expect(isAutomatedImessageHandle("sam@icloud.com", "sam@icloud.com")).toBe(false);
+  });
+});
+
+// Every real sender becomes a contact (owner spec 2026-08-06). Messages skipped under the
+// old Contacts-only policy are long past the ROWID cursor, so a normal sync will never see
+// them again — backfillMissingSenders walks the window from scratch and repairs them.
+describe("backfillMissingSenders", () => {
+  const DAY = 86_400_000;
+  const UNKNOWN = "+19995550100";
+
+  function seedWithAnUnknownSender() {
+    buildChatDb([{ rowid: 1, guid: "g-known", text: "hi", atMs: Date.now() - 1 * DAY }]);
+    const chat = new Database(chatDbPath);
+    chat.prepare("INSERT INTO handle (ROWID, id) VALUES (2, ?)").run(UNKNOWN);
+    chat.prepare("INSERT INTO chat (ROWID, guid) VALUES (2, ?)").run(`iMessage;-;${UNKNOWN}`);
+    chat.prepare("INSERT INTO chat_handle_join (chat_id, handle_id) VALUES (2, 2)").run();
+    for (const [rowid, guid, text, fromMe] of [
+      [2, "g-missed-1", "you never saw this", 0],
+      [3, "g-missed-2", "or this", 0],
+      [4, "g-missed-3", "and my reply", 1],
+    ] as [number, string, string, number][]) {
+      chat
+        .prepare("INSERT INTO message (ROWID, guid, text, attributedBody, date, is_from_me) VALUES (?, ?, ?, NULL, ?, ?)")
+        .run(rowid, guid, text, nsAt(Date.now() - 2 * DAY), fromMe);
+      chat.prepare("INSERT INTO chat_message_join (chat_id, message_id) VALUES (2, ?)").run(rowid);
+    }
+    chat.close();
+  }
+
+  it("creates the missing contact and ingests the history the cursor already skipped", async () => {
+    seedWithAnUnknownSender();
+    // The cursor is already past every row — a normal sync is now blind to them.
+    setCursor(db, "imessage", "999");
+    expect((await syncImessage(deps(), { chatDbPath })).ingested).toBe(0);
+
+    const report = await backfillMissingSenders(db, chatDbPath);
+    expect(report.error).toBeUndefined();
+    expect(report.createdPeople).toBe(1);
+    expect(report.ingested).toBe(3);
+
+    const person = db
+      .prepare(
+        `SELECT p.id, p.tier, (SELECT COUNT(*) FROM person_tag t WHERE t.person_id = p.id AND t.tag = 'unverified') AS unv
+           FROM person p JOIN alias a ON a.person_id = p.id WHERE a.value = ?`
+      )
+      .get(UNKNOWN) as { id: number; tier: number; unv: number };
+    expect(person.tier).toBe(3);
+    expect(person.unv).toBe(1);
+    expect(
+      db.prepare("SELECT COUNT(*) AS n FROM interaction WHERE person_id = ?").get(person.id)
+    ).toEqual({ n: 3 });
+
+    // the cursor is untouched — the incremental path is unaffected
+    expect(getCursor(db, "imessage")).toBe("999");
+  });
+
+  it("is idempotent and never re-creates or duplicates a person already on file", async () => {
+    seedWithAnUnknownSender();
+    setCursor(db, "imessage", "999");
+    await backfillMissingSenders(db, chatDbPath);
+    const second = await backfillMissingSenders(db, chatDbPath);
+    expect(second.createdPeople).toBe(0);
+    expect(second.ingested).toBe(0);
+    expect(
+      db.prepare("SELECT COUNT(*) AS n FROM person p JOIN alias a ON a.person_id = p.id WHERE a.value = ?").get(UNKNOWN)
+    ).toEqual({ n: 1 });
+  });
+
+  it("leaves people who already resolve alone (no duplicate for the known friend)", async () => {
+    seedWithAnUnknownSender();
+    setCursor(db, "imessage", "999");
+    await backfillMissingSenders(db, chatDbPath);
+    expect(
+      db.prepare("SELECT COUNT(*) AS n FROM person WHERE display_name = 'Known Friend'").get()
+    ).toEqual({ n: 1 });
+    // its message was NOT ingested here — the backfill only writes for people it created
+    expect(
+      db.prepare("SELECT COUNT(*) AS n FROM interaction WHERE external_id = 'g-known'").get()
+    ).toEqual({ n: 0 });
+  });
+
+  it("reports chat_db_not_found instead of throwing when there is no chat.db", async () => {
+    const report = await backfillMissingSenders(db, path.join(dir, "nope.db"));
+    expect(report.error).toBe("chat_db_not_found");
   });
 });

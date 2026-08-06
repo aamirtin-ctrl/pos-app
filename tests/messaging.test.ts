@@ -151,11 +151,182 @@ describe("listInbox", () => {
     const collapsed = listInbox(db);
     expect(collapsed).toHaveLength(1);
     expect(collapsed[0].body_summary).toBe("m5");
-    // limit bounds the scanned inbound rows → conversations, one per person here
+    // limit counts CONVERSATIONS, not scanned rows: the 6-message thread is one of them
     for (const name of ["P2", "P3", "P4"]) {
       addInteraction(addPerson(name), { direction: "inbound", occurredAt: "2026-08-02T10:00:00Z", body: "hi" });
     }
     expect(listInbox(db, { limit: 3 })).toHaveLength(3);
+    expect(listInbox(db)).toHaveLength(4);
+  });
+});
+
+// The bug the owner reported: "texts from friends who ARE in my contacts don't show up".
+// The old query LIMITed the scanned inbound ROWS and did unanswered-first ordering in SQL,
+// so (a) chatty threads ate the whole budget and (b) anything he had already replied to
+// sorted behind every unanswered row in 30k interactions and fell off the end.
+describe("listInbox is conversation-complete", () => {
+  function seedOneChattyThreadAndFiveQuietPeople() {
+    const chatty = addPerson("Chatty");
+    for (let i = 0; i < 30; i++) {
+      addInteraction(chatty, {
+        channel: "imessage", direction: "inbound",
+        occurredAt: `2026-08-04T12:${String(i).padStart(2, "0")}:00Z`, body: `spam ${i}`,
+      });
+    }
+    const quiet = ["Ada", "Bob", "Cleo", "Dee", "Eli"];
+    quiet.forEach((name, i) => {
+      const p = addPerson(name);
+      addInteraction(p, {
+        channel: "imessage", direction: "inbound",
+        occurredAt: `2026-08-03T09:0${i}:00Z`, body: "hey",
+      });
+      // Two of them he already replied to — under the old ordering these were the first
+      // conversations to vanish, which is exactly the "my friends aren't there" complaint.
+      if (i < 2) {
+        addInteraction(p, {
+          channel: "imessage", direction: "outbound",
+          occurredAt: `2026-08-03T10:0${i}:00Z`, body: "replied from my phone",
+        });
+      }
+    });
+    return { chatty, quiet };
+  }
+
+  it("shows all 6 conversations when one thread has 30 inbound and five people have one each", () => {
+    const { quiet } = seedOneChattyThreadAndFiveQuietPeople();
+    const names = listInbox(db).map((i) => i.person_name).sort();
+    expect(names).toEqual([...quiet, "Chatty"].sort());
+    // exactly once each — the 30-message thread collapses to a single row
+    expect(new Set(names).size).toBe(6);
+  });
+
+  it("cuts by conversation, not by message: limit 6 still yields all 6", () => {
+    seedOneChattyThreadAndFiveQuietPeople();
+    expect(listInbox(db, { limit: 6 })).toHaveLength(6);
+  });
+
+  it("keeps answered-but-recent conversations in the list, sorted after the unanswered ones", () => {
+    seedOneChattyThreadAndFiveQuietPeople();
+    const items = listInbox(db);
+    const answered = items.filter((i) => i.unanswered === 0).map((i) => i.person_name);
+    expect(answered.sort()).toEqual(["Ada", "Bob"]);
+    // unanswered-first is a SORT, not a filter
+    expect(items.slice(0, 4).every((i) => i.unanswered === 1)).toBe(true);
+    expect(items.slice(-2).every((i) => i.unanswered === 0)).toBe(true);
+  });
+
+  it("defaults to 60 conversations", () => {
+    expect(DEFAULT_CONVERSATION_LIMIT).toBe(60);
+    for (let i = 0; i < 70; i++) {
+      addInteraction(addPerson(`P${i}`), {
+        channel: "imessage", direction: "inbound",
+        occurredAt: `2026-08-0${(i % 4) + 1}T10:${String(i % 60).padStart(2, "0")}:00Z`, body: "hi",
+      });
+    }
+    expect(listInbox(db)).toHaveLength(60);
+  });
+});
+
+describe("tapbacks never headline a conversation", () => {
+  it("recognizes the tapback text shapes and nothing else", () => {
+    for (const t of [
+      'Liked "Preciate the support shmear"',
+      'You liked "Preciate the support shmear"',
+      'Loved “dinner at 8”',
+      'Laughed at "lol"',
+      'Emphasized "yes"',
+      'Questioned "really?"',
+      'Disliked "nope"',
+      'Removed a heart from "hi"',
+    ]) {
+      expect(isTapback(t)).toBe(true);
+    }
+    for (const t of [null, "", "I liked your post", 'she loved "it"', "Liked it", "Loved the show"]) {
+      expect(isTapback(t)).toBe(false);
+    }
+  });
+
+  it("picks the newest NON-tapback message as the representative", () => {
+    const p = addPerson("Reacty");
+    addInteraction(p, {
+      channel: "imessage", direction: "inbound",
+      occurredAt: "2026-08-01T10:00:00Z", body: "Preciate the support shmear",
+    });
+    addInteraction(p, {
+      channel: "imessage", direction: "inbound",
+      occurredAt: "2026-08-01T11:00:00Z", body: 'Liked "Preciate the support shmear"',
+    });
+    const [item] = listInbox(db);
+    expect(item.body_summary).toBe("Preciate the support shmear");
+    // the tapback row is NOT deleted — it just can't be the headline
+    expect(item.thread).toHaveLength(2);
+  });
+
+  it("falls back to the tapback when it is the only inbound there is", () => {
+    const p = addPerson("OnlyReacts");
+    addInteraction(p, {
+      channel: "imessage", direction: "inbound",
+      occurredAt: "2026-08-01T11:00:00Z", body: 'Loved "the deck"',
+    });
+    const [item] = listInbox(db);
+    expect(item.person_name).toBe("OnlyReacts");
+    expect(item.body_summary).toBe('Loved "the deck"');
+  });
+
+  it("does not let a chatty tapback tail hide the conversation itself", () => {
+    const p = addPerson("Tappy");
+    addInteraction(p, {
+      channel: "imessage", direction: "inbound",
+      occurredAt: "2026-08-01T09:00:00Z", body: "are we still on for friday?",
+    });
+    for (let i = 0; i < 5; i++) {
+      addInteraction(p, {
+        channel: "imessage", direction: "inbound",
+        occurredAt: `2026-08-01T1${i}:00:00Z`, body: `Liked "message ${i}"`,
+      });
+    }
+    const [item] = listInbox(db);
+    expect(item.body_summary).toBe("are we still on for friday?");
+  });
+});
+
+// Deletion is a ✕ click and nothing else. The bulk-mail purge is the only automatic
+// delete in the app, so it is the one that has to prove it can't touch a texter.
+describe("purgeBulkContacts never removes someone he has texted with", () => {
+  function addUnverified(name: string): number {
+    const id = addPerson(name);
+    db.prepare("INSERT INTO person_tag (person_id, tag) VALUES (?, 'unverified')").run(id);
+    return id;
+  }
+
+  it("still purges an inbound-mail-only newsletter contact", () => {
+    const nyt = addUnverified("NYT Newsletters");
+    addInteraction(nyt, { channel: "gmail", direction: "inbound", occurredAt: "2026-08-01T10:00:00Z", subject: "Your daily digest" });
+    expect(bulkContactCandidates(db).map((c) => c.id)).toEqual([nyt]);
+    expect(purgeBulkContacts(db)).toBe(1);
+  });
+
+  it("spares the identical contact the moment ONE iMessage interaction exists", () => {
+    const nyt = addUnverified("NYT Newsletters");
+    addInteraction(nyt, { channel: "gmail", direction: "inbound", occurredAt: "2026-08-01T10:00:00Z", subject: "Your daily digest" });
+    addInteraction(nyt, { channel: "imessage", direction: "inbound", occurredAt: "2026-08-02T10:00:00Z", body: "hey it's me" });
+
+    expect(bulkContactCandidates(db)).toEqual([]);
+    expect(purgeBulkContacts(db)).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM person WHERE id = ?").get(nyt)).toEqual({ n: 1 });
+  });
+
+  it("spares an unverified auto-created texter with a handle-shaped name", () => {
+    const unknown = addUnverified("+15551234567");
+    addInteraction(unknown, { channel: "imessage", direction: "inbound", occurredAt: "2026-08-01T10:00:00Z", body: "yo" });
+    expect(purgeBulkContacts(db)).toBe(0);
+    expect(listInbox(db).map((i) => i.person_name)).toEqual(["+15551234567"]);
+  });
+
+  it("spares an outbound-only iMessage relationship too", () => {
+    const friend = addUnverified("Newsletter Bot");
+    addInteraction(friend, { channel: "imessage", direction: "outbound", occurredAt: "2026-08-01T10:00:00Z", body: "hi" });
+    expect(purgeBulkContacts(db)).toBe(0);
   });
 });
 
