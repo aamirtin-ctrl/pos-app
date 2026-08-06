@@ -65,19 +65,24 @@ export async function braindump(db: Db, doctrineDir: string, llm: LlmClient | nu
       // invariant). "Tomorrow" also carries a date, but it is a commitment to a day, and a
       // window_end there would license the planner to shuffle it — the opposite of what he said.
       const windowEnd = t.flexible && t.windowEnd && t.windowEnd > dateISO ? t.windowEnd : null;
+      // A window that opens LATER ("next week" → next Monday, "this weekend" → Saturday)
+      // starts there, and the task is parked on its opening day — otherwise the reclaim pass
+      // could legally pull next week's work into this one.
+      const windowStart =
+        windowEnd && t.windowStart && t.windowStart > dateISO ? t.windowStart : windowEnd ? dateISO : null;
       // A NAMED day is a commitment to that day, and it used to be discarded: parseWindow
       // resolves "tomorrow" correctly and returns it with flexible=false, but only the
       // flexible branch was ever persisted, so plan_date stayed the day of capture. That is
       // why work he said was for tomorrow landed on today (owner report 2026-08-06).
       const namedDay = !t.flexible && t.windowEnd && t.windowEnd >= dateISO ? t.windowEnd : null;
-      const planDate = namedDay ?? dateISO;
+      const planDate = namedDay ?? (windowStart && windowStart > dateISO ? windowStart : dateISO);
       ins.run(
         t.title, t.blockType, t.cognitiveLoad, t.estimatedMinutes, t.rawEstimateMinutes,
         t.isMit ? 1 : 0,
         t.hardDeadlineAt ? `${planDate}T${t.hardDeadlineAt}:00` : null,
         t.splittable ? 1 : 0, t.estimateSource, planDate,
         t.personHint ? `person: ${t.personHint}` : null,
-        windowEnd ? dateISO : null, windowEnd, t.dayPart ?? null
+        windowStart, windowEnd, t.dayPart ?? null
       );
     }
   });

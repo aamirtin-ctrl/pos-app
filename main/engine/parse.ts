@@ -25,6 +25,8 @@ export interface ParsedTask {
    * the engine's licence to move the task to a later day inside the window.
    */
   windowEnd: string | null;
+  /** First day the window opens ("next week" → next Monday), or null = immediately. */
+  windowStart: string | null;
   /** Part of the day he named ("tonight", "this morning"), or null. */
   dayPart: DayPart | null;
   /**
@@ -68,10 +70,16 @@ export const endOfThisWeek = (refISO: string) => isoOf(onOrAfterWeekday(utcMidni
  */
 export type DayPart = "morning" | "afternoon" | "evening";
 
+// Order matters: evening checked first so "tomorrow night" wins over any stray match, and the
+// patterns are deliberately BARE nouns with word boundaries — "Thursday evening", "late
+// afternoon" and "tomorrow morning" must all hit, which anchored phrases like "this evening"
+// missed (owner ask 2026-08-06: expand the keyword dataset the no-model path acts on).
 const DAY_PART_PATTERNS: [RegExp, DayPart][] = [
-  [/\btonight\b|\bthis evening\b|\bin the evening\b|\bafter dinner\b|\bat night\b/i, "evening"],
-  [/\bthis afternoon\b|\bin the afternoon\b|\bafter lunch\b/i, "afternoon"],
-  [/\bthis morning\b|\bin the morning\b|\bfirst thing\b|\bbefore lunch\b/i, "morning"],
+  [/\btonight\b|\btonite\b|\bevenings?\b|\bnights?\b|\bafter dinner\b|\bbefore bed\b|\bafter work\b/i, "evening"],
+  [/\bafternoons?\b|\bafter lunch\b|\bat noon\b|\baround noon\b|\bmid-?day\b/i, "afternoon"],
+  // "(?<!good )" keeps "good morning" — the digest greeting and half his Alexa emails — from
+  // marking everything he says at 7am as morning work.
+  [/(?<!good )\bmornings?\b|\bfirst thing\b|\bbefore (?:noon|lunch)\b|\bwhen i wake\b/i, "morning"],
 ];
 
 /** The part of the day the text names, or null when it names none. */
@@ -91,11 +99,21 @@ export const DAY_PART_BOUNDS: Record<DayPart, { earliest: number; latest: number
 export interface ParsedWindow {
   /** Last day the work may happen (ISO date), or null when the text names no timeframe. */
   windowEnd: string | null;
+  /**
+   * FIRST day the work may happen, when the range does not start immediately: "next week"
+   * opens next Monday, "this weekend" opens Saturday. Null = opens now (the old behavior,
+   * and still the common case). Without this, "next week" work sat with window_start = today
+   * and the reclaim pass could legally pull it into THIS week — the opposite of what he said.
+   */
+  windowStart?: string | null;
   /** True when the text named a RANGE; false when it named one specific day. */
   flexible: boolean;
 }
 
 const NO_WINDOW: ParsedWindow = { windowEnd: null, flexible: false };
+
+const WEEKDAYS_FULL = "monday|tuesday|wednesday|thursday|friday|saturday|sunday";
+const WEEKDAYS_ABBR = "mon|tue|tues|wed|weds|thu|thur|thurs|fri|sat|sun";
 
 /**
  * Deterministic window extraction — no LLM. Used as the fallback when the model omits the
@@ -125,7 +143,9 @@ export function parseWindow(text: string, refISO: string): ParsedWindow {
     /\bnot\s+(?:necessarily\s+)?today\b/.test(low);
 
   // ── one named day: a commitment, not a window ──
-  if (!negatesToday && /\btoday\b|\btonight\b/.test(low)) return { windowEnd: refISO, flexible: false };
+  // "day after tomorrow" contains "tomorrow" and must be read first.
+  if (/\b(?:the\s+)?day after tomorrow\b/.test(low)) return { windowEnd: isoOf(addDays(ref, 2)), flexible: false };
+  if (!negatesToday && /\btoday\b|\btonight\b|\btonite\b/.test(low)) return { windowEnd: refISO, flexible: false };
   if (/\btomorrow\b|\btmrw\b|\btmr\b/.test(low)) return { windowEnd: isoOf(addDays(ref, 1)), flexible: false };
 
   // ── "by <weekday>" — a deadline, and everything before it is fair game ──
@@ -138,7 +158,82 @@ export function parseWindow(text: string, refISO: string): ParsedWindow {
     if (d) return { windowEnd: isoOf(d), flexible: true };
   }
 
-  if (/\bnext week\b/.test(low)) return { windowEnd: isoOf(addDays(utcMidnight(endOfThisWeek(refISO)), 7)), flexible: true };
+  // ── a named weekday: "next Thursday", "on Friday", bare "Wednesday" ──
+  //
+  // Owner ask 2026-08-06, after a day of these being dropped: "references to later weeks or
+  // days of later weeks, like next Thursday, next Wednesday, etcetera." A weekday is a
+  // commitment to a day, exactly like "tomorrow" — non-flexible, so braindump pins plan_date
+  // to it and the engine may not shuffle it. crm/when.ts owns the arithmetic (including the
+  // "next" offset); abbreviations require a preposition so "sat down" is never Saturday.
+  const nextWd = low.match(new RegExp(`\\bnext\\s+(${WEEKDAYS_FULL}|${WEEKDAYS_ABBR})\\b`));
+  if (nextWd) {
+    const d = parseWhen(`next ${nextWd[1]}`, ref);
+    if (d) return { windowEnd: isoOf(d), flexible: false };
+  }
+  const bareWd =
+    low.match(new RegExp(`\\b(?:on|this|by)?\\s*(${WEEKDAYS_FULL})\\b`)) ??
+    low.match(new RegExp(`\\b(?:on|this)\\s+(${WEEKDAYS_ABBR})\\b`));
+  if (bareWd) {
+    const d = parseWhen(bareWd[1], ref);
+    if (d) return { windowEnd: isoOf(d), flexible: false };
+  }
+
+  // ── absolute dates: "August 10", "the 12th", "8/10" ──
+  if (new RegExp(`\\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?\\s+\\d{1,2}\\b`).test(low)) {
+    const d = parseWhen(low, ref);
+    if (d) return { windowEnd: isoOf(d), flexible: false };
+  }
+  const ordinal = low.match(/\b(?:on\s+)?the\s+(\d{1,2})(?:st|nd|rd|th)\b/);
+  if (ordinal) {
+    const dayN = parseInt(ordinal[1], 10);
+    if (dayN >= 1 && dayN <= 31) {
+      let cand = new Date(Date.UTC(ref.getUTCFullYear(), ref.getUTCMonth(), dayN));
+      if (cand.getTime() < ref.getTime()) cand = new Date(Date.UTC(ref.getUTCFullYear(), ref.getUTCMonth() + 1, dayN));
+      // A 31st in a 30-day month rolls over silently — refuse rather than land on the 1st.
+      if (cand.getUTCDate() === dayN) return { windowEnd: isoOf(cand), flexible: false };
+    }
+  }
+  const slashDate = low.match(/\b(\d{1,2})\/(\d{1,2})\b(?!\s*(?:hour|hr|h\b))/);
+  if (slashDate) {
+    const m = parseInt(slashDate[1], 10), dayN = parseInt(slashDate[2], 10);
+    if (m >= 1 && m <= 12 && dayN >= 1 && dayN <= 31) {
+      let cand = new Date(Date.UTC(ref.getUTCFullYear(), m - 1, dayN));
+      if (cand.getTime() < ref.getTime()) cand = new Date(Date.UTC(ref.getUTCFullYear() + 1, m - 1, dayN));
+      if (cand.getUTCDate() === dayN) return { windowEnd: isoOf(cand), flexible: false };
+    }
+  }
+
+  // ── "in N days / a week / two weeks": a point that far out ──
+  const inDays = low.match(/\bin\s+(\d{1,2}|a couple(?: of)?|a few)\s+days?\b/);
+  if (inDays && !/\bthe next\b/.test(low)) {
+    const n = /^\d+$/.test(inDays[1]) ? Math.min(60, parseInt(inDays[1], 10)) : inDays[1].startsWith("a couple") ? 2 : 3;
+    return { windowEnd: isoOf(addDays(ref, n)), flexible: false };
+  }
+  const inWeeks = low.match(/\bin\s+(a|one|two|three|four|\d{1,2})\s+weeks?\b/);
+  if (inWeeks) {
+    const words: Record<string, number> = { a: 1, one: 1, two: 2, three: 3, four: 4 };
+    const n = words[inWeeks[1]] ?? Math.min(8, parseInt(inWeeks[1], 10) || 1);
+    return { windowEnd: isoOf(addDays(ref, 7 * n)), flexible: false };
+  }
+
+  // ── "this weekend": a RANGE that does not open until Saturday ──
+  if (/\b(?:this|the|over the)\s+weekend\b/.test(low)) {
+    const sat = onOrAfterWeekday(ref, 6);
+    const sun = onOrAfterWeekday(sat, 0);
+    return { windowStart: isoOf(sat), windowEnd: isoOf(sun), flexible: true };
+  }
+
+  // ── "end of the month": everything left in it ──
+  if (/\bend of (?:the |this )?month\b/.test(low)) {
+    const last = new Date(Date.UTC(ref.getUTCFullYear(), ref.getUTCMonth() + 1, 0));
+    return { windowEnd: isoOf(last), flexible: true };
+  }
+
+  if (/\bnext week\b/.test(low)) {
+    // Opens next Monday — without windowStart the reclaim pass could pull it into THIS week.
+    const nextMon = addDays(utcMidnight(endOfThisWeek(refISO)), 1);
+    return { windowStart: isoOf(nextMon), windowEnd: isoOf(addDays(utcMidnight(endOfThisWeek(refISO)), 7)), flexible: true };
+  }
   if (/\b(?:this|the) week\b|\b(?:rest|remainder|balance) of (?:this |the )?week\b|\ball week\b/.test(low)) {
     return { windowEnd: endOfThisWeek(refISO), flexible: true };
   }
@@ -151,7 +246,7 @@ export function parseWindow(text: string, refISO: string): ParsedWindow {
     return { windowEnd: isoOf(addDays(ref, n)), flexible: true };
   }
   // Slack with no stated edge. The week is the smallest honest bound we can put on it.
-  if (/\bno rush\b|\bwhenever\b|\bany ?time\b|\bsometime\b|\bdoesn'?t have to be today\b|\bnot urgent\b/.test(low)) {
+  if (/\bno rush\b|\bno hurry\b|\bwhenever\b|\bany ?time\b|\bsometime\b|\beventually\b|\bat some point\b|\bwhen i (?:get|have) (?:a )?chance\b|\bdoesn'?t have to be today\b|\bnot urgent\b/.test(low)) {
     return { windowEnd: endOfThisWeek(refISO), flexible: true };
   }
   return NO_WINDOW;
@@ -336,6 +431,7 @@ function coerce(raw: unknown, doctrine: Doctrine, text: string, refISO: string):
       estimateSource: r.estimate_source === "stated" ? "stated" : "inferred",
       reasoning: typeof r.reasoning === "string" ? r.reasoning : "",
       windowEnd: window.windowEnd,
+      windowStart: window.windowStart ?? null,
       flexible: window.flexible,
       // Read from the owner's own words, not from the model: "tonight" is unambiguous and a
       // model that omits it should not cost him the constraint.
@@ -446,6 +542,12 @@ const SCHEDULING_WORDS = new Set([
   "about", "around", "maybe", "like", "some", "the", "and", "for", "need", "want", "have",
   "gonna", "going", "will", "can", "could", "should", "would", "just", "really", "half",
   "couple", "few", "rest", "remainder", "balance", "all", "any", "more", "bit",
+  // Temporal nouns: a fragment made only of these ("next Thursday", "tomorrow evening") is a
+  // modifier for the work beside it, never a task of its own. Weekdays were missing, which is
+  // how "next Thursday" could have become its own 75-minute to-do.
+  "tomorrow", "tonight", "tonite", "yesterday", "noon", "midday", "evening", "afternoon",
+  "night", "weekend", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+  "sunday", "early", "late", "sometime", "eventually",
   ...Object.keys(NUMBER_WORDS),
 ]);
 
@@ -574,6 +676,7 @@ export function deterministicParse(
       estimateSource: stated ? "stated" : "inferred",
       reasoning: "deterministic fallback (no LLM)",
       windowEnd: window.windowEnd,
+      windowStart: window.windowStart ?? null,
       flexible: window.flexible,
       dayPart: parseDayPart(p),
     });

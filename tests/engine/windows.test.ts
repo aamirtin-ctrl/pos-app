@@ -215,8 +215,14 @@ describe("parseWindow — the five phrases, without an LLM", () => {
     expect(parseWindow("by next Friday", THU)).toEqual({ windowEnd: "2026-08-14", flexible: true });
   });
 
-  it('"next week" → the FOLLOWING Sunday, flexible', () => {
-    expect(parseWindow("start the reading next week", THU)).toEqual({ windowEnd: "2026-08-16", flexible: true });
+  it('"next week" → opens next Monday, closes the following Sunday, flexible', () => {
+    // windowStart is the 2026-08-06 addition: without it, next-week work carried
+    // window_start = today and the reclaim pass could legally pull it into THIS week.
+    expect(parseWindow("start the reading next week", THU)).toEqual({
+      windowStart: "2026-08-10",
+      windowEnd: "2026-08-16",
+      flexible: true,
+    });
   });
 
   it('"today" / "tomorrow" → that day, NOT flexible', () => {

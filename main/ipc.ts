@@ -765,8 +765,13 @@ export function registerIpc(deps: IpcDeps) {
   h("assistant.command", async (text: string) => {
     const captureId = recordCapture(db, "sparkle", text);
     try {
+      const healthy = llmHealth(db, secrets).ok;
       const res = await handleCommand({ db, secrets, doctrineDir, llm: deps.llm() }, text);
-      if (captureId !== null) markCaptureDone(db, captureId, { kind: res.kind });
+      // `degraded` is provenance, not a retry marker: the fallback DID act (created tasks,
+      // filed notes), so re-running the same text when the model returns would duplicate its
+      // output. What it buys is an audit trail — a row that says "this was interpreted
+      // without the model" is findable, where before it was indistinguishable from a full parse.
+      if (captureId !== null) markCaptureDone(db, captureId, { kind: res.kind, degraded: !healthy });
       return res;
     } catch (e) {
       if (captureId !== null) markCaptureFailed(db, captureId, (e as Error).message);
