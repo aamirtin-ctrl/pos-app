@@ -100,6 +100,20 @@ export const SERVICES: Record<string, PanelService> = {
 
 export const SERVICE_IDS = Object.keys(SERVICES);
 
+/**
+ * Electron's default UA advertises `POS/x` and `Electron/x` alongside Chrome. Snapchat
+ * Web sniffs it and refuses to load ("Browser not supported") — Instagram and LinkedIn
+ * do not care. Stripping those two tokens leaves a genuine Chrome UA string built from
+ * this same Chromium, so we are not claiming a version we do not have.
+ */
+export function chromeUserAgent(defaultUa: string): string {
+  return defaultUa
+    .replace(/\s*(POS|pos)\/[^\s]+/g, "")
+    .replace(/\s*Electron\/[^\s]+/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 export function getService(id: string): PanelService | null {
   return Object.prototype.hasOwnProperty.call(SERVICES, id) ? SERVICES[id] : null;
 }
@@ -239,7 +253,7 @@ function enforce(panel: Panel) {
     const now = Date.now();
     if (now - panel.lastBounceAt < 1000) return;
     panel.lastBounceAt = now;
-    void wc.loadURL(service.url).catch(() => {});
+    void wc.loadURL(service.url, { userAgent: chromeUserAgent(wc.getUserAgent()) }).catch(() => {});
   };
 
   const handle = (url: string, isMainFrame: boolean, ev?: { preventDefault(): void }) => {
@@ -267,7 +281,7 @@ function enforce(panel: Panel) {
   wc.setWindowOpenHandler((details: HandlerDetails) => {
     const decision = decideNavigation(service, details.url);
     if (decision === "external") void shell.openExternal(details.url).catch(() => {});
-    else if (decision === "allow") void wc.loadURL(details.url).catch(() => {});
+    else if (decision === "allow") void wc.loadURL(details.url, { userAgent: chromeUserAgent(wc.getUserAgent()) }).catch(() => {});
     // "bounce": swallow it — the panel stays where it is.
     return { action: "deny" as const };
   });
@@ -340,7 +354,15 @@ export function openPanel(win: BrowserWindow, serviceId: string, bounds?: Rectan
   win.contentView.addChildView(view);
   current = panel;
   apply(panel);
-  void view.webContents.loadURL(service.url).catch(() => {});
+  // Present as plain Chrome — see chromeUserAgent(). Set before the first load so the
+  // very first request already carries it.
+  try {
+    view.webContents.setUserAgent(chromeUserAgent(view.webContents.getUserAgent()));
+  } catch {
+    /* non-fatal: worst case the site sees the Electron UA it would have seen anyway */
+  }
+  const ua = chromeUserAgent(view.webContents.getUserAgent());
+  void view.webContents.loadURL(service.url, { userAgent: ua }).catch(() => {});
   return info(panel);
 }
 

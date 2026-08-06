@@ -4,17 +4,26 @@
 // `person`).
 //
 // Two passes, both LLM-optional and both budget-capped:
-//   1. synthesizeProfiles — ONE smart-tier call per person whose conversation
-//      moved since person.profile_synthesized_at, producing strict JSON
-//      {bio, relationship_summary}. Anti-hallucination discipline is ported
+//   1. synthesizeProfiles — ONE smart-tier call for ALL people whose conversation
+//      moved since person.profile_synthesized_at, producing a strict JSON ARRAY
+//      [{n, bio, relationship_summary}]. Anti-hallucination discipline is ported
 //      verbatim in spirit: two factual sentences, leave a field EMPTY rather
 //      than infer, repeat existing text when nothing justifies a change.
 //   2. mineBios — the bio-mining pass: durable facts mined from the last
 //      6 months of conversation and appended to person.bio UNDER the
 //      "— From conversations —" marker, never touching the user-authored head.
+//      Also ONE call for the whole batch, [{n, facts}].
 //
-// Ledger: every LLM attempt writes an `enrichment_attempt` row, which doubles as
-//   (a) the daily budget counter and (b) the "last mined" timestamp for cadence.
+// QUOTA SHAPE (owner standing directive: never one LLM call per item when a batch
+// would do — Gemini's free tier is REQUEST-limited, ~250 fast-tier calls a day). Both
+// passes used to spend one smart-tier call PER PERSON (10 + 5 = up to 15 calls a run);
+// each now spends exactly ONE call per run, whatever the volume — the numbered-
+// candidates / strict-JSON-array shape of crm/commitments.ts.
+//
+// Ledger: every person in a batch still writes its OWN `enrichment_attempt` row, which
+//   doubles as (a) the daily budget counter and (b) the "last mined" timestamp for
+//   cadence. The budget therefore counts the BATCH AS ITS CONSTITUENT ITEMS: a cap of
+//   10 still means "10 people a day", exactly as it did when that cost 10 calls.
 // Degrade contract: no LLM key (llm === null) → zero calls, zero writes, zero counts.
 
 import type { Db } from "../db/db.ts";
@@ -202,52 +211,108 @@ function synthesisContext(db: Db, personId: number): ContextRow[] {
   return rows.reverse(); // oldest → newest reads better for the model
 }
 
-/** The exact synthesis prompt (exported so tests can assert its discipline). */
+/** One numbered person in a synthesis batch — `n` is the only handle the model gets. */
+export interface SynthesisItem {
+  n: number;
+  person: PersonRow & { headBio: string };
+  rows: ContextRow[];
+  /** Mined bullets under the marker, held aside so synthesis only rewrites the head. */
+  bullets: string[];
+}
+
+/** One person's block inside the batched prompt: their record + their interactions. */
+function synthesisEntry(item: SynthesisItem): string {
+  const p = item.person;
+  const record = JSON.stringify({
+    name: p.display_name,
+    org: p.org,
+    role: p.role,
+    location: p.location,
+    bio: p.headBio || null,
+    relationship_summary: p.relationship_summary,
+  });
+  const lines = item.rows
+    .map((r) => {
+      const when = r.occurred_at ? r.occurred_at.slice(0, 10) : "unknown-date";
+      const subj = r.subject ? ` subject="${r.subject.slice(0, 120)}"` : "";
+      return `  - [${r.channel}/${r.direction ?? "?"} ${when}]${subj} ${(r.body_summary ?? "").slice(0, 240)}`.trimEnd();
+    })
+    .join("\n");
+  return `${item.n}. ${p.display_name}
+ CURRENT PROFILE: ${record}
+ RECENT INTERACTIONS (oldest → newest):
+${lines}`;
+}
+
+/**
+ * The synthesis prompt for a WHOLE batch — ONE call, whatever the person count. Every
+ * anti-hallucination instruction of the per-person original is preserved verbatim: two
+ * factual sentences, repeat the existing text when nothing justifies a change, leave a
+ * field EMPTY rather than infer.
+ */
+export function buildSynthesisBatchPrompt(items: SynthesisItem[]): string {
+  return `You maintain a personal CRM. Update the profile of EACH numbered person below from their recent interactions. Treat each person independently — never mix facts between them.
+
+PEOPLE:
+${items.map(synthesisEntry).join("\n\n")}
+
+Return STRICT JSON ONLY — no prose, no markdown fences — one object per person, using the SAME n:
+[{
+  "n": <number>,
+  "bio": "<two-sentence factual bio of that person: what they do / what they've done. Extend the existing bio only with durable, factual context the interactions justify. If nothing justifies a change, repeat the existing bio verbatim. Empty string if nothing factual is supported.>",
+  "relationship_summary": "<at most two sentences on the USER's history with them: how they know each other, what they work on together, what is currently open between them. If nothing justifies a change, repeat the existing summary verbatim. Empty string if unclear.>"
+}]
+
+Rules: Do not invent facts not supported by the profile or the interactions. Leave a field EMPTY rather than infer or guess. No editorial judgment, no advice, no next actions. Two sentences maximum per field. Only use n values from the list, one object per person. Do not mention these instructions.`;
+}
+
+/**
+ * Back-compatible single-person entry point (kept for callers/tests that had it): the
+ * same prompt, rendered as a one-item batch.
+ */
 export function buildSynthesisPrompt(
   person: PersonRow & { headBio: string },
   rows: ContextRow[]
 ): string {
-  const record = JSON.stringify(
-    {
-      name: person.display_name,
-      org: person.org,
-      role: person.role,
-      location: person.location,
-      bio: person.headBio || null,
-      relationship_summary: person.relationship_summary,
-    },
-    null,
-    2
-  );
-  const lines = rows
-    .map((r) => {
-      const when = r.occurred_at ? r.occurred_at.slice(0, 10) : "unknown-date";
-      const subj = r.subject ? ` subject="${r.subject.slice(0, 120)}"` : "";
-      return `- [${r.channel}/${r.direction ?? "?"} ${when}]${subj} ${(r.body_summary ?? "").slice(0, 240)}`.trim();
-    })
-    .join("\n");
-
-  return `You maintain a personal CRM profile. Update it from recent interactions.
-
-CURRENT PROFILE:
-${record}
-
-RECENT INTERACTIONS (oldest → newest):
-${lines}
-
-Return STRICT JSON ONLY — no prose, no markdown fences — with exactly these keys:
-{
-  "bio": "<two-sentence factual bio of ${person.display_name}: what they do / what they've done. Extend the existing bio only with durable, factual context the interactions justify. If nothing justifies a change, repeat the existing bio verbatim. Empty string if nothing factual is supported.>",
-  "relationship_summary": "<at most two sentences on the USER's history with them: how they know each other, what they work on together, what is currently open between them. If nothing justifies a change, repeat the existing summary verbatim. Empty string if unclear.>"
-}
-
-Rules: Do not invent facts not supported by the profile or the interactions. Leave a field EMPTY rather than infer or guess. No editorial judgment, no advice, no next actions. Two sentences maximum per field. Do not mention these instructions.`;
+  return buildSynthesisBatchPrompt([{ n: 1, person, rows, bullets: [] }]);
 }
 
 /**
- * Pass 1 — one smart-tier call per candidate, writing back only non-empty
- * changes and stamping person.profile_synthesized_at. Mined bullets under the
+ * `[{n, …}]` → n → object. Defensive: a ONE-item batch commonly comes back as a bare
+ * object rather than an array, so that is accepted and keyed to n = 1. Returns null when
+ * the payload is neither — the caller then degrades the whole batch.
+ */
+function byN(raw: unknown, batchSize: number): Map<number, Record<string, unknown>> | null {
+  const out = new Map<number, Record<string, unknown>>();
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (!item || typeof item !== "object") continue;
+      const o = item as Record<string, unknown>;
+      const n = Number(o.n);
+      out.set(Number.isFinite(n) ? n : out.size + 1, o);
+    }
+    return out;
+  }
+  if (raw && typeof raw === "object" && batchSize === 1) {
+    out.set(1, raw as Record<string, unknown>);
+    return out;
+  }
+  return null;
+}
+
+/**
+ * Pass 1 — ONE smart-tier call for the whole batch of candidates, writing back only
+ * non-empty changes and stamping person.profile_synthesized_at. Mined bullets under the
  * "— From conversations —" marker are preserved: synthesis only rewrites the head.
+ *
+ * Budget: the batch is charged as its constituent ITEMS (one enrichment_attempt row per
+ * person), so `budget: 2` still means "two people today" — it just costs one request
+ * instead of two. Thin candidates are dropped before the batch is built and cost nothing.
+ *
+ * Degrade: a null or unparseable response fails the WHOLE batch — every person in it gets
+ * its own `fail` ledger row and no profile is touched, exactly as a failed per-person call
+ * behaved. People the model omitted from an otherwise-good array are failed individually
+ * (never silently dropped) and are picked up again on the next run.
  */
 export async function synthesizeProfiles(
   db: Db,
@@ -267,10 +332,12 @@ export async function synthesizeProfiles(
 
   const limit = opts.limit ?? 10;
   const candidates = synthesisCandidates(db, Math.min(limit, MAX_SCAN_PER_PASS));
+  const cap = Math.min(limit, remaining);
 
+  // ── build the batch (no LLM involved): thin candidates never reach the prompt ──
+  const items: SynthesisItem[] = [];
   for (const person of candidates) {
-    if (remaining <= 0 || summary.attempted >= limit) break;
-
+    if (items.length >= cap) break;
     const rows = synthesisContext(db, person.id);
     const seen = new Set<string>();
     const content = rows.filter((r) => isContent(r.body_summary, seen));
@@ -278,39 +345,58 @@ export async function synthesizeProfiles(
       summary.skippedThin++;
       continue;
     }
-
     const { head, bullets } = splitBio(person.bio);
-    const res = await llm.call(
-      "profile_synthesis",
-      "smart",
-      buildSynthesisPrompt({ ...person, headBio: head }, content),
-      { json: true, maxTokens: 500 }
-    );
-    summary.attempted++;
-    remaining--;
+    items.push({ n: items.length + 1, person: { ...person, headBio: head }, rows: content, bullets });
+  }
+  if (items.length === 0) {
+    summary.budgetLeft = Math.max(0, remaining);
+    return summary;
+  }
 
-    if (!res) {
-      summary.failed++;
-      logAttempt(db, person.id, SYNTHESIS_SOURCE, "fail", "llm returned null");
-      continue;
-    }
+  // ── ONE call for every person in the batch ────────────────────────────────
+  const res = await llm.call("profile_synthesis", "smart", buildSynthesisBatchPrompt(items), {
+    json: true,
+    maxTokens: Math.min(4000, 500 * items.length),
+  });
+  summary.attempted += items.length;
+  remaining -= items.length;
+  console.log(`enrich: synthesized ${items.length} profile(s) in 1 LLM call`);
 
-    let bio = "";
-    let rel = "";
+  let parsed: Map<number, Record<string, unknown>> | null = null;
+  let failDetail = "llm returned null";
+  if (res) {
     try {
-      const parsed = extractJson(res.text) as Record<string, unknown>;
-      bio = typeof parsed.bio === "string" ? parsed.bio.trim() : "";
-      rel = typeof parsed.relationship_summary === "string" ? parsed.relationship_summary.trim() : "";
+      parsed = byN(extractJson(res.text), items.length);
+      if (!parsed) failDetail = "unusable JSON shape";
     } catch {
+      failDetail = "unparseable JSON";
+    }
+  }
+  if (!parsed) {
+    // Whole-batch degrade: nothing is written, every person is logged as a failure.
+    for (const item of items) {
       summary.failed++;
-      logAttempt(db, person.id, SYNTHESIS_SOURCE, "fail", "unparseable JSON");
+      logAttempt(db, item.person.id, SYNTHESIS_SOURCE, "fail", failDetail);
+    }
+    summary.budgetLeft = Math.max(0, remaining);
+    return summary;
+  }
+
+  for (const item of items) {
+    const person = item.person;
+    const o = parsed.get(item.n);
+    if (!o) {
+      summary.failed++;
+      logAttempt(db, person.id, SYNTHESIS_SOURCE, "fail", "missing from batch response");
       continue;
     }
+    const bio = typeof o.bio === "string" ? o.bio.trim() : "";
+    const rel = typeof o.relationship_summary === "string" ? o.relationship_summary.trim() : "";
 
     // Fail-safe: empty output never overwrites a good record.
     const sets: string[] = [];
     const vals: unknown[] = [];
-    const newBio = bio ? composeBio(bio, bullets) : null;
+    const newBio = bio ? composeBio(bio, item.bullets) : null;
     if (newBio && newBio !== person.bio) {
       sets.push("bio = ?");
       vals.push(newBio);
@@ -424,43 +510,78 @@ export function miningCandidates(db: Db, now: Date, limit: number): MineCandidat
     .slice(0, limit);
 }
 
-/** The exact bio-mining prompt (ported from PersonalCRM2 lib/llm.ts). */
-export function buildMiningPrompt(
-  name: string,
-  head: string,
-  existingBullets: string[],
-  transcript: string
-): string {
-  return `You maintain a personal CRM. Below is a recent message/email history between the user and "${name}".
-Pull out only the few MOST NOTABLE, durable facts about ${name} — real ventures/companies, roles, research, concrete achievements, school, and major life events. Quality over quantity: a sparse, high-signal list is the goal.
+/** One numbered person in a mining batch. */
+export interface MiningItem {
+  n: number;
+  name: string;
+  head: string;
+  existingBullets: string[];
+  transcript: string;
+}
 
-HARD RULES — follow all of them:
+/**
+ * Transcript budget per person, so the batch prompt stays bounded by TRUNCATION rather
+ * than by dropping people. (The single-person original allowed 12000.)
+ */
+const MINING_TRANSCRIPT_CHARS = 6000;
+
+/** One person's block inside the batched mining prompt. */
+function miningEntry(item: MiningItem): string {
+  return `${item.n}. "${item.name}"
+ The user's existing bio for ${item.name} (for context — do NOT repeat what's already there):
+ """${item.head.slice(0, 800)}"""
+ Already-extracted facts for ${item.name} (KEEP the still-valid ones, MERGE in new ones, DROP duplicates and anything that now violates the rules above):
+${item.existingBullets.length ? item.existingBullets.map((b) => `- ${b}`).join("\n") : "(none yet)"}
+ Conversation with ${item.name} (most recent last):
+ """${item.transcript.slice(0, MINING_TRANSCRIPT_CHARS)}"""`;
+}
+
+/**
+ * The bio-mining prompt (ported from PersonalCRM2 lib/llm.ts) for a WHOLE batch — ONE
+ * call, whatever the person count. Every hard rule of the per-person original is intact;
+ * only the framing became "for each numbered person" and the reply became an array.
+ */
+export function buildMiningBatchPrompt(items: MiningItem[]): string {
+  return `You maintain a personal CRM. Below are recent message/email histories between the user and several people, numbered.
+For EACH numbered person, pull out only the few MOST NOTABLE, durable facts about THAT person — real ventures/companies, roles, research, concrete achievements, school, and major life events. Quality over quantity: a sparse, high-signal list is the goal. Never carry a fact from one person to another.
+
+HARD RULES — follow all of them, for every person:
 1. BE SELECTIVE. Aim for 1–4 facts; only output a 5th if it's genuinely significant. If nothing rises to that bar, return very few or none.
 2. DROP the vague/speculative: ideas they merely "want" or are "interested in" or "thinking about", and anything not actually happening yet.
 3. DROP the generic/low-value: "is a student", "lives in a dorm", "has a cofounder", "plays video games" — facts that are unremarkable or true of most people.
 4. MERGE related facts about the same thing into ONE bullet (e.g. "sourcing funding" + "company sells to solar farms" → "Sourcing funding for a company that sells to solar farms").
 5. BE TERSE. Each fact is a short phrase, NOT a sentence. Do NOT begin with the person's name or a pronoun (He/She/They) — start with a verb or noun. Cut filler ("secured a position" → "research at…", "is researching" → "researching").
 
-STRICTLY IGNORE: logistics/scheduling, smalltalk, greetings, the USER's own life, opinions about third parties, ephemeral chatter, and anything not clearly about ${name}.
+STRICTLY IGNORE: logistics/scheduling, smalltalk, greetings, the USER's own life, opinions about third parties, ephemeral chatter, and anything not clearly about the person whose entry you are writing.
 
-The user's existing bio (for context — do NOT repeat what's already there):
-"""${head.slice(0, 800)}"""
+PEOPLE:
+${items.map(miningEntry).join("\n\n")}
 
-Already-extracted facts (KEEP the still-valid ones, MERGE in new ones, DROP duplicates and anything that now violates the rules above):
-${existingBullets.length ? existingBullets.map((b) => `- ${b}`).join("\n") : "(none yet)"}
+Return STRICT JSON ONLY — no prose, no markdown fences — one object per person, using the SAME n:
+[{ "n": <number>, "facts": ["terse phrase, no leading pronoun", "..."] }]
+Do not invent anything not supported by the text. Only use n values from the list. If there is nothing notable for a person, repeat that person's already-extracted facts unchanged.`;
+}
 
-Conversation (most recent last):
-"""${transcript.slice(0, 12000)}"""
-
-Return STRICT JSON ONLY — no prose, no markdown fences — exactly:
-{ "facts": ["terse phrase, no leading pronoun", "..."] }
-Do not invent anything not supported by the text. If there is nothing notable, return {"facts": ${JSON.stringify(existingBullets)}}.`;
+/** Back-compatible single-person entry point: the same prompt as a one-item batch. */
+export function buildMiningPrompt(
+  name: string,
+  head: string,
+  existingBullets: string[],
+  transcript: string
+): string {
+  return buildMiningBatchPrompt([{ n: 1, name, head, existingBullets, transcript }]);
 }
 
 /**
  * Pass 2 — mine durable facts from recent conversation and append them to
  * person.bio under the "— From conversations —" marker. The user-authored head
  * is never touched.
+ *
+ * ONE smart-tier call for the whole batch. Budget and ledger semantics are unchanged:
+ * one enrichment_attempt row per person, so the daily cap still counts PEOPLE, and the
+ * MINING_SOURCE rows still drive the re-mine cadence. A null/unparseable response fails
+ * the whole batch (per-person `fail` rows, no bio touched); a person omitted from an
+ * otherwise-good array is failed individually and retried next run.
  */
 export async function mineBios(
   db: Db,
@@ -480,46 +601,74 @@ export async function mineBios(
 
   const limit = opts.limit ?? 5;
   const candidates = miningCandidates(db, now, MAX_SCAN_PER_PASS);
+  const cap = Math.min(limit, remaining);
 
+  // ── build the batch (no LLM involved): filler/tapbacks/automated messages and
+  //    thin conversations are dropped BEFORE the call is spent.
+  const items: MiningItem[] = [];
+  const meta: { person: MineCandidate; head: string; trimmed: boolean }[] = [];
   for (const person of candidates) {
-    if (remaining <= 0 || summary.attempted >= limit) break;
-
-    // Filler/tapbacks/automated messages are dropped BEFORE spending a call.
+    if (items.length >= cap) break;
     const conv = gatherConversation(db, person.id, now);
     if (conv.contentCount < MIN_CONTENT_MSGS) {
       summary.skippedThin++;
       continue;
     }
-
     const { head, bullets } = splitBio(person.bio);
-    const res = await llm.call(
-      "bio_mining",
-      "smart",
-      buildMiningPrompt(person.display_name, head, bullets, conv.transcript),
-      { json: true, maxTokens: 500 }
-    );
-    summary.attempted++;
-    remaining--;
+    items.push({
+      n: items.length + 1,
+      name: person.display_name,
+      head,
+      existingBullets: bullets,
+      transcript: conv.transcript,
+    });
+    meta.push({ person, head, trimmed: conv.trimmed });
+  }
+  if (items.length === 0) {
+    summary.budgetLeft = Math.max(0, remaining);
+    return summary;
+  }
 
-    if (!res) {
-      summary.failed++;
-      logAttempt(db, person.id, MINING_SOURCE, "fail", "llm returned null");
-      continue;
-    }
+  const res = await llm.call("bio_mining", "smart", buildMiningBatchPrompt(items), {
+    json: true,
+    maxTokens: Math.min(4000, 500 * items.length),
+  });
+  summary.attempted += items.length;
+  remaining -= items.length;
+  console.log(`enrich: mined ${items.length} bio(s) in 1 LLM call`);
 
-    let facts: string[];
+  let parsed: Map<number, Record<string, unknown>> | null = null;
+  let failDetail = "llm returned null";
+  if (res) {
     try {
-      const parsed = extractJson(res.text) as Record<string, unknown>;
-      const raw = Array.isArray(parsed.facts) ? parsed.facts : [];
-      facts = raw
-        .filter((f): f is string => typeof f === "string" && !!f.trim())
-        .map((f) => f.trim())
-        .slice(0, 5);
+      parsed = byN(extractJson(res.text), items.length);
+      if (!parsed) failDetail = "unusable JSON shape";
     } catch {
-      summary.failed++;
-      logAttempt(db, person.id, MINING_SOURCE, "fail", "unparseable JSON");
-      continue;
+      failDetail = "unparseable JSON";
     }
+  }
+  if (!parsed) {
+    for (const m of meta) {
+      summary.failed++;
+      logAttempt(db, m.person.id, MINING_SOURCE, "fail", failDetail);
+    }
+    summary.budgetLeft = Math.max(0, remaining);
+    return summary;
+  }
+
+  items.forEach((item, i) => {
+    const { person, head, trimmed } = meta[i];
+    const o = parsed!.get(item.n);
+    if (!o) {
+      summary.failed++;
+      logAttempt(db, person.id, MINING_SOURCE, "fail", "missing from batch response");
+      return;
+    }
+    const rawFacts = Array.isArray(o.facts) ? o.facts : [];
+    const facts = rawFacts
+      .filter((f): f is string => typeof f === "string" && !!f.trim())
+      .map((f) => f.trim())
+      .slice(0, 5);
 
     const newBio = composeBio(head, facts);
     const changed = newBio !== person.bio;
@@ -537,9 +686,9 @@ export async function mineBios(
       person.id,
       MINING_SOURCE,
       "success",
-      `${facts.length} fact${facts.length === 1 ? "" : "s"}${conv.trimmed ? " (transcript trimmed)" : ""}`
+      `${facts.length} fact${facts.length === 1 ? "" : "s"}${trimmed ? " (transcript trimmed)" : ""}`
     );
-  }
+  });
 
   summary.budgetLeft = Math.max(0, remaining);
   return summary;

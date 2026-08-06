@@ -5,8 +5,16 @@ import ContactDetail from "./relationships/ContactDetail.tsx";
 import Inbox from "./inbox/Stub.tsx";
 import Settings from "./settings/Settings.tsx";
 import ReviewModal from "./relationships/ReviewModal.tsx";
+import VoiceHud, { makeRecorder, sttMessage } from "./overlay/VoiceHud.tsx";
+
+// The recorder and the STT error copy live in VoiceHud.tsx so the floating overlay window
+// and the in-app CommandBar share one implementation with no import cycle. Re-exported
+// here because this is where they have always been imported from (tests/stt.test.ts).
+export { sttMessage };
 
 // Hash router: #/calendar · #/relationships[/contacts] · #/contact/:id · #/messaging · #/settings
+// Plus #/overlay, which is not navigable UI: it is the route main/index.ts loads into the
+// frameless always-on-top voice HUD window (see OVERLAY_ROUTE below).
 export function useRoute(): string {
   const [route, setRoute] = useState(window.location.hash || "#/calendar");
   useEffect(() => {
@@ -85,64 +93,6 @@ function Branch({ blooms }: { blooms: number }) {
   );
 }
 
-// Maps main/stt.ts's typed error codes ("whisper_missing", "no_audio: …", …) to
-// something the user can act on. Anything unrecognised falls through verbatim.
-export function sttMessage(error: string, hint?: string): string {
-  const code = error.split(":")[0].trim();
-  const detail = error.slice(code.length + 1).trim();
-  if (code === "whisper_missing")
-    return "Speech-to-text needs whisper.cpp. Install with: brew install whisper-cpp";
-  if (code === "model_download_failed")
-    return `Couldn't download the speech model${detail ? ` (${detail})` : ""}. Check your connection and try again.`;
-  if (code === "no_audio")
-    return `Nothing was recorded${detail ? ` — ${detail}` : ""}. ${hint ?? ""}`.trim();
-  if (code === "transcribe_failed")
-    return `Transcription failed${detail ? `: ${detail}` : ""}`;
-  return error;
-}
-
-// 16kHz mono WAV recorder for whisper.cpp
-function makeRecorder() {
-  let ctx: AudioContext, stream: MediaStream, proc: ScriptProcessorNode;
-  // `src` and `sink` are held in the closure on purpose: an unreferenced
-  // MediaStreamAudioSourceNode can be collected mid-recording and capture goes silent.
-  let src: MediaStreamAudioSourceNode, sink: GainNode;
-  let chunks: Float32Array[] = [];
-  return {
-    async start() {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      ctx = new AudioContext({ sampleRate: 16000 });
-      src = ctx.createMediaStreamSource(stream);
-      proc = ctx.createScriptProcessor(4096, 1, 1);
-      chunks = [];
-      proc.onaudioprocess = (e) => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-      // A ScriptProcessorNode only runs while it reaches the destination, but routing the
-      // mic straight to the speakers is a feedback loop — go through a muted gain node.
-      sink = ctx.createGain();
-      sink.gain.value = 0;
-      src.connect(proc); proc.connect(sink); sink.connect(ctx.destination);
-    },
-    stop(): Uint8Array {
-      proc.onaudioprocess = null;
-      src.disconnect(); proc.disconnect(); sink.disconnect();
-      stream.getTracks().forEach((t) => t.stop()); ctx.close();
-      const len = chunks.reduce((a, c) => a + c.length, 0);
-      const pcm = new Int16Array(len);
-      let o = 0;
-      for (const c of chunks) for (let i = 0; i < c.length; i++) pcm[o++] = Math.max(-32768, Math.min(32767, c[i] * 32767));
-      const buf = new ArrayBuffer(44 + pcm.length * 2);
-      const v = new DataView(buf);
-      const w = (off: number, str: string) => { for (let i = 0; i < str.length; i++) v.setUint8(off + i, str.charCodeAt(i)); };
-      w(0, "RIFF"); v.setUint32(4, 36 + pcm.length * 2, true); w(8, "WAVEfmt ");
-      v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-      v.setUint32(24, 16000, true); v.setUint32(28, 32000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-      w(36, "data"); v.setUint32(40, pcm.length * 2, true);
-      new Int16Array(buf, 44).set(pcm);
-      return new Uint8Array(buf);
-    },
-  };
-}
-
 // ── LLM health (main/llm/provider.ts llmHealth) ──────────────────────────────
 //
 // When the provider stops answering, nothing breaks — the app just silently swaps in its
@@ -218,6 +168,10 @@ function CommandBar() {
     const id = setInterval(() => setElapsed((Date.now() - t0) / 1000), 200);
     return () => clearInterval(id);
   }, [rec]);
+  // In-app shortcut, unchanged: a bare Shift+A while POS is focused. It stays bare
+  // precisely because it is scoped to this window — the system-wide equivalent is a
+  // chord (see main/index.ts), since a global bare Shift+A would eat every capital
+  // letter typed anywhere on the Mac.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = e.target as HTMLElement;
@@ -271,6 +225,12 @@ function CommandBar() {
       }
     }
   };
+  // No "pos:voice-capture" subscription here, on purpose. The system-wide hotkey no
+  // longer brings this window forward — it opens the floating HUD
+  // (renderer/src/overlay/VoiceHud.tsx) in its own non-activating window, and main sends
+  // the event only there. Reviving a listener in this window would mean the shortcut
+  // stole focus from whatever the owner was typing in, which is the behaviour it exists
+  // to avoid. The in-app Shift+A above is the way to reach this popup.
   const submit = async () => {
     if (!text.trim() || busy) return;
     setBusy(true);
@@ -461,8 +421,25 @@ function ProfileBadge() {
   );
 }
 
+/**
+ * The hash main/index.ts loads into the floating voice-HUD window. Same bundle, same
+ * preload, entirely different UI: no shell, no dock, no branch.
+ */
+export const OVERLAY_ROUTE = "#/overlay";
+
+/**
+ * Split in two so the overlay branch is a component boundary rather than an early return
+ * inside Shell — Shell's hooks (health polling, undo keybinding, the activity counter)
+ * must never run in the HUD window, and an early return past them would be a hook-order
+ * violation the moment the route changed.
+ */
 export default function App() {
   const route = useRoute();
+  if (route.startsWith(OVERLAY_ROUTE)) return <VoiceHud />;
+  return <Shell route={route} />;
+}
+
+function Shell({ route }: { route: string }) {
   const view = route.split("/")[1] ?? "calendar";
   const health = useLlmHealth();
   const aiDown = health != null && !health.ok;

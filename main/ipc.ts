@@ -119,11 +119,192 @@ import {
 } from "./webpanel.ts";
 import type { Rectangle } from "electron";
 
+// ── global hotkey (system-wide "start listening without leaving what I'm in") ──
+//
+// The registration itself lives in main/index.ts (it needs the HUD window and the
+// globalShortcut module); the *validation* lives here because this file imports
+// cleanly under `ELECTRON_RUN_AS_NODE=1` — nothing at module scope touches an
+// Electron object — so tests/hotkey.test.ts can exercise it without booting an app.
+// main/index.ts cannot be imported that way: it calls app.setPath() at module scope.
+
+/** `setting` table key holding the user's chosen accelerator. */
+export const GLOBAL_HOTKEY_KEY = "global_hotkey";
+
+/**
+ * Default global accelerator.
+ *
+ * The owner asked for Fn+Control. Fn is not bindable: Electron accelerators expose
+ * exactly four modifiers (Command, Control, Alt/Option, Shift), and the macOS APIs
+ * underneath — RegisterEventHotKey and NSEvent's modifier flags as Electron reads them
+ * — do not carry Fn as a hotkey modifier at all. (macOS itself treats Fn/Globe as a
+ * system key it reserves for emoji, dictation and F-key switching.) Seeing Fn press
+ * would mean a CGEventTap native module plus Accessibility permission for the whole
+ * app, which is a lot of machinery for one modifier.
+ *
+ * So: Control (which he did ask for) + Alt + Space. Space because it is the fastest key
+ * to hit blind; Alt in the chord because bare `Control+Space` is what macOS hands to
+ * input-source switching on most keyboards. Deliberately a real chord — a *global*
+ * bare `Shift+A` would fire on every capital A the owner types in every application on
+ * the Mac, and globalShortcut would happily register it. The in-app `Shift+A` in
+ * renderer/src/App.tsx keeps needing no modifier — it only listens while POS is focused.
+ */
+export const DEFAULT_GLOBAL_HOTKEY = "Control+Alt+Space";
+
+/** What `hotkey.get` / `hotkey.set` report. `registered: false` always carries an `error`. */
+export interface HotkeyState {
+  accelerator: string;
+  registered: boolean;
+  error?: string;
+}
+
+export type AcceleratorCheck =
+  | { ok: true; accelerator: string }
+  | { ok: false; error: string };
+
+// Electron accelerator modifiers, lowercased → canonical spelling.
+const MODIFIERS: Record<string, string> = {
+  command: "Command",
+  cmd: "Command",
+  control: "Control",
+  ctrl: "Control",
+  commandorcontrol: "CommandOrControl",
+  cmdorctrl: "CommandOrControl",
+  alt: "Alt",
+  option: "Option",
+  altgr: "AltGr",
+  shift: "Shift",
+  super: "Super",
+  meta: "Meta",
+};
+
+// Electron accelerator key codes. Single characters are handled separately.
+const NAMED_KEYS = [
+  "Plus", "Space", "Tab", "Capslock", "Numlock", "Scrolllock", "Backspace",
+  "Delete", "Insert", "Return", "Enter", "Up", "Down", "Left", "Right",
+  "Home", "End", "PageUp", "PageDown", "Escape", "Esc",
+  "VolumeUp", "VolumeDown", "VolumeMute",
+  "MediaNextTrack", "MediaPreviousTrack", "MediaStop", "MediaPlayPause",
+  "PrintScreen", "numdec", "numadd", "numsub", "nummult", "numdiv",
+  ...Array.from({ length: 24 }, (_, i) => `F${i + 1}`),
+  ...Array.from({ length: 10 }, (_, i) => `num${i}`),
+];
+const KEY_BY_LOWER = new Map(NAMED_KEYS.map((k) => [k.toLowerCase(), k]));
+
+// The punctuation Electron accepts as a single-character key code.
+const PUNCTUATION = new Set(`)!@#$%^&*(:;+=<,_->.?/~\`{]|[}"'\\`.split(""));
+
+// Fn (the Globe key on recent Macs) is the one thing the owner asked for that cannot
+// be given. It is not an Electron accelerator modifier, and macOS does not deliver it
+// as a modifier to the hotkey APIs Electron registers against — it is a hardware-level
+// key the system reserves. Named separately from the generic "not a modifier" branch
+// so Settings can say *why* rather than just listing the four that do work.
+const FN_ALIASES = new Set(["fn", "function", "globe", "fnkey", "fn-key"]);
+const FN_ERROR =
+  "Fn (the Globe key) can't be used as a shortcut modifier on macOS — the system keeps it " +
+  "for itself and never reports it to apps. Use Control, Option, Command or Shift instead — " +
+  "the default Control+Alt+Space keeps the Control you wanted.";
+
+/**
+ * Pure accelerator check for the *global* shortcut, and the only place the "Shift is
+ * not a modifier on its own" rule lives. Returns the canonically-spelled accelerator
+ * (case and spacing normalized, `CmdOrCtrl` → `CommandOrControl`) or a message written
+ * for the Settings row.
+ *
+ * Rejects: empty/whitespace, Fn in any position, no modifier at all, Shift as the only
+ * modifier, a modifier in the key position, and key names Electron does not know.
+ */
+export function validateAccelerator(input: string): AcceleratorCheck {
+  const raw = (input ?? "").trim();
+  if (!raw) return { ok: false, error: `Enter a shortcut — for example ${DEFAULT_GLOBAL_HOTKEY}.` };
+
+  const parts = raw.split("+").map((p) => p.trim());
+  if (parts.some((p) => p === "")) {
+    return { ok: false, error: `"${raw}" has an empty part — write the plus key as "Plus".` };
+  }
+
+  // Checked across every position: "Fn+Control" puts it in the modifier slot,
+  // "Control+Fn" in the key slot, and both deserve the explanation rather than
+  // the generic "not a modifier" / "not a key macOS knows".
+  if (parts.some((p) => FN_ALIASES.has(p.toLowerCase()))) return { ok: false, error: FN_ERROR };
+
+  const keyPart = parts[parts.length - 1];
+  const modParts = parts.slice(0, -1);
+
+  const mods: string[] = [];
+  for (const m of modParts) {
+    const canon = MODIFIERS[m.toLowerCase()];
+    if (!canon) {
+      return { ok: false, error: `"${m}" is not a modifier — use Command, Control, CommandOrControl, Alt, Option or Shift.` };
+    }
+    mods.push(canon);
+  }
+
+  if (mods.length === 0) {
+    return {
+      ok: false,
+      error: `"${raw}" has no modifier — a bare key registered system-wide would fire in every app you type in. Add Command, Control or Alt.`,
+    };
+  }
+  if (mods.every((m) => m === "Shift")) {
+    return {
+      ok: false,
+      error: "Shift alone is not a safe global modifier — it would intercept every capital letter you type. Add Command, Control or Alt.",
+    };
+  }
+
+  // A modifier in the key position ("CommandOrControl+Shift") is not a shortcut.
+  if (MODIFIERS[keyPart.toLowerCase()]) {
+    return { ok: false, error: `"${keyPart}" is a modifier, not a key — finish the shortcut with a letter, number or named key.` };
+  }
+
+  let key: string;
+  const named = KEY_BY_LOWER.get(keyPart.toLowerCase());
+  if (named) {
+    key = named;
+  } else if (keyPart.length === 1 && /[a-z0-9]/i.test(keyPart)) {
+    key = keyPart.toUpperCase();
+  } else if (keyPart.length === 1 && PUNCTUATION.has(keyPart)) {
+    key = keyPart;
+  } else {
+    return {
+      ok: false,
+      error: `"${keyPart}" isn't a key macOS knows — use a letter, a number, or a name like Space, Return or F5.`,
+    };
+  }
+
+  return { ok: true, accelerator: [...mods, key].join("+") };
+}
+
 export interface IpcDeps {
   db: Db;
   secrets: SecretStore;
   doctrineDir: string;
   llm: () => LlmClient | null; // re-evaluated per call so newly-entered keys take effect
+  /**
+   * Live global-shortcut registration, owned by main/index.ts (it holds the window and
+   * the globalShortcut module). `set` re-registers; persistence stays here so the
+   * setting is only written for an accelerator that actually took.
+   */
+  hotkey: {
+    get: () => HotkeyState;
+    set: (accelerator: string) => HotkeyState;
+  };
+  /**
+   * The floating voice HUD, owned by main/index.ts. The renderer reports when its
+   * capture ended so main can hide the window at the right moment — the HUD cannot
+   * hide itself without main, and main cannot know when the result has been on screen
+   * long enough to read.
+   */
+  hud: {
+    result: (payload: HudResult) => void;
+  };
+}
+
+/** What the HUD renderer reports back through `hud.result`. */
+export interface HudResult {
+  status: "done" | "cancelled" | "error";
+  text?: string;
+  reply?: string;
 }
 
 export function registerIpc(deps: IpcDeps) {
@@ -574,6 +755,26 @@ export function registerIpc(deps: IpcDeps) {
   });
   h("settings.get", (key: string) => getSetting(db, key));
   h("settings.set", (key: string, value: string) => setSetting(db, key, value));
+
+  // ── global hotkey ──
+  // get() reports what main/index.ts actually managed to register at startup, including
+  // the failure — a shortcut another app already owns must be visible in Settings, not
+  // silently dead. set() validates first (so a Shift-only chord never reaches
+  // globalShortcut), re-registers, and only persists once registration succeeded.
+  h("hotkey.get", (): HotkeyState => deps.hotkey.get());
+  h("hotkey.set", (accelerator: string): HotkeyState => {
+    const v = validateAccelerator(accelerator ?? "");
+    if (!v.ok) return { accelerator: (accelerator ?? "").trim(), registered: false, error: v.error };
+    const state = deps.hotkey.set(v.accelerator);
+    if (state.registered) setSetting(db, GLOBAL_HOTKEY_KEY, state.accelerator);
+    return state;
+  });
+  // The floating HUD saying "I'm finished — put me away". Sent after the result has
+  // been readable for a beat, or immediately on Escape/click-to-cancel.
+  h("hud.result", (payload: HudResult) => {
+    deps.hud.result(payload ?? { status: "cancelled" });
+    return { hidden: true };
+  });
   h("stt.transcribe", (wav: Uint8Array) => transcribe(doctrineDir, wav));
   // ── docked in-app web panels (main/webpanel.ts) ──
   // Snapchat and Instagram DMs exist only on the web; these dock the real site in

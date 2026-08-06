@@ -43,6 +43,28 @@ export interface GoogleScopeStatus {
   canWrite: boolean;
 }
 
+/**
+ * `hotkey.get` / `hotkey.set` (main/index.ts globalShortcut, validated in main/ipc.ts).
+ * `registered: false` always carries an `error` — a shortcut another app already owns,
+ * one whose only modifier is Shift, or one using Fn (which macOS never reports to apps),
+ * must be visible rather than silently inert.
+ */
+export interface HotkeyState {
+  accelerator: string;
+  registered: boolean;
+  error?: string;
+}
+
+/**
+ * `hud.result`: the floating voice HUD telling main its capture is over. "cancelled" is
+ * Escape or a click on the HUD — nothing was sent to the assistant.
+ */
+export interface HudResult {
+  status: "done" | "cancelled" | "error";
+  text?: string;
+  reply?: string;
+}
+
 /** A rect in CSS pixels, relative to the window's content area (main/webpanel.ts). */
 export interface PanelBounds {
   x: number;
@@ -101,6 +123,18 @@ declare global {
         keys: Call; setKey: Call; doctrineGet: Call; doctrineSet: Call;
         spend: Call; setCeiling: Call; get: Call; set: Call;
       };
+      /**
+       * The system-wide accelerator that opens the floating listener HUD with the mic
+       * live — without bringing POS forward or taking keyboard focus.
+       */
+      hotkey: { get: Call<HotkeyState>; set: Call<HotkeyState> };
+      /** HUD-only: "my capture is over, hide me". See HudResult. */
+      hud: { result: Call<{ hidden: boolean }> };
+      /**
+       * Fired when that accelerator is pressed, from any app. Delivered to the HUD
+       * window, which treats each one as a toggle. Returns its unsubscribe.
+       */
+      onVoiceCapture: (cb: () => void) => () => void;
       /** Provider reachability — see LlmHealth above. */
       llm: { health: Call<LlmHealth> };
       msgplans: { run: Call; list: Call };

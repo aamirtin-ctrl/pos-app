@@ -78,6 +78,7 @@ export default function Settings() {
     <div className="p-6 max-w-2xl mx-auto">
       <div className="drag-region h-4" />
       <h1 className="font-display text-2xl font-semibold mb-5 no-drag">Settings</h1>
+      <GlobalShortcut />
       <Integrations />
       <AboutYou />
       <Preferences />
@@ -85,6 +86,201 @@ export default function Settings() {
       <Doctrine />
       <Adherence />
     </div>
+  );
+}
+
+// ── a0. Global shortcut ──────────────────────────────────────────────────────
+//
+// The system-wide chord that opens the floating voice HUD with the mic already
+// recording (main/index.ts globalShortcut → "pos:voice-capture" → overlay/VoiceHud.tsx).
+// It is a *chord* on purpose: registered globally, a bare Shift+A would fire on every
+// capital letter the owner typed in every other app. main/ipc.ts validateAccelerator
+// refuses anything whose only modifier is Shift, and the register-time refusal (some
+// other app already owns the chord) comes back here rather than failing silently.
+
+type HotkeyState = { accelerator: string; registered: boolean; error?: string };
+
+/** How the accelerator reads on a Mac keyboard: CommandOrControl+Shift+A → ⌘⇧A. */
+function prettyAccelerator(acc: string): string {
+  const glyph: Record<string, string> = {
+    commandorcontrol: "⌘", cmdorctrl: "⌘", command: "⌘", cmd: "⌘", meta: "⌘", super: "⌘",
+    control: "⌃", ctrl: "⌃", alt: "⌥", option: "⌥", shift: "⇧",
+  };
+  return acc
+    .split("+")
+    .map((p) => glyph[p.trim().toLowerCase()] ?? p.trim())
+    .join("");
+}
+
+/**
+ * Turn a real key press into an Electron accelerator string. Reads `code` rather than
+ * `key` for letters and digits: on macOS, Alt+V reports key "√", and holding Shift
+ * reports "A" for the same physical key either way.
+ */
+function acceleratorFromEvent(e: React.KeyboardEvent): string | null {
+  if (["Meta", "Control", "Alt", "Shift", "CapsLock"].includes(e.key)) return null; // still mid-chord
+  const mods: string[] = [];
+  // CommandOrControl rather than Command: the same setting then means the obvious thing
+  // if this ever runs anywhere but macOS.
+  if (e.metaKey || e.ctrlKey) mods.push("CommandOrControl");
+  if (e.altKey) mods.push("Alt");
+  if (e.shiftKey) mods.push("Shift");
+
+  const NAMED: Record<string, string> = {
+    Escape: "Escape", Enter: "Return", Tab: "Tab", Backspace: "Backspace", Delete: "Delete",
+    ArrowUp: "Up", ArrowDown: "Down", ArrowLeft: "Left", ArrowRight: "Right",
+    Home: "Home", End: "End", PageUp: "PageUp", PageDown: "PageDown", Insert: "Insert", " ": "Space",
+  };
+  let key: string;
+  const letter = /^Key([A-Z])$/.exec(e.code);
+  const digit = /^Digit([0-9])$/.exec(e.code);
+  if (letter) key = letter[1];
+  else if (digit) key = digit[1];
+  else if (/^F\d{1,2}$/.test(e.key)) key = e.key;
+  else if (NAMED[e.key]) key = NAMED[e.key];
+  else if (e.key.length === 1) key = e.key.toUpperCase();
+  else return null;
+
+  return [...mods, key].join("+");
+}
+
+function GlobalShortcut() {
+  const [state, setState] = useState<HotkeyState | null>(null);
+  const [draft, setDraft] = useState("");
+  const [capturing, setCapturing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    const r = await window.pos.hotkey.get();
+    if (!r.ok) {
+      setError(r.error ?? "Couldn't read the current shortcut.");
+      return;
+    }
+    // Main is the single source of truth for which chord ships as the default —
+    // the renderer never hardcodes it, so changing it there changes it everywhere.
+    const s = (r.data as HotkeyState | undefined) ?? {
+      accelerator: "",
+      registered: false,
+      error: "Main didn't report a shortcut.",
+    };
+    setState(s);
+    setDraft(s.accelerator);
+    setError(s.registered ? null : (s.error ?? null));
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const save = async (accelerator: string) => {
+    if (busy || !accelerator.trim()) return;
+    setBusy(true);
+    const r = await window.pos.hotkey.set(accelerator.trim());
+    setBusy(false);
+    if (!r.ok) { setError(r.error ?? "Couldn't set that shortcut."); return; }
+    const s = r.data as HotkeyState;
+    // A rejected accelerator leaves the live one alone — keep showing what is registered.
+    if (s.registered) { setState(s); setDraft(s.accelerator); setError(null); }
+    else { setDraft(s.accelerator); setError(s.error ?? "That shortcut couldn't be registered."); }
+  };
+
+  const onCaptureKey = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    e.preventDefault();
+    const acc = acceleratorFromEvent(e);
+    if (!acc) return;
+    setDraft(acc);
+    setCapturing(false);
+    setError(null);
+    e.currentTarget.blur();
+  };
+
+  const dirty = !!state && draft.trim() !== state.accelerator;
+
+  return (
+    <Section title="Global shortcut">
+      <p className="text-[12px] mb-3" style={{ color: "var(--muted)" }}>
+        Press this from any app. A small listener panel floats in above whatever you are
+        working in and starts recording immediately — <b>POS does not come to the front and
+        your keyboard focus does not move</b>, so you can keep typing where you were. Press
+        it again to stop; it transcribes, does the thing, tells you what it did, and
+        disappears. Escape or a click on the panel cancels without sending.
+      </p>
+      {state == null ? (
+        <p className="text-sm" style={{ color: "var(--muted)" }}>Loading…</p>
+      ) : (
+        <div className="rounded-2xl border p-3" style={{ borderColor: "var(--line)" }}>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span
+              className="px-2.5 py-1 rounded-lg border text-sm tabular-nums"
+              style={{ borderColor: "var(--line)", background: "var(--accent-soft)", color: "var(--ink)" }}
+              title={state.accelerator}
+            >
+              {prettyAccelerator(state.accelerator)}
+            </span>
+            <span
+              className="text-[11px] px-2 py-0.5 rounded-full border"
+              style={
+                state.registered
+                  ? { borderColor: "transparent", background: "var(--accent-soft)", color: "var(--ink)" }
+                  : { borderColor: "var(--danger)", color: "var(--danger)" }
+              }
+            >
+              {state.registered ? "Active system-wide" : "Not registered"}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-1.5 mt-2.5 flex-wrap">
+            <input
+              readOnly
+              value={capturing ? "Press the keys…" : draft}
+              onFocus={() => setCapturing(true)}
+              onBlur={() => setCapturing(false)}
+              onKeyDown={onCaptureKey}
+              placeholder="Click, then press a chord"
+              className="w-64 border rounded-lg px-2 py-1 text-sm cursor-pointer"
+              style={{
+                borderColor: capturing ? "var(--accent)" : "var(--line)",
+                color: capturing ? "var(--muted)" : "var(--ink)",
+              }}
+            />
+            <button
+              onClick={() => save(draft)}
+              disabled={busy || !dirty}
+              className="px-2.5 py-1 rounded-lg text-[12px] text-white disabled:opacity-50 active:scale-95"
+              style={{ background: "var(--accent)" }}
+            >
+              {busy ? "Saving…" : "Save"}
+            </button>
+            <button
+              onClick={() => { setDraft(state.accelerator); setError(state.registered ? null : (state.error ?? null)); }}
+              disabled={busy || !dirty}
+              className="px-2.5 py-1 rounded-lg border text-[12px] bg-white disabled:opacity-50 active:scale-95"
+              style={{ borderColor: "var(--line)", color: "var(--muted)" }}
+            >
+              Cancel
+            </button>
+          </div>
+
+          {error && (
+            <p className="text-[12px] mt-2" style={{ color: "var(--danger)" }}>{error}</p>
+          )}
+
+          <p className="text-[11px] mt-2 leading-relaxed" style={{ color: "var(--muted)" }}>
+            <b>Fn cannot be used as a shortcut modifier on macOS — use Control, Option,
+            Command or Shift combinations.</b> The Fn/Globe key is held by the system for
+            emoji, dictation and F-key switching; it is never reported to apps as a
+            modifier, so no app can bind it (POS would need a low-level input tap and
+            Accessibility access across your whole Mac to see it at all). The default,
+            Control+Option+Space, keeps the Control you wanted and avoids Control+Space,
+            which macOS usually gives to input-source switching.
+          </p>
+          <p className="text-[11px] mt-1.5 leading-relaxed" style={{ color: "var(--muted)" }}>
+            Needs a real chord. Shift on its own is not a safe global modifier — it would
+            intercept every capital letter you type in every app — so Command, Control or
+            Alt has to be in there. Inside POS, plain <b>Shift+A</b> still opens the command
+            box as it always has; this shortcut is only for reaching it from somewhere else.
+          </p>
+        </div>
+      )}
+    </Section>
   );
 }
 

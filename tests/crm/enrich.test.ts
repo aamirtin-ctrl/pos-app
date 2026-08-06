@@ -271,23 +271,28 @@ describe("synthesizeProfiles", () => {
     expect(splitBio(personRow(p).bio)).toEqual({ head: "New head.", bullets: ["Raising a seed round."] });
   });
 
-  it("respects the daily budget: no calls past the cap", async () => {
+  it("respects the daily budget: the batch is charged as its constituent people", async () => {
     for (const name of ["A", "B", "C"]) seedConversation(addPerson(name));
-    const llm = fakeLlm(() => ({ bio: "Synthesized.", relationship_summary: "Summary." }));
+    // Batched reply shape: one object per numbered person, in ONE call.
+    const llm = fakeLlm(() => [
+      { n: 1, bio: "Synthesized.", relationship_summary: "Summary." },
+      { n: 2, bio: "Synthesized.", relationship_summary: "Summary." },
+    ]);
 
     const first = await synthesizeProfiles(db, llm, { budget: 2 });
     expect(first).toMatchObject({ attempted: 2, updated: 2, budgetLeft: 0 });
-    expect(llm.calls).toHaveLength(2);
+    expect(llm.calls).toHaveLength(1); // TWO people, ONE request
 
-    // Budget is counted from today's ledger rows, so a second pass adds nothing.
+    // Budget is counted from today's ledger rows (one per person), so a second pass adds nothing.
     const second = await synthesizeProfiles(db, llm, { budget: 2 });
     expect(second).toMatchObject({ attempted: 0, budgetLeft: 0 });
-    expect(llm.calls).toHaveLength(2);
+    expect(llm.calls).toHaveLength(1);
     expect(ledger(SYNTHESIS_SOURCE)).toHaveLength(2);
 
-    // Raising the cap lets the third person through.
+    // Raising the cap lets the third person through — one more batch, one more call.
     const third = await synthesizeProfiles(db, llm, { budget: 3 });
     expect(third).toMatchObject({ attempted: 1 });
+    expect(llm.calls).toHaveLength(2);
     expect(ledger(SYNTHESIS_SOURCE)).toHaveLength(3);
   });
 
@@ -375,14 +380,17 @@ describe("mineBios", () => {
     expect(splitBio(personRow(p).bio).bullets).toEqual(["First fact."]);
   });
 
-  it("respects the daily budget: no calls past the cap", async () => {
+  it("respects the daily budget: the batch is charged as its constituent people", async () => {
     for (const name of ["A", "B", "C"]) seedConversation(addPerson(name));
-    const llm = fakeLlm(() => ({ facts: ["A durable fact."] }));
+    const llm = fakeLlm(() => [
+      { n: 1, facts: ["A durable fact."] },
+      { n: 2, facts: ["A durable fact."] },
+    ]);
 
     expect(await mineBios(db, llm, { budget: 2 })).toMatchObject({ attempted: 2, mined: 2, budgetLeft: 0 });
-    expect(llm.calls).toHaveLength(2);
+    expect(llm.calls).toHaveLength(1); // TWO people, ONE request
     expect(await mineBios(db, llm, { budget: 2 })).toMatchObject({ attempted: 0 });
-    expect(llm.calls).toHaveLength(2);
+    expect(llm.calls).toHaveLength(1);
     expect(ledger(MINING_SOURCE)).toHaveLength(2);
   });
 

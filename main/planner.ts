@@ -16,6 +16,8 @@ import {
   inferFlexibility,
   pushPlan,
   pushTasks,
+  persistDayCache,
+  readDayCache,
   type GcalPushDeps,
   type MergeableGoogleAnchor,
   type MergeableAppleEvent,
@@ -80,14 +82,27 @@ export function listTasks(db: Db, dateISO: string) {
  * Each anchor carries the `flexibility` inferred at its source (gcal/sync.inferFlexibility).
  * Anything that declares no tier defaults to `fixed` inside the engine, so a source that
  * has not been taught about flexibility still behaves as it always did.
+ *
+ * Every source is best-effort — a dead feed or a revoked permission must never break
+ * planning — but "best-effort" and "there is nothing on the calendar" are indistinguishable
+ * in the return value, and one of them means the opposite of the other. Pass `problems` to
+ * learn which happened: it collects one message per source that failed. The re-plan path
+ * uses it to refuse to treat an unreachable Google as "he deleted everything".
  */
-export async function externalAnchors(db: Db, secrets: SecretStore, dateISO: string): Promise<Anchor[]> {
+export async function externalAnchors(
+  db: Db,
+  secrets: SecretStore,
+  dateISO: string,
+  problems?: string[]
+): Promise<Anchor[]> {
   const googleAnchors: MergeableGoogleAnchor[] = [];
   if (isGoogleConnected(secrets)) {
     try {
       googleAnchors.push(...(await readAnchors(db, secrets, dateISO)));
     } catch (e) {
-      console.warn(`gcal anchors unavailable: ${(e as Error).message}`);
+      const msg = `gcal anchors unavailable: ${(e as Error).message}`;
+      console.warn(msg);
+      problems?.push(msg);
     }
   }
 
@@ -110,7 +125,9 @@ export async function externalAnchors(db: Db, secrets: SecretStore, dateISO: str
       });
     }
   } catch (e) {
-    console.warn(`apple calendar anchors unavailable: ${(e as Error).message}`);
+    const msg = `apple calendar anchors unavailable: ${(e as Error).message}`;
+    console.warn(msg);
+    problems?.push(msg);
   }
 
   // Subscribed webcal/ICS feeds anchor the day too. Same shape as Apple events —
@@ -131,7 +148,9 @@ export async function externalAnchors(db: Db, secrets: SecretStore, dateISO: str
       });
     }
   } catch (e) {
-    console.warn(`ics anchors unavailable: ${(e as Error).message}`);
+    const msg = `ics anchors unavailable: ${(e as Error).message}`;
+    console.warn(msg);
+    problems?.push(msg);
   }
 
   // One event living in two systems must block the day exactly once. The join is the
@@ -152,7 +171,8 @@ export async function generatePlan(
   doctrineDir: string,
   secrets: SecretStore,
   llm: LlmClient | null,
-  dateISO: string
+  dateISO: string,
+  deps?: ReplanDeps
 ) {
   const stored: Doctrine = loadDoctrine(doctrineDir);
 
@@ -170,8 +190,16 @@ export async function generatePlan(
       ? stored
       : { ...stored, chronotype: { ...stored.chronotype, wake_time: wakeTime } };
 
-  // anchors: external GCal events + locked blocks from prior plans for this date
-  const anchors: Anchor[] = await externalAnchors(db, secrets, dateISO);
+  // anchors: external GCal events + locked blocks from prior plans for this date.
+  // `deps.anchors` exists so the re-plan path (and its tests) can hand the SAME anchor set
+  // to the check and to the regeneration it triggers — reading the calendar twice could
+  // otherwise re-plan the day around an event the new plan never sees.
+  const anchors: Anchor[] = await readExternal(db, secrets, dateISO, deps);
+
+  // What the day looked like OUTSIDE this app at generation time. Stored below so the
+  // re-plan sweep can tell "the calendar changed since this plan was made" from "the
+  // calendar is exactly what this plan was already built around" — see anchorFingerprint.
+  const externalFingerprint = anchorFingerprint(anchors);
 
   const lockedRows = db
     .prepare("SELECT block_type, title, starts_at, ends_at FROM block WHERE is_locked = 1 AND date(starts_at) = ?")
@@ -232,6 +260,7 @@ export async function generatePlan(
         b.flexibility ?? (b.isAnchor ? "fixed" : "flexible"));
     }
     db.prepare("UPDATE task SET status = 'planned' WHERE plan_date = ? AND status = 'inbox'").run(dateISO);
+    persistDayCache(db, ANCHOR_FINGERPRINT_PREFIX, dateISO, JSON.stringify(externalFingerprint));
     return planId;
   });
   const planId = persist();
@@ -251,115 +280,401 @@ export function getPlan(db: Db, dateISO: string, planId?: number) {
   return { plan, blocks, unplaced: JSON.parse((plan.unplaced_tasks as string) ?? "[]") };
 }
 
-// ── re-solve when a new external obligation lands on an accepted day ─────────
+// ── re-solve when the calendar moves under a plan ────────────────────────────
 //
 // Owner ask 2026-08-05: "Sometimes I add Google Calendar events after the fact — typically
 // that means it's something I have to go to, and my calendar should adjust around it."
 //
-// The accepted plan is a commitment, not a draft, so this is deliberately narrow: ONLY a
-// `fixed` anchor that (a) the plan does not already know about and (b) actually lands on
-// top of a placed block triggers a regeneration. A `preferred` event appearing does not —
-// the solver can already bend around it, and re-planning an accepted day is a disruption
-// the owner has to re-read.
+// The miss that rewrote this section (2026-08-06, verified in his DB): he added a three-hour
+// "hangout" at 16:00–19:00 in Google AFTER that day's plan was generated, and a focused_work
+// block stayed sitting at 17:15–18:30 inside it. Four separate reasons, all fixed here:
+//
+//   1. the check only ever ran for TODAY, and he plans days ahead     → replanUpcoming()
+//   2. it only guarded ACCEPTED plans                                 → see `accepted` below
+//   3. a `preferred` event could never trigger anything               → PREFERRED_OVERLAP_MIN
+//   4. a DELETED event freed time and nothing noticed                 → freedByRemovedAnchors
+//
+// The governing distinction is ACCEPTANCE, and it now sets the THRESHOLD rather than
+// eligibility. An un-accepted plan is a draft he has not read: re-solving it costs him
+// nothing, so any new external event that lands on it re-solves it eagerly. An accepted plan
+// is a commitment he has read, so it takes a real conflict to rewrite it — a `fixed`
+// obligation, or an event of any tier that sits on a working block for at least half an hour.
+
+/** How much of a placed block a non-`fixed` event must cover to disturb an ACCEPTED plan. */
+export const PREFERRED_OVERLAP_MIN = 30;
+
+/** How much time a vanished obligation must free to disturb an ACCEPTED plan. */
+export const FREED_SPAN_MIN = 45;
+
+/** Days the sweep looks at, counting today. He plans ahead; a conflict on Thursday is real. */
+export const REPLAN_HORIZON_DAYS = 3;
+
+/** Setting prefix holding the external anchor set each date's plan was generated against. */
+export const ANCHOR_FINGERPRINT_PREFIX = "plan_anchors_fp:";
+
+/**
+ * Injection seam for the re-plan path. `anchors` replaces the live calendar read, which is
+ * what makes every decision below testable without a network — and, in production, what
+ * makes the check and the regeneration it triggers agree on one view of the day.
+ */
+export interface ReplanDeps {
+  anchors?: (dateISO: string) => Promise<Anchor[]>;
+}
+
+/** Live external anchors for a date, honoring an injected reader. */
+async function readExternal(
+  db: Db,
+  secrets: SecretStore,
+  dateISO: string,
+  deps?: ReplanDeps,
+  problems?: string[]
+): Promise<Anchor[]> {
+  if (deps?.anchors) return deps.anchors(dateISO);
+  return externalAnchors(db, secrets, dateISO, problems);
+}
+
+/**
+ * A stable, order-independent summary of an external anchor set. Two reads of an unchanged
+ * calendar produce the same string; any add, delete, move or rename produces a different one.
+ *
+ * This is the STRUCTURAL guarantee that the re-plan cannot loop. The semantic checks below
+ * already settle on their own (after a re-solve the new obligation is part of the plan, so
+ * nothing reads as new), but they settle by argument, and the argument has edges — a
+ * `preferred` anchor the solver could not find room for is absent from the plan it just
+ * produced. Recording what the plan was built against turns "it should stop" into "it cannot
+ * run twice for the same calendar".
+ */
+export function anchorFingerprint(anchors: readonly Anchor[]): string[] {
+  return anchors
+    .map((a) => `${a.startMin}|${a.endMin}|${a.flexibility ?? "fixed"}|${a.title.trim()}`)
+    .sort();
+}
 
 export interface ReplanResult {
   /** True when the plan was regenerated. */
   replanned: boolean;
-  /** Titles of the placed blocks the new obligation landed on, sorted, deduped. */
+  /** Titles of the placed blocks the new event landed on, sorted, deduped. */
   displaced: string[];
+  /** Titles of external anchors that DISAPPEARED and freed the time, sorted. */
+  freed: string[];
 }
 
-/** One block of an accepted plan, reduced to what the conflict scan needs. */
+/** One block of a plan, reduced to what the conflict scan needs. */
 export interface PlannedSpan {
   title: string;
   startMin: number;
   endMin: number;
   isAnchor: boolean;
+  /** The owner pinned this placement (or this exact span) himself. */
   isLocked: boolean;
+  /** The block carries a `gcal_event_id` — it is certainly an external calendar event. */
+  isExternal?: boolean;
 }
 
+/** How hard it is to justify disturbing this plan. */
+export interface ConflictOptions {
+  /** Has the owner read and accepted this plan? Un-accepted drafts re-solve freely. */
+  accepted: boolean;
+  /** Override for PREFERRED_OVERLAP_MIN. */
+  minPreferredOverlapMin?: number;
+  /** Override for FREED_SPAN_MIN. */
+  minFreedSpanMin?: number;
+}
+
+const norm = (title: string) => title.trim().toLowerCase();
+const overlapMinutes = (
+  a: { startMin: number; endMin: number },
+  b: { startMin: number; endMin: number }
+) => Math.min(a.endMin, b.endMin) - Math.max(a.startMin, b.startMin);
+
 /**
- * The pure core of `replanIfConflicted`: which placed blocks does a newly-appeared `fixed`
- * anchor land on? Separated from the I/O so the decision to disturb an accepted day is
- * testable without a calendar, a network or a database.
+ * Which placed blocks does a newly-appeared external event land on? Pure — the decision to
+ * disturb a day is testable without a calendar, a network or a database.
  *
- * "Newly appeared" = no anchor block in the plan with the same span AND title. A
- * rescheduled event fails that test deliberately: an obligation that moved is a new
- * obligation as far as the day is concerned.
+ * What counts as "newly appeared" depends on the tier, because the tiers differ in whether
+ * the SOLVER is allowed to move them:
  *
- * `is_locked` blocks are excluded from the scan. Re-planning cannot move them (generatePlan
- * re-reads them as anchors), so counting one as displaced would re-plan the day on every
- * tick, forever, and never resolve.
+ *   fixed     — matched by span AND title. The solver never moves a fixed anchor, so a plan
+ *               holding it at a different time means the event was rescheduled, and a
+ *               rescheduled obligation is a new obligation as far as the day is concerned.
+ *   preferred — matched by TITLE alone. The solver may displace a preferred anchor to seat
+ *               something else, so a span mismatch proves nothing; requiring one would make
+ *               every displaced block look new again on the next pass, forever.
+ *   flexible  — never triggers. Those minutes are POS's own output pushed back to Google;
+ *               treating them as an external event would have the app re-planning around
+ *               itself.
+ *
+ * Thresholds, per the acceptance rule at the top of this section:
+ *
+ *   un-accepted plan — ANY overlap by a fixed or preferred event. It is a draft; re-solving
+ *                      it costs him nothing and it is better done before he reads it.
+ *   accepted plan    — a fixed event at any overlap, or an event of any tier covering at
+ *                      least `minPreferredOverlapMin` of a placed block. A three-hour hangout
+ *                      landing on a work block is a real conflict whatever its title; a
+ *                      ten-minute clip of one is not worth rewriting a day he has read.
+ *
+ * `is_locked` blocks are excluded from the scan entirely. Re-planning cannot move them
+ * (generatePlan re-reads them as anchors), so counting one as displaced would re-plan the day
+ * on every tick, forever, and never resolve.
  */
 export function displacedByNewAnchors(
   blocks: readonly PlannedSpan[],
-  anchors: readonly Anchor[]
+  anchors: readonly Anchor[],
+  opts: ConflictOptions = { accepted: true }
 ): string[] {
-  const known = new Set(
-    blocks.filter((b) => b.isAnchor).map((b) => `${b.startMin}|${b.endMin}|${b.title.trim()}`)
-  );
+  const minOverlap = opts.minPreferredOverlapMin ?? PREFERRED_OVERLAP_MIN;
+  const anchorBlocks = blocks.filter((b) => b.isAnchor);
+  const knownExactly = new Set(anchorBlocks.map((b) => `${b.startMin}|${b.endMin}|${norm(b.title)}`));
+  const knownByTitle = new Set(anchorBlocks.map((b) => norm(b.title)));
+
   const placed = blocks.filter((b) => !b.isAnchor && !b.isLocked);
   const displaced = new Set<string>();
+
   for (const a of anchors) {
-    if ((a.flexibility ?? "fixed") !== "fixed") continue; // only obligations force a re-plan
-    if (known.has(`${a.startMin}|${a.endMin}|${a.title.trim()}`)) continue; // already planned around
+    const tier = a.flexibility ?? "fixed"; // an untiered anchor is an obligation (grid.ts)
+    if (tier === "flexible") continue; // our own output; see above
+    const isNew =
+      tier === "fixed"
+        ? !knownExactly.has(`${a.startMin}|${a.endMin}|${norm(a.title)}`)
+        : !knownByTitle.has(norm(a.title));
+    if (!isNew) continue; // the plan was already built around this
     for (const b of placed) {
-      if (a.startMin < b.endMin && a.endMin > b.startMin) displaced.add(b.title);
+      const over = overlapMinutes(a, b);
+      if (over <= 0) continue;
+      if (!opts.accepted || tier === "fixed" || over >= minOverlap) displaced.add(b.title);
     }
   }
   return [...displaced].sort();
 }
 
+/** A window an external event used to occupy and no longer does. */
+export interface FreedWindow {
+  title: string;
+  startMin: number;
+  endMin: number;
+}
+
 /**
- * Compare the accepted plan for `dateISO` against the CURRENT external anchors and
- * regenerate it when a newly-appeared `fixed` anchor overlaps something already placed.
- * `is_locked` blocks survive the regeneration untouched — generatePlan re-reads them as
- * anchors, which is also why they are excluded from the conflict scan below: re-planning
- * cannot move them, so treating them as displaced would re-plan the day on every tick
- * forever.
+ * The reverse trigger: which external anchors has the plan reserved time for that the
+ * calendar no longer has? Pure, for the same reason as its sibling above.
  *
- * Safe to call repeatedly: after a regeneration the new anchors are part of the plan, so
- * the next call finds nothing new and does nothing.
+ * Owner's stance, stated explicitly: he does NOT expect the old arrangement back when an
+ * event is cancelled. A fresh solve into the newly free time is the correct answer, so this
+ * only reports the freed windows — the caller decides whether there is work waiting to use
+ * them (`hasWorkWaiting`) before re-solving.
+ *
+ * An anchor block is considered GONE when the live anchor set contains nothing at its span
+ * and nothing with its title. Either match is enough on purpose: a `preferred` anchor the
+ * solver moved keeps its title, and an event whose title was edited keeps its span, and
+ * neither of those is a cancellation.
+ *
+ * Excluded:
+ *   - locked blocks. The owner pinned that time himself; it is not the calendar's to free,
+ *     and it re-materialises as an anchor in every regenerated plan, so treating it as a
+ *     removal would re-plan the day forever.
+ *   - windows shorter than `minFreedSpanMin` on an ACCEPTED plan. A cancelled 15-minute call
+ *     must not rewrite a day he is already reading. Un-accepted drafts have no floor.
+ *
+ * This cannot loop: the re-solve it triggers builds the new plan from the anchor set that no
+ * longer contains the removed event, so the next pass has no anchor block to miss.
+ */
+export function freedByRemovedAnchors(
+  blocks: readonly PlannedSpan[],
+  anchors: readonly Anchor[],
+  opts: ConflictOptions = { accepted: true }
+): FreedWindow[] {
+  const liveSpans = new Set(anchors.map((a) => `${a.startMin}|${a.endMin}`));
+  const liveTitles = new Set(anchors.map((a) => norm(a.title)));
+  const floor = opts.accepted ? (opts.minFreedSpanMin ?? FREED_SPAN_MIN) : 1;
+
+  return blocks
+    .filter((b) => b.isAnchor && !b.isLocked)
+    .filter((b) => !liveSpans.has(`${b.startMin}|${b.endMin}`) && !liveTitles.has(norm(b.title)))
+    .filter((b) => b.endMin - b.startMin >= floor)
+    .map((b) => ({ title: b.title, startMin: b.startMin, endMin: b.endMin }))
+    .sort((x, y) => x.startMin - y.startMin || x.title.localeCompare(y.title));
+}
+
+/**
+ * Is there anything for a freed window to be spent on? True when the plan gave up on a task
+ * (`unplaced_tasks`) or when a task for the date is still waiting — `inbox` or `planned` with
+ * no block on this plan. Without this, a cancellation would re-shuffle a day that had nothing
+ * more to fit into it.
+ */
+export function hasWorkWaiting(db: Db, dateISO: string, planId: number): boolean {
+  const row = db.prepare("SELECT unplaced_tasks FROM plan WHERE id = ?").get(planId) as
+    | { unplaced_tasks: string | null }
+    | undefined;
+  try {
+    const unplaced = JSON.parse(row?.unplaced_tasks ?? "[]");
+    if (Array.isArray(unplaced) && unplaced.length > 0) return true;
+  } catch {
+    /* unreadable JSON is not evidence of waiting work */
+  }
+  const { n } = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM task t
+        WHERE t.plan_date = ? AND t.status IN ('inbox','planned')
+          AND NOT EXISTS (SELECT 1 FROM block b WHERE b.plan_id = ? AND b.task_id = t.id)`
+    )
+    .get(dateISO, planId) as { n: number };
+  return n > 0;
+}
+
+/**
+ * Compare the LATEST plan for `dateISO` against the current external anchors and regenerate
+ * it when the calendar has moved under it — either a new event landing on placed work, or a
+ * cancelled event freeing time that waiting work could use.
+ *
+ * Deliberately not restricted to accepted plans any more: an un-accepted plan is one he has
+ * not read, so re-solving it is free, and leaving it stale is exactly how a work block ends
+ * up sitting inside a hangout. Acceptance now only raises the bar (see ConflictOptions).
+ *
+ * `is_locked` blocks survive the regeneration untouched — generatePlan re-reads them as
+ * anchors — which is also why they are excluded from both scans: re-planning cannot move
+ * them, so treating one as displaced or freed would re-plan the day on every tick forever.
+ *
+ * Safe to call repeatedly. The anchor fingerprint recorded by generatePlan short-circuits an
+ * unchanged calendar outright, and each scan independently reads a regenerated plan as
+ * settled.
  */
 export async function replanIfConflicted(
   db: Db,
   doctrineDir: string,
   secrets: SecretStore,
   llm: LlmClient | null,
-  dateISO: string
+  dateISO: string,
+  deps?: ReplanDeps
 ): Promise<ReplanResult> {
-  const none: ReplanResult = { replanned: false, displaced: [] };
+  const none: ReplanResult = { replanned: false, displaced: [], freed: [] };
 
-  const accepted = db
+  const plan = db
     .prepare(
-      "SELECT id FROM plan WHERE plan_date = ? AND accepted_at IS NOT NULL ORDER BY generated_at DESC, id DESC LIMIT 1"
+      "SELECT id, accepted_at FROM plan WHERE plan_date = ? ORDER BY generated_at DESC, id DESC LIMIT 1"
     )
-    .get(dateISO) as { id: number } | undefined;
-  if (!accepted) return none; // nothing accepted for this date — generatePlan is the entry point
+    .get(dateISO) as { id: number; accepted_at: string | null } | undefined;
+  if (!plan) return none; // nothing planned for this date — generatePlan is the entry point
+  const opts: ConflictOptions = { accepted: plan.accepted_at != null };
+
+  // A source that FAILED reads as an empty calendar, and an empty calendar reads as "he
+  // deleted everything". Never let an unreachable Google trigger the removal path.
+  const problems: string[] = [];
+  const anchors = await readExternal(db, secrets, dateISO, deps, problems);
+
+  // Nothing outside this app has changed since the plan was built → nothing to decide.
+  const fingerprint = readDayCache<string[]>(db, ANCHOR_FINGERPRINT_PREFIX, dateISO);
+  if (fingerprint && JSON.stringify(fingerprint) === JSON.stringify(anchorFingerprint(anchors))) {
+    return none;
+  }
 
   const rows = db
-    .prepare("SELECT title, starts_at, ends_at, is_anchor, is_locked FROM block WHERE plan_id = ?")
-    .all(accepted.id) as {
+    .prepare(
+      "SELECT title, starts_at, ends_at, is_anchor, is_locked, gcal_event_id FROM block WHERE plan_id = ?"
+    )
+    .all(plan.id) as {
     title: string | null;
     starts_at: string;
     ends_at: string;
     is_anchor: number;
     is_locked: number;
+    gcal_event_id: string | null;
   }[];
 
-  const spans: PlannedSpan[] = rows.map((b) => ({
-    title: b.title ?? "(untitled)",
-    startMin: fromIso(b.starts_at),
-    endMin: fromIso(b.ends_at),
-    isAnchor: b.is_anchor === 1,
-    isLocked: b.is_locked === 1,
-  }));
+  // Every span the owner has pinned for this date, from ANY plan. A regenerated plan carries
+  // the pinned span forward as a plain anchor (generatePlan re-reads it), so matching on the
+  // span — not just this row's is_locked flag — is what keeps a pin excluded from both scans
+  // for the whole life of the date.
+  const lockedSpans = new Set(
+    (
+      db
+        .prepare("SELECT starts_at, ends_at FROM block WHERE is_locked = 1 AND date(starts_at) = ?")
+        .all(dateISO) as { starts_at: string; ends_at: string }[]
+    ).map((b) => `${fromIso(b.starts_at)}|${fromIso(b.ends_at)}`)
+  );
 
-  const displaced = displacedByNewAnchors(spans, await externalAnchors(db, secrets, dateISO));
-  if (displaced.length === 0) return none;
+  const spans: PlannedSpan[] = rows.map((b) => {
+    const startMin = fromIso(b.starts_at);
+    const endMin = fromIso(b.ends_at);
+    return {
+      title: b.title ?? "(untitled)",
+      startMin,
+      endMin,
+      isAnchor: b.is_anchor === 1,
+      isLocked: b.is_locked === 1 || lockedSpans.has(`${startMin}|${endMin}`),
+      isExternal: !!b.gcal_event_id,
+    };
+  });
 
-  await generatePlan(db, doctrineDir, secrets, llm, dateISO);
-  return { replanned: true, displaced };
+  const displaced = displacedByNewAnchors(spans, anchors, opts);
+  const freedWindows =
+    problems.length > 0 ? [] : freedByRemovedAnchors(spans, anchors, opts);
+  const freed =
+    freedWindows.length > 0 && hasWorkWaiting(db, dateISO, plan.id)
+      ? freedWindows.map((f) => f.title)
+      : [];
+
+  if (displaced.length === 0 && freed.length === 0) return none;
+
+  // Same anchor set the decision was made on — see ReplanDeps.
+  await generatePlan(db, doctrineDir, secrets, llm, dateISO, { ...deps, anchors: async () => anchors });
+  return { replanned: true, displaced, freed };
+}
+
+/** `days` ISO dates starting at `today`, in order. UTC arithmetic — no DST surprises. */
+export function upcomingDates(today: string, days: number): string[] {
+  const base = Date.parse(`${today}T00:00:00Z`);
+  const out: string[] = [];
+  for (let i = 0; i < Math.max(1, days); i++) {
+    out.push(new Date(base + i * 86_400_000).toISOString().slice(0, 10));
+  }
+  return out;
+}
+
+export interface ReplanSweepResult {
+  /** Dates examined, in order. */
+  checked: string[];
+  /** Dates whose plan was regenerated. */
+  replanned: string[];
+  /** date → titles of the blocks a new event landed on. */
+  displaced: Record<string, string[]>;
+  /** date → titles of the cancelled events whose time was reclaimed. */
+  freed: Record<string, string[]>;
+}
+
+/**
+ * Run the conflict check across the planning HORIZON, not just today.
+ *
+ * This is the first of the four fixes and the one that made the others visible: he plans days
+ * ahead, so the day a new obligation lands on is very often not today, and a check wired to
+ * `new Date()` could never have caught it.
+ *
+ * One date failing (an LLM outage during the re-solve, say) must not cost the others their
+ * check, so each date is contained. Deterministic: dates run in order, and the anchor set for
+ * each is read once and used for both the decision and the regeneration.
+ */
+export async function replanUpcoming(
+  db: Db,
+  doctrineDir: string,
+  secrets: SecretStore,
+  llm: LlmClient | null,
+  opts: { days?: number; today?: string; deps?: ReplanDeps } = {}
+): Promise<ReplanSweepResult> {
+  const today = opts.today ?? new Date().toISOString().slice(0, 10);
+  const out: ReplanSweepResult = { checked: [], replanned: [], displaced: {}, freed: {} };
+
+  for (const dateISO of upcomingDates(today, opts.days ?? REPLAN_HORIZON_DAYS)) {
+    out.checked.push(dateISO);
+    try {
+      const r = await replanIfConflicted(db, doctrineDir, secrets, llm, dateISO, opts.deps);
+      if (!r.replanned) continue;
+      out.replanned.push(dateISO);
+      if (r.displaced.length > 0) out.displaced[dateISO] = r.displaced;
+      if (r.freed.length > 0) out.freed[dateISO] = r.freed;
+    } catch (e) {
+      console.warn(`replan check failed for ${dateISO}: ${(e as Error).message}`);
+    }
+  }
+  return out;
 }
 
 // ── accepting a plan pushes it (owner directive 2026-08-05) ──────────────────

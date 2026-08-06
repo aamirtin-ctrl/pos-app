@@ -98,6 +98,20 @@ contextBridge.exposeInMainWorld("pos", {
     events: call("applecal.events"),
     mirror: call("applecal.mirror"),
   },
+  // System-wide voice-capture shortcut (main/index.ts globalShortcut).
+  hotkey: { get: call("hotkey.get"), set: call("hotkey.set") },
+  // The floating listener window (renderer/src/overlay/VoiceHud.tsx) reporting that its
+  // capture is over, so main can hide it. Only that window ever calls this.
+  hud: { result: call("hud.result") },
+  // Main fires this when the global hotkey is pressed from any app — at the HUD window,
+  // which treats it as a toggle (start listening / stop and transcribe). The raw
+  // IpcRenderer never crosses the bridge — only a wrapper that drops the event
+  // object — and the returned function is the unsubscribe.
+  onVoiceCapture: (cb: () => void) => {
+    const listener = () => cb();
+    ipcRenderer.on("pos:voice-capture", listener);
+    return () => { ipcRenderer.removeListener("pos:voice-capture", listener); };
+  },
   settings: {
     keys: call("settings.keys"),
     setKey: call("settings.setKey"),

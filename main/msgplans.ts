@@ -31,6 +31,15 @@
 //   - Duration guard (ensureEnd): the Python version could emit start == end, which Apple
 //     rejected with "start date must be before the end date". Any zero/negative duration is
 //     given DEFAULT_EVENT_MINUTES (all-day → one full day).
+//   - BATCHED DECISION (owner standing directive: never one LLM call per item when a batch
+//     would do — Gemini's free tier is REQUEST-limited). The Python watcher spent one call
+//     per signalling conversation. Here every conversation that ticks in a run is numbered
+//     into ONE prompt — {n, conversation, distilled thread, current event} — answered with
+//     a strict-JSON ARRAY [{n, is_plan, action, …}], the shape crm/commitments.ts uses. The
+//     precomputed date-reference table is shared: ONE copy in the preamble, not one per
+//     conversation. Everything downstream is untouched — the same gateDecision (confidence
+//     ≥ 0.6, concrete start, the 6h stale rule) and the same one-event-per-conversation
+//     state machine run per item, exactly as before.
 //
 // chat.db is READ-ONLY: copy db+wal+shm to a tmpdir and open the COPY read-only, exactly
 // like connectors/imessage.ts and capture.ts. The live database is never opened.
@@ -334,7 +343,12 @@ export interface ExistingEvent {
   all_day: boolean;
 }
 
-/** brain._user_prompt — verbatim structure. */
+/**
+ * brain._user_prompt — verbatim structure, the SINGLE-conversation form. The pipeline
+ * now sends buildBatchedUserPrompt (one call for every conversation in a run); this is
+ * kept as the reference rendering the batched form is derived from, and is what the
+ * ported-parity tests assert against.
+ */
 export function buildUserPrompt(
   distilled: readonly DistilledMessage[],
   now: Date,
@@ -366,6 +380,74 @@ export function buildUserPrompt(
     `Event currently on the calendar for this conversation: ${evLine}\n\n` +
     `Recent messages (oldest first):\n${convo}\n\n` +
     "What should the calendar do now? Reply with the JSON object."
+  );
+}
+
+/**
+ * BATCH_SYSTEM — SYSTEM verbatim, plus the one override the batched form needs: several
+ * numbered conversations arrive at once and the reply is an ARRAY keyed by `n`. Every
+ * decision rule above is applied per conversation, independently, exactly as before.
+ */
+export const BATCH_SYSTEM =
+  SYSTEM +
+  "\n\nBATCH MODE — OVERRIDES THE OUTPUT SHAPE ABOVE (and nothing else): you will be " +
+  "given SEVERAL numbered conversations at once. Apply every rule above to each " +
+  "conversation INDEPENDENTLY — never merge two conversations, never let one thread's " +
+  "plan leak into another's. Respond ONLY with a JSON ARRAY holding exactly one object " +
+  "per conversation, each carrying its conversation's \"n\" alongside the exact fields " +
+  "listed above:\n" +
+  '[{ "n": <number>, "is_plan": true/false, "action": "create" | "update" | "cancel" | ' +
+  '"none", "title": "...", "start": "YYYY-MM-DDTHH:MM" or null, "end": ' +
+  '"YYYY-MM-DDTHH:MM" or null, "all_day": true/false, "confidence": 0.0-1.0, "reason": ' +
+  '"one short sentence" }]\n' +
+  "Only use n values from the list. Do not invent a conversation.";
+
+/** One numbered conversation inside a batched prompt. */
+export interface PlanBatchItem {
+  n: number;
+  distilled: readonly DistilledMessage[];
+  existing: ExistingEvent | null;
+  convoName?: string | null;
+}
+
+/**
+ * The batched counterpart of buildUserPrompt: the now-line and the precomputed date
+ * reference appear ONCE in the preamble (they are identical for every conversation in a
+ * run), then one numbered block per conversation carrying its own thread and its own
+ * currently-tracked event.
+ */
+export function buildBatchedUserPrompt(items: readonly PlanBatchItem[], now: Date): string {
+  const nowLine =
+    `Current date/time: ${DOW_LONG[now.getDay()]} ${localDate(now)} ` +
+    `${pad2(now.getHours())}:${pad2(now.getMinutes())}  |  user's timezone: ${timezoneLabel(now)}`;
+  const refLine =
+    "Date reference (use these EXACT dates; do not compute weekdays yourself): " +
+    buildDateReference(now);
+  const blocks = items.map((it) => {
+    const evLine = it.existing
+      ? JSON.stringify({
+          title: it.existing.title,
+          start: it.existing.start,
+          end: it.existing.end,
+          all_day: it.existing.all_day,
+        })
+      : "none";
+    const whoLine = it.convoName
+      ? `This conversation is with: ${it.convoName}. Put their name in the title (e.g. 'Dinner with ${it.convoName}').\n`
+      : "";
+    const convo = it.distilled.map((m) => `[${m.when}] ${m.who}: ${m.text}`).join("\n");
+    return (
+      `${it.n}.\n` +
+      `${whoLine}` +
+      `Event currently on the calendar for this conversation: ${evLine}\n` +
+      `Recent messages (oldest first):\n${convo}`
+    );
+  });
+  return (
+    `${nowLine}\n` +
+    `${refLine}\n\n` +
+    `CONVERSATIONS (${items.length}):\n\n${blocks.join("\n\n")}\n\n` +
+    "What should the calendar do now for EACH numbered conversation? Reply with the JSON array."
   );
 }
 
@@ -706,8 +788,12 @@ function displayName(db: Db, personId: number | null): string | null {
 /**
  * watcher.process_once, ported. One pass:
  *   new rows since the cursor → group by conversation → prefilter (free) → distill →
- *   ONE fast-tier LLM call per signalling thread → gate → Google Calendar create/update/
- *   delete on "POS — From Messages" only.
+ *   ONE fast-tier LLM call for ALL signalling threads together → gate each → Google
+ *   Calendar create/update/delete on "POS — From Messages" only.
+ *
+ * QUOTA: the whole pass costs exactly ONE request no matter how many conversations tick
+ * (it used to cost one per conversation). Threads the free prefilter rejects still cost
+ * zero and never enter the batch.
  */
 export async function runMsgPlans(deps: ConnectorDeps, opts: MsgPlanOptions = {}): Promise<SyncReport> {
   const { db, secrets, llm } = deps;
@@ -756,6 +842,19 @@ export async function runMsgPlans(deps: ConnectorDeps, opts: MsgPlanOptions = {}
       if (!cur || m.rowid >= cur.newest) convs.set(k, { newest: m.rowid, sample: m });
     }
 
+    // ── phase 1 (ZERO tokens): everything that decides whether a thread is worth
+    //    a decision at all — the cursor rule, the free prefilter, distillation.
+    const pending: {
+      key: string;
+      newest: number;
+      plan: PlanRow | null;
+      personId: number | null;
+      personName: string | null;
+      convoName: string | null;
+      distilled: DistilledMessage[];
+      existing: ExistingEvent | null;
+    }[] = [];
+
     for (const [key, info] of convs) {
       const plan = loadPlan(db, key);
       // Per-conversation staleness rule: never re-decide a thread we already decided on.
@@ -785,44 +884,92 @@ export async function runMsgPlans(deps: ConnectorDeps, opts: MsgPlanOptions = {}
         continue;
       }
 
-      // Never send a raw phone number as the "name" — a group name or a resolved person only.
-      const convoName = info.sample.chatName || personName || null;
-      const existing: ExistingEvent | null =
-        plan && plan.status === "active" && plan.gcal_event_id
-          ? { title: plan.title, start: plan.starts_at, end: plan.ends_at, all_day: plan.all_day === 1 }
-          : null;
+      pending.push({
+        key,
+        newest: info.newest,
+        plan,
+        personId,
+        personName,
+        // Never send a raw phone number as the "name" — a group name or a resolved person only.
+        convoName: info.sample.chatName || personName || null,
+        distilled,
+        existing:
+          plan && plan.status === "active" && plan.gcal_event_id
+            ? { title: plan.title, start: plan.starts_at, end: plan.ends_at, all_day: plan.all_day === 1 }
+            : null,
+      });
+    }
 
-      const prompt = buildUserPrompt(distilled, now, existing, convoName);
-      const res = await llm.call(MSGPLANS_SOURCE, "fast", prompt, { json: true, system: SYSTEM });
+    // ── phase 2: ONE fast-tier call for EVERY signalling conversation ─────────
+    if (pending.length > 0) {
+      const items: PlanBatchItem[] = pending.map((p, i) => ({
+        n: i + 1,
+        distilled: p.distilled,
+        existing: p.existing,
+        convoName: p.convoName,
+      }));
+      const res = await llm.call(MSGPLANS_SOURCE, "fast", buildBatchedUserPrompt(items, now), {
+        json: true,
+        system: BATCH_SYSTEM,
+      });
+      console.log(`msgplans: ${pending.length} signalling conversation(s) decided in 1 LLM call`);
+
+      // n → decision. A bare object is accepted for a one-conversation batch (models
+      // routinely answer a single item with the object shape SYSTEM describes).
+      let decisions: Map<number, PlanDecision> | null = null;
       if (!res) {
         // No key / ceiling reached / API error — do NOT advance, retry next run.
         errors.push("llm unavailable");
-        continue;
-      }
-      let decision: PlanDecision;
-      try {
-        decision = extractJson(res.text) as PlanDecision;
-      } catch (e) {
-        errors.push(`bad JSON from model: ${(e as Error).message}`);
-        continue; // don't advance → retry next poll (ported behavior)
-      }
-
-      decided++;
-      markDecided(db, key, info.newest);
-
-      const outcome = gateDecision(decision, { hasExisting: !!existing, now });
-      try {
-        await applyOutcome({ db, secrets }, key, plan, personId, personName, outcome);
-        if (outcome.kind === "write") {
-          report.ingested++;
-          if (!existing) report.created++;
-        } else if (outcome.kind === "cancel") {
-          if (existing) report.ingested++;
-        } else {
-          report.skipped++;
+      } else {
+        try {
+          const parsed = extractJson(res.text);
+          if (Array.isArray(parsed)) {
+            decisions = new Map();
+            parsed.forEach((item, idx) => {
+              if (!item || typeof item !== "object") return;
+              const o = item as Record<string, unknown>;
+              const n = Number(o.n);
+              decisions!.set(Number.isFinite(n) ? n : idx + 1, o as PlanDecision);
+            });
+          } else if (parsed && typeof parsed === "object" && items.length === 1) {
+            decisions = new Map([[1, parsed as PlanDecision]]);
+          } else {
+            errors.push("unusable JSON shape from model");
+          }
+        } catch (e) {
+          // Whole batch degrades: nothing is marked decided → retried next poll
+          // (the ported per-conversation behavior, applied to the batch).
+          errors.push(`bad JSON from model: ${(e as Error).message}`);
         }
-      } catch (e) {
-        errors.push(`${key}: ${(e as Error).message}`);
+      }
+
+      if (decisions) {
+        let missing = 0;
+        for (const [i, p] of pending.entries()) {
+          const decision = decisions.get(i + 1);
+          if (!decision) {
+            missing++; // not decided → not marked → revisited on the next poll
+            continue;
+          }
+          decided++;
+          markDecided(db, p.key, p.newest);
+
+          const outcome = gateDecision(decision, { hasExisting: !!p.existing, now });
+          try {
+            await applyOutcome({ db, secrets }, p.key, p.plan, p.personId, p.personName, outcome);
+            if (outcome.kind === "write") {
+              report.ingested++;
+              if (!p.existing) report.created++;
+            } else if (outcome.kind === "cancel") {
+              if (p.existing) report.ingested++;
+            } else {
+              report.skipped++;
+            }
+          } catch (e) {
+            errors.push(`${p.key}: ${(e as Error).message}`);
+          }
+        }
+        if (missing > 0) errors.push(`${missing} conversation(s) missing from the batch reply`);
       }
     }
 

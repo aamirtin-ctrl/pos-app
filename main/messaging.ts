@@ -47,7 +47,7 @@ export interface InboxItem {
   is_group: 0 | 1;
   /** Group display name (most recent non-null subject in the thread); null for 1:1. */
   group_name: string | null;
-  /** 1 when a 'suggested' draft exists for this inbound message. */
+  /** 1 when a 'suggested' draft exists anywhere in this conversation. */
   has_draft: 0 | 1;
   draft_id: number | null;
   draft_body: string | null;
@@ -62,71 +62,137 @@ export interface InboxItem {
 const THREAD_LIMIT = 12;
 
 /**
+ * How many CONVERSATIONS listInbox returns. This is a conversation count, never a
+ * message count — see the scan-window note below for why that distinction is the
+ * whole bug this function used to have.
+ */
+export const DEFAULT_CONVERSATION_LIMIT = 60;
+
+/**
+ * Inbound rows read before collapsing. The scan is always at least this many rows AND
+ * at least everything in the last RECENT_WINDOW_DAYS, so a couple of chatty threads
+ * can never consume the budget and starve every quieter conversation.
+ */
+const MIN_SCAN_ROWS = 400;
+const RECENT_WINDOW_DAYS = 30;
+
+/**
  * Channels whose interactions are email. The mail connector writes every provider's
  * messages under channel 'gmail'; the others exist for the file/OAuth importers and
  * for outbound rows recorded by sendEmail (channel = the account's provider).
  */
 export const EMAIL_CHANNELS = ["gmail", "outlook", "icloud", "mailfile"] as const;
 
+/**
+ * iMessage tapbacks (❤️ 👍 😂 …) are delivered as ordinary messages whose text is
+ * `Liked "…"` / `Loved "…"` / `You liked "…"`. chat.db's `associated_message_type`
+ * is not stored by the connector, so the text shape is the only signal we have.
+ *
+ * They are never a real message: a tapback must not represent a conversation. They
+ * are NOT deleted — the row stays in the thread, it just can't be the headline.
+ */
+const TAPBACK_RE =
+  /^\s*(?:you\s+)?(?:liked|loved|laughed at|emphasi[sz]ed|questioned|disliked|removed (?:a|an) [a-z]+ from)\s+[“"”'‘’]/i;
+
+/** True when this message text is an iMessage tapback/reaction rather than a message. */
+export function isTapback(text: string | null | undefined): boolean {
+  return !!text && TAPBACK_RE.test(text);
+}
+
 type InboxRow = Omit<
   InboxItem,
-  "unanswered" | "thread" | "thread_key" | "is_group" | "group_name"
+  "unanswered" | "thread" | "thread_key" | "is_group" | "group_name" | "answered"
 >;
 
+/** One collapsed conversation, before threads/answered are filled in. */
+interface Bucket {
+  key: string;
+  /** Headline row: the newest NON-tapback inbound, falling back to a tapback. */
+  rep: InboxRow;
+  repIsTapback: boolean;
+  /** Newest suggested draft anywhere in the conversation, so compose still prefills. */
+  draft: { id: number | null; body: string | null } | null;
+  /** Newest inbound timestamp in the conversation — what "recent" means for the cut. */
+  latestAt: string;
+}
+
 /**
- * Recent INBOUND interactions joined to person, collapsed to ONE row per
- * conversation. A conversation is a group chat (`chat:<thread_external_id>`)
- * or a 1:1 (`person:<person_id>`); the newest inbound message represents it.
- * Group rows carry is_group=1 + group_name (latest non-null subject in the
- * thread, fallback "Group chat") and thread by chat guid; 1:1 rows thread by
- * person. Unanswered (has_draft or no later outbound) sort first, then newest.
+ * Recent INBOUND interactions joined to person, collapsed to ONE row per conversation.
+ * A conversation is a group chat (`chat:<thread_external_id>`) or a 1:1
+ * (`person:<person_id>`); the newest non-tapback inbound message represents it.
+ *
+ * CONVERSATION-COMPLETE (owner report 2026-08-06). The old query applied `LIMIT` to the
+ * scanned inbound ROWS and ordered unanswered-first in SQL, which meant (a) a handful of
+ * chatty threads ate the whole budget and (b) every conversation he had already replied to
+ * sorted behind every unanswered row in the entire history and fell off the end — so real
+ * friends simply never appeared. Now: scan a wide recent window, collapse to conversations
+ * FIRST, take the newest `limit` conversations, and apply unanswered-first only as a SORT.
+ *
+ * Group rows carry is_group=1 + group_name (latest non-null subject in the thread,
+ * fallback "Group chat") and thread by chat guid; 1:1 rows thread by person.
  */
-export function listInbox(db: Db, opts: { limit?: number } = {}): InboxItem[] {
-  const limit = opts.limit ?? 50;
+export function listInbox(
+  db: Db,
+  opts: { limit?: number; scanRows?: number } = {}
+): InboxItem[] {
+  const limit = Math.max(1, opts.limit ?? DEFAULT_CONVERSATION_LIMIT);
+
+  // Scan window: at least MIN_SCAN_ROWS rows, and never less than everything inbound in
+  // the last 30 days — whichever is larger. Cheap COUNT first so the window adapts to a
+  // busy period instead of a fixed guess.
+  const cutoff = new Date(Date.now() - RECENT_WINDOW_DAYS * 86_400_000).toISOString();
+  const recent = db
+    .prepare("SELECT COUNT(*) AS n FROM interaction WHERE direction = 'inbound' AND occurred_at >= ?")
+    .get(cutoff) as { n: number };
+  const scanRows = Math.max(opts.scanRows ?? MIN_SCAN_ROWS, recent?.n ?? 0);
+
   const rows = db
     .prepare(
       `SELECT i.id, i.person_id, p.display_name AS person_name, i.channel, i.subject,
               i.body_summary, i.occurred_at, i.external_id, i.thread_external_id,
               d.id AS draft_id, d.body AS draft_body,
-              CASE WHEN d.id IS NOT NULL THEN 1 ELSE 0 END AS has_draft,
-              EXISTS(
-                SELECT 1 FROM interaction o
-                WHERE o.person_id = i.person_id AND o.direction = 'outbound'
-                  AND o.occurred_at > i.occurred_at
-              ) AS answered
+              CASE WHEN d.id IS NOT NULL THEN 1 ELSE 0 END AS has_draft
        FROM interaction i
        JOIN person p ON p.id = i.person_id
        LEFT JOIN draft d ON d.interaction_id = i.id AND d.status = 'suggested'
        WHERE i.direction = 'inbound'
-       ORDER BY (CASE WHEN d.id IS NOT NULL OR NOT EXISTS(
-                   SELECT 1 FROM interaction o
-                   WHERE o.person_id = i.person_id AND o.direction = 'outbound'
-                     AND o.occurred_at > i.occurred_at
-                 ) THEN 0 ELSE 1 END) ASC,
-                i.occurred_at DESC
+       ORDER BY i.occurred_at DESC, i.id DESC
        LIMIT ?`
     )
-    .all(limit) as InboxRow[];
+    .all(scanRows) as InboxRow[];
 
-  // Collapse to one representative row (the newest inbound) per conversation key.
-  // If an older inbound carries the suggested draft, the draft rides along so the
-  // compose box still prefills.
-  const byKey = new Map<string, InboxRow>();
+  // Collapse to one representative row per conversation key. Rows arrive newest-first,
+  // so the first row for a key is the newest; a tapback headline is upgraded the moment
+  // a real message shows up beneath it, and the newest suggested draft rides along.
+  const byKey = new Map<string, Bucket>();
   for (const r of rows) {
     const key = r.thread_external_id ? `chat:${r.thread_external_id}` : `person:${r.person_id}`;
-    const prev = byKey.get(key);
-    if (!prev) {
-      byKey.set(key, r);
-    } else {
-      const [newer, older] = (r.occurred_at ?? "") > (prev.occurred_at ?? "") ? [r, prev] : [prev, r];
-      if (!newer.has_draft && older.has_draft) {
-        byKey.set(key, { ...newer, has_draft: 1, draft_id: older.draft_id, draft_body: older.draft_body });
-      } else {
-        byKey.set(key, newer);
-      }
+    const at = r.occurred_at ?? "";
+    const tapback = isTapback(r.body_summary);
+    let b = byKey.get(key);
+    if (!b) {
+      b = { key, rep: r, repIsTapback: tapback, draft: null, latestAt: at };
+      byKey.set(key, b);
+    } else if (b.repIsTapback && !tapback) {
+      // Prefer the newest NON-tapback message as the conversation's headline.
+      b.rep = r;
+      b.repIsTapback = false;
     }
+    if (at > b.latestAt) b.latestAt = at;
+    if (r.has_draft && !b.draft) b.draft = { id: r.draft_id, body: r.draft_body };
   }
 
+  // Newest conversations first, then cut to `limit` CONVERSATIONS (not messages).
+  const buckets = [...byKey.values()]
+    .sort((a, b) => b.latestAt.localeCompare(a.latestAt))
+    .slice(0, limit);
+
+  const answeredStmt = db.prepare(
+    `SELECT EXISTS(
+       SELECT 1 FROM interaction o
+       WHERE o.person_id = ? AND o.direction = 'outbound' AND o.occurred_at > ?
+     ) AS answered`
+  );
   const groupNameStmt = db.prepare(
     `SELECT subject FROM interaction
      WHERE thread_external_id = ? AND subject IS NOT NULL AND subject != ''
@@ -155,7 +221,8 @@ export function listInbox(db: Db, opts: { limit?: number } = {}): InboxItem[] {
   );
 
   const items: InboxItem[] = [];
-  for (const [key, r] of byKey) {
+  for (const b of buckets) {
+    const r = b.rep;
     const isGroup = r.thread_external_id != null;
     const thread = (
       isGroup
@@ -166,12 +233,22 @@ export function listInbox(db: Db, opts: { limit?: number } = {}): InboxItem[] {
       ? ((groupNameStmt.get(r.thread_external_id) as { subject: string } | undefined)?.subject ??
         "Group chat")
       : null;
+    const answered = (
+      answeredStmt.get(r.person_id, r.occurred_at) as { answered: number }
+    ).answered
+      ? 1
+      : 0;
+    const hasDraft: 0 | 1 = r.has_draft || b.draft ? 1 : 0;
     items.push({
       ...r,
-      thread_key: key,
+      has_draft: hasDraft,
+      draft_id: r.has_draft ? r.draft_id : (b.draft?.id ?? null),
+      draft_body: r.has_draft ? r.draft_body : (b.draft?.body ?? null),
+      answered,
+      thread_key: b.key,
       is_group: isGroup ? 1 : 0,
       group_name: groupName,
-      unanswered: r.has_draft || !r.answered ? 1 : 0,
+      unanswered: hasDraft || !answered ? 1 : 0,
       thread,
     });
   }

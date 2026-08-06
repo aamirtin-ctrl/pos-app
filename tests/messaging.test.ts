@@ -9,6 +9,8 @@ import path from "node:path";
 import { openDb, type Db } from "../main/db/db.ts";
 import {
   listInbox,
+  isTapback,
+  DEFAULT_CONVERSATION_LIMIT,
   personHandles,
   escapeAppleScript,
   iMessageScript,
@@ -20,6 +22,7 @@ import {
   type MailTransport,
 } from "../main/messaging.ts";
 import { deletePerson } from "../main/crm/people.ts";
+import { bulkContactCandidates, purgeBulkContacts } from "../main/crm/review.ts";
 
 let dir: string;
 let db: Db;

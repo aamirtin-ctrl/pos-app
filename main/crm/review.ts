@@ -178,9 +178,28 @@ export function groupContacts(db: Db, ids: number[], groupName: string): { added
 //      (one reply, one iMessage, one meeting → a real relationship, left alone);
 //   3. looks bulk: every email alias matches bulkAddressReason, OR the display name is a
 //      robot name, OR every stored subject is unmistakably newsletter/notification copy.
+//
+// DELETION POLICY (owner spec 2026-08-06): a person who has EVER exchanged an iMessage is
+// never removed by anything automatic — only by the user clicking ✕ in Messaging (which
+// calls crm/people.ts deletePerson) or by an explicit Discard in the review queue. That is
+// enforced below as its own named condition (2a), not as a side effect of 2b, so it can't
+// be weakened by accident when the channel list changes.
 
-/** Channels that count as email for condition 2. Anything else disqualifies the person. */
+/**
+ * Channels that count as email for condition 2b. Anything else — iMessage above all, but
+ * also linkedin, slack, calendar — means a real conversation and disqualifies the person.
+ */
 const MAIL_CHANNELS = new Set(["gmail", "outlook", "email", "mail", "mailfile", "linkedin-email"]);
+
+/**
+ * Condition 2a, stated explicitly: any interaction on a non-mail channel makes this person
+ * untouchable. `interaction.channel` for texts is always 'imessage' (see
+ * main/connectors/imessage.ts and messaging.ts sendIMessage), so one text — in either
+ * direction, however old — is enough to protect a contact forever.
+ */
+function hasNonMailInteraction(rows: { channel: string }[]): boolean {
+  return rows.some((r) => !MAIL_CHANNELS.has(r.channel));
+}
 
 /**
  * Subject copy no human writes to one person. Only consulted when the address and name
@@ -225,7 +244,10 @@ export function bulkContactCandidates(db: Db): BulkPurgeCandidate[] {
     // Condition 2 — inbound email and nothing else. No history at all is NOT enough
     // evidence to delete somebody, so an empty list disqualifies too.
     if (rows.length === 0) continue;
-    if (rows.some((r) => !MAIL_CHANNELS.has(r.channel) || r.direction !== "inbound")) continue;
+    // 2a. Anyone he has ever texted with is off-limits, unconditionally.
+    if (hasNonMailInteraction(rows)) continue;
+    // 2b. Inbound only — a single reply of his own makes it a relationship.
+    if (rows.some((r) => r.direction !== "inbound")) continue;
 
     // Condition 3 — address, then name, then subjects.
     const aliases = aliasesOf.all(p.id) as { kind: string; value: string }[];

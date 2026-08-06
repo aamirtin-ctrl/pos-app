@@ -12,7 +12,13 @@ import { parseDoctrine, DEFAULT_DOCTRINE_YAML } from "../../main/engine/doctrine
 import { solve, type PlannerTask } from "../../main/engine/solver.ts";
 import { flexibilityOf, type Anchor } from "../../main/engine/grid.ts";
 import { inferFlexibility, looksLikeObligation, POS_CALENDAR_NAME } from "../../main/gcal/sync.ts";
-import { displacedByNewAnchors, type PlannedSpan } from "../../main/planner.ts";
+import {
+  displacedByNewAnchors,
+  freedByRemovedAnchors,
+  upcomingDates,
+  anchorFingerprint,
+  type PlannedSpan,
+} from "../../main/planner.ts";
 
 const doctrine = parseDoctrine(DEFAULT_DOCTRINE_YAML);
 const W = 7 * 60 + 30; // wake 07:30
@@ -73,12 +79,40 @@ describe("inferFlexibility", () => {
     }
   });
 
+  it("a solo social commitment is fixed — he promised another person (2026-08-06)", () => {
+    // The miss: "hangout" 16:00-19:00, typed into Google after agreeing over text. No
+    // attendees, no invitation, none of the appointment vocabulary — and the day still has
+    // to bend around it, because someone else is expecting him.
+    expect(inferFlexibility({ title: "hangout" })).toBe("fixed");
+    for (const title of [
+      "Hangout with Zayn",
+      "hang out",
+      "Dinner with Sara",
+      "Lunch with the team",
+      "Coffee with Priya",
+      "Drinks",
+      "Birthday party",
+      "Amal's birthday",
+      "Wedding",
+      "Basketball game",
+      "Concert",
+      "Date night",
+    ]) {
+      expect(inferFlexibility({ title }), title).toBe("fixed");
+    }
+  });
+
   it("a neutral solo event the owner created himself is preferred", () => {
+    // A PLAIN SOLO BLOCK commits him to nobody, so it stays movable-under-pressure.
     expect(inferFlexibility({ title: "Reading" })).toBe("preferred");
+    expect(inferFlexibility({ title: "Errands" })).toBe("preferred");
     expect(inferFlexibility({ title: "Write the draft", attendees: [{ self: true }] })).toBe("preferred");
     // word-bounded, so these are NOT obligations
     expect(inferFlexibility({ title: "Classroom refresh" })).toBe("preferred");
     expect(inferFlexibility({ title: "Overdue invoices" })).toBe("preferred");
+    // …and the social words do not swallow ordinary work titles either
+    expect(inferFlexibility({ title: "Third-party integration" })).toBe("preferred");
+    expect(inferFlexibility({ title: "Game plan for Q3" })).toBe("preferred");
     expect(looksLikeObligation("Reading")).toBe(false);
   });
 
@@ -315,35 +349,153 @@ describe("displacedByNewAnchors — the re-plan trigger", () => {
     flexibility: "fixed",
     ...over,
   });
+  const ACCEPTED = { accepted: true };
+  const DRAFT = { accepted: false };
 
   it("a new fixed anchor over a placed block triggers the re-plan", () => {
-    expect(displacedByNewAnchors(plan, [at(14 * 60 + 30, 15 * 60)])).toEqual(["MIT"]);
+    expect(displacedByNewAnchors(plan, [at(14 * 60 + 30, 15 * 60)], ACCEPTED)).toEqual(["MIT"]);
   });
 
   it("an anchor the plan already knows about changes nothing", () => {
-    expect(displacedByNewAnchors(plan, [at(9 * 60, 9 * 60 + 30, { title: "Standup" })])).toEqual([]);
+    expect(displacedByNewAnchors(plan, [at(9 * 60, 9 * 60 + 30, { title: "Standup" })], ACCEPTED)).toEqual([]);
   });
 
   it("a new anchor that lands on free time changes nothing", () => {
-    expect(displacedByNewAnchors(plan, [at(11 * 60, 12 * 60)])).toEqual([]);
-  });
-
-  it("a preferred event does not disturb an accepted day — the solver can bend around it", () => {
-    expect(displacedByNewAnchors(plan, [at(14 * 60, 15 * 60, { flexibility: "preferred" })])).toEqual([]);
-    expect(displacedByNewAnchors(plan, [at(14 * 60, 15 * 60, { flexibility: "flexible" })])).toEqual([]);
+    expect(displacedByNewAnchors(plan, [at(11 * 60, 12 * 60)], ACCEPTED)).toEqual([]);
   });
 
   it("an untiered anchor counts as fixed", () => {
-    expect(displacedByNewAnchors(plan, [at(14 * 60, 15 * 60, { flexibility: undefined })])).toEqual(["MIT"]);
+    expect(displacedByNewAnchors(plan, [at(14 * 60, 15 * 60, { flexibility: undefined })], ACCEPTED)).toEqual([
+      "MIT",
+    ]);
   });
 
   it("a locked block is never reported — re-planning cannot move it, so it must not loop", () => {
-    expect(displacedByNewAnchors(plan, [at(17 * 60, 17 * 60 + 30)])).toEqual([]);
+    expect(displacedByNewAnchors(plan, [at(17 * 60, 17 * 60 + 30)], ACCEPTED)).toEqual([]);
   });
 
   it("a rescheduled obligation reads as new", () => {
     // same title, different minutes → the plan bent around the OLD time, not this one
-    expect(displacedByNewAnchors(plan, [at(14 * 60, 15 * 60, { title: "Standup" })])).toEqual(["MIT"]);
+    expect(displacedByNewAnchors(plan, [at(14 * 60, 15 * 60, { title: "Standup" })], ACCEPTED)).toEqual(["MIT"]);
+  });
+
+  // ── acceptance sets the THRESHOLD, not eligibility (2026-08-06) ────────────
+
+  it("an UN-accepted plan re-solves on ANY new overlapping event, of any tier", () => {
+    // He has not read this plan. Re-solving it costs him nothing, so a ten-minute clip of a
+    // preferred event is reason enough — better fixed before he reads it than after.
+    expect(displacedByNewAnchors(plan, [at(14 * 60, 14 * 60 + 10, { flexibility: "preferred" })], DRAFT)).toEqual(
+      ["MIT"]
+    );
+    expect(displacedByNewAnchors(plan, [at(14 * 60 + 30, 15 * 60)], DRAFT)).toEqual(["MIT"]);
+  });
+
+  it("an ACCEPTED plan re-solves for a long preferred overlap — a 3h event on a work block", () => {
+    // The owner's case with a title we could not classify: whatever it is called, three hours
+    // sitting on top of placed work is a real conflict.
+    expect(
+      displacedByNewAnchors(plan, [at(16 * 60, 19 * 60, { flexibility: "preferred", title: "Hangout" })], {
+        accepted: true,
+      })
+    ).toEqual([]); // …but only when it actually overlaps something placed
+    expect(
+      displacedByNewAnchors(plan, [at(13 * 60, 16 * 60, { flexibility: "preferred", title: "Hangout" })], ACCEPTED)
+    ).toEqual(["MIT"]);
+  });
+
+  it("an ACCEPTED plan ignores a SHORT preferred overlap — no thrashing a day he is reading", () => {
+    expect(
+      displacedByNewAnchors(plan, [at(15 * 60 + 20, 15 * 60 + 30, { flexibility: "preferred" })], ACCEPTED)
+    ).toEqual([]);
+    // exactly at the 30-minute line it counts
+    expect(
+      displacedByNewAnchors(plan, [at(15 * 60, 15 * 60 + 30, { flexibility: "preferred" })], ACCEPTED)
+    ).toEqual(["MIT"]);
+  });
+
+  it("a flexible anchor never triggers — that is POS's own output coming back from Google", () => {
+    expect(displacedByNewAnchors(plan, [at(14 * 60, 15 * 60, { flexibility: "flexible" })], ACCEPTED)).toEqual([]);
+    expect(displacedByNewAnchors(plan, [at(14 * 60, 15 * 60, { flexibility: "flexible" })], DRAFT)).toEqual([]);
+  });
+
+  it("a preferred anchor the solver MOVED is matched by title, not span — the loop guard", () => {
+    // The plan holds "Reading" at 16:00 because the solver displaced it from 14:00. Reading
+    // the 14:00 event as brand new every pass is precisely how this would loop.
+    const withReading: PlannedSpan[] = [
+      ...plan,
+      { title: "Reading", startMin: 16 * 60, endMin: 17 * 60, isAnchor: true, isLocked: false },
+    ];
+    const ev = at(14 * 60, 15 * 60, { flexibility: "preferred", title: "Reading" });
+    expect(displacedByNewAnchors(withReading, [ev], DRAFT)).toEqual([]);
+    expect(displacedByNewAnchors(withReading, [ev], ACCEPTED)).toEqual([]);
+  });
+});
+
+describe("freedByRemovedAnchors — the reverse trigger", () => {
+  const plan: PlannedSpan[] = [
+    { title: "Dentist appointment", startMin: 13 * 60, endMin: 15 * 60, isAnchor: true, isLocked: false, isExternal: true },
+    { title: "Quick call", startMin: 16 * 60, endMin: 16 * 60 + 15, isAnchor: true, isLocked: false },
+    { title: "MIT", startMin: 9 * 60, endMin: 10 * 60, isAnchor: false, isLocked: false },
+    { title: "Pinned", startMin: 19 * 60, endMin: 20 * 60, isAnchor: true, isLocked: true },
+  ];
+  const anchor = (startMin: number, endMin: number, title: string): Anchor => ({
+    startMin,
+    endMin,
+    blockType: "personal",
+    title,
+    flexibility: "fixed",
+  });
+  const live = [anchor(13 * 60, 15 * 60, "Dentist appointment"), anchor(16 * 60, 16 * 60 + 15, "Quick call")];
+
+  it("reports nothing while every anchor is still on the calendar", () => {
+    expect(freedByRemovedAnchors(plan, live, { accepted: true })).toEqual([]);
+  });
+
+  it("reports an anchor that has disappeared", () => {
+    expect(freedByRemovedAnchors(plan, [live[1]], { accepted: true })).toEqual([
+      { title: "Dentist appointment", startMin: 13 * 60, endMin: 15 * 60 },
+    ]);
+  });
+
+  it("a short cancellation does not rewrite an ACCEPTED day, but does a draft", () => {
+    expect(freedByRemovedAnchors(plan, [live[0]], { accepted: true })).toEqual([]); // 15 min < 45
+    expect(freedByRemovedAnchors(plan, [live[0]], { accepted: false })).toEqual([
+      { title: "Quick call", startMin: 16 * 60, endMin: 16 * 60 + 15 },
+    ]);
+  });
+
+  it("a locked pin is never 'freed' — it is not the calendar's to cancel, and it would loop", () => {
+    expect(freedByRemovedAnchors(plan, [], { accepted: true }).map((f) => f.title)).toEqual([
+      "Dentist appointment",
+    ]);
+  });
+
+  it("a renamed or moved event is not a cancellation — either match is enough", () => {
+    // same span, new title
+    expect(freedByRemovedAnchors(plan, [anchor(13 * 60, 15 * 60, "Dr. Osman"), live[1]], { accepted: true })).toEqual([]);
+    // same title, new span (the solver may move a preferred anchor)
+    expect(freedByRemovedAnchors(plan, [anchor(10 * 60, 12 * 60, "Dentist appointment"), live[1]], { accepted: true })).toEqual([]);
+  });
+
+  it("placed (non-anchor) work is never reported — only external anchors free time", () => {
+    expect(freedByRemovedAnchors([plan[2]], [], { accepted: false })).toEqual([]);
+  });
+});
+
+describe("the sweep's date window and fingerprint", () => {
+  it("covers today plus the next days-1 dates, in order, across a month boundary", () => {
+    expect(upcomingDates("2026-08-06", 3)).toEqual(["2026-08-06", "2026-08-07", "2026-08-08"]);
+    expect(upcomingDates("2026-08-30", 3)).toEqual(["2026-08-30", "2026-08-31", "2026-09-01"]);
+    expect(upcomingDates("2026-08-06", 1)).toEqual(["2026-08-06"]);
+  });
+
+  it("the anchor fingerprint ignores order and notices every real change", () => {
+    const a = { startMin: 60, endMin: 120, blockType: "personal" as const, title: "A", flexibility: "fixed" as const };
+    const b = { startMin: 180, endMin: 240, blockType: "personal" as const, title: "B", flexibility: "preferred" as const };
+    expect(anchorFingerprint([a, b])).toEqual(anchorFingerprint([b, a]));
+    expect(anchorFingerprint([a, b])).not.toEqual(anchorFingerprint([a]));
+    expect(anchorFingerprint([a])).not.toEqual(anchorFingerprint([{ ...a, endMin: 150 }]));
+    expect(anchorFingerprint([a])).not.toEqual(anchorFingerprint([{ ...a, flexibility: "preferred" as const }]));
   });
 });
 

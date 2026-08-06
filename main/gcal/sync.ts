@@ -282,7 +282,7 @@ export async function deleteMessagesEvent(db: Db, secrets: SecretStore, eventId:
  *
  * Word-bounded so "classroom", "overdue" and friends do not false-positive.
  */
-export const OBLIGATION_PATTERNS: readonly RegExp[] = [
+export const APPOINTMENT_PATTERNS: readonly RegExp[] = [
   /\bclass(es)?\b/i,
   /\blectures?\b/i,
   /\bexams?\b/i,
@@ -296,6 +296,44 @@ export const OBLIGATION_PATTERNS: readonly RegExp[] = [
   /\bcall with\b/i,
   /\bdeadlines?\b/i,
   /\bdue\b/i,
+];
+
+/**
+ * Social commitments (owner ask 2026-08-06, from a real miss: a "hangout" added to Google
+ * after the plan was generated left a focused_work block sitting inside it).
+ *
+ * These are things he has told ANOTHER PERSON he will do. That is the same category as an
+ * appointment — the other person is the reason it cannot move — even though the title
+ * carries none of the appointment vocabulary above and Google shows no attendees, because
+ * he types the event in himself after agreeing over text.
+ *
+ * Deliberately NOT here: plain solo blocks. "Reading", "Errands", "Write the draft", "Gym"
+ * involve nobody else and stay `preferred` — real intentions the solver may bend around
+ * when the day demands it. The dividing line is a promise to a person, not busyness.
+ */
+export const SOCIAL_COMMITMENT_PATTERNS: readonly RegExp[] = [
+  /\bhang ?outs?\b/i,
+  /\bdinner with\b/i,
+  /\blunch with\b/i,
+  /\bcoffee with\b/i,
+  /\bdrinks\b/i,
+  // "third-party integration" is not a party — the lookbehind rejects a preceding hyphen.
+  /(?<![\w-])part(y|ies)\b/i,
+  /\bbirthdays?\b/i,
+  /\bweddings?\b/i,
+  // "Game plan" is a work title, not an event with a kickoff time.
+  /\bgames?\b(?!\s+plan)/i,
+  /\bconcerts?\b/i,
+  /\bdate night\b/i,
+];
+
+/**
+ * Every title pattern that makes an event `fixed`: appointments he must attend, and
+ * commitments he made to someone else.
+ */
+export const OBLIGATION_PATTERNS: readonly RegExp[] = [
+  ...APPOINTMENT_PATTERNS,
+  ...SOCIAL_COMMITMENT_PATTERNS,
 ];
 
 /** True when a title reads like something the owner has to attend. */
@@ -336,8 +374,9 @@ export interface FlexibilityEvent {
  *
  * NOTE (the owner's stated case): a solo event he adds AFTER THE FACT still comes back
  * `fixed` whenever its title reads like an obligation — "Dentist appointment", "Flight to
- * SFO", "CS229 lecture" — precisely because that is the signal he described. Only a solo
- * event with a neutral title ("Reading", "Write draft") falls through to `preferred`.
+ * SFO", "CS229 lecture", "Hangout", "Dinner with Sam" — precisely because that is the
+ * signal he described. Only a solo event with a NEUTRAL title, one that commits him to
+ * nobody ("Reading", "Errands", "Write draft"), falls through to `preferred`.
  */
 export function inferFlexibility(ev: FlexibilityEvent): Flexibility {
   const calendar = (ev.calendarName ?? "").trim();

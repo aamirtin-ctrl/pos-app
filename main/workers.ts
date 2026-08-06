@@ -31,7 +31,7 @@ import { syncAllMail, gmailConfigured } from "./connectors/gmail.ts";
 import { reconcileGoogleTasks } from "./gtasks-sync.ts";
 import { runNudgeCheck } from "./nudge.ts";
 import { screenTimeAvailable, autoCaptureOutcomes } from "./screentime.ts";
-import { replanIfConflicted } from "./planner.ts";
+import { replanUpcoming } from "./planner.ts";
 import { syncImessage, imessageAvailable } from "./connectors/imessage.ts";
 import { syncLinkedin } from "./connectors/linkedin.ts";
 import { syncLinkedinEmail } from "./connectors/linkedin-email.ts";
@@ -215,35 +215,109 @@ interface ResolutionMsg {
   body_summary: string | null;
 }
 
-function buildResolutionPrompt(
-  name: string | null,
-  open: { id: number; description: string; due_at: string | null }[],
-  msgs: ResolutionMsg[]
-): string {
-  const clip = (s: string | null | undefined, n: number) =>
-    (s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
-  const commitments = open.map(
-    (c) => `- id ${c.id}: ${clip(c.description, 160)}${c.due_at ? ` (due ${c.due_at.slice(0, 10)})` : ""}`
-  );
-  const lines = msgs.map(
-    (m) =>
-      `[${m.direction ?? "?"} ${clip(m.occurred_at, 16)}] ${clip([m.subject, m.body_summary].filter(Boolean).join(" — "), 200)}`
-  );
-  return `These commitments between the user and ${name ?? "a contact"} are currently OPEN. New messages just arrived in their conversation. Decide which commitments these NEW messages CLEARLY show as already fulfilled or cancelled.
+/** People per thread-resolution call. Beyond this a SECOND call is made — never per person. */
+export const RESOLUTION_BATCH_PEOPLE = 15;
+/** New messages carried per person: the size knob, so no PERSON is ever dropped. */
+export const RESOLUTION_MSGS_PER_PERSON = 6;
 
-OPEN COMMITMENTS:
+/** One numbered person in a resolution batch — `n` is the only handle the model gets. */
+interface ResolutionItem {
+  n: number;
+  personId: number;
+  name: string | null;
+  open: { id: number; description: string; due_at: string | null }[];
+  msgs: ResolutionMsg[];
+}
+
+const clipText = (s: string | null | undefined, n: number) =>
+  (s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+
+/**
+ * ONE call for every person with open commitments. Each numbered entry carries that
+ * person's own open commitments (id + description) and their own new messages; the model
+ * may only return ids from that entry's list, and omission still means "unresolved".
+ * Prompt size is bounded by keeping the newest RESOLUTION_MSGS_PER_PERSON messages per
+ * person, never by dropping a person.
+ */
+function buildResolutionPrompt(items: ResolutionItem[]): string {
+  const entries = items.map((it) => {
+    const commitments = it.open.map(
+      (c) => `  - id ${c.id}: ${clipText(c.description, 160)}${c.due_at ? ` (due ${c.due_at.slice(0, 10)})` : ""}`
+    );
+    const lines = it.msgs
+      .slice(-RESOLUTION_MSGS_PER_PERSON)
+      .map(
+        (m) =>
+          `  [${m.direction ?? "?"} ${clipText(m.occurred_at, 16)}] ${clipText([m.subject, m.body_summary].filter(Boolean).join(" — "), 200)}`
+      );
+    return `${it.n}. ${it.name ?? "a contact"}
+ OPEN COMMITMENTS:
 ${commitments.join("\n")}
+ NEW MESSAGES (direction-labeled, oldest first):
+${lines.join("\n")}`;
+  });
 
-NEW MESSAGES (direction-labeled, oldest first):
-${lines.join("\n")}
+  return `Each numbered entry below is one contact of the user's. The commitments listed under a contact are currently OPEN, and new messages just arrived in that contact's conversation. For EACH entry, decide which of THAT ENTRY'S commitments its NEW messages CLEARLY show as already fulfilled or cancelled.
+
+CONTACTS:
+${entries.join("\n\n")}
 
 Rules:
 - "resolved" means a NEW message shows the obligation was FULFILLED ("sent it", "done", "got them", "here you go", an attachment delivering the thing) or explicitly CANCELLED ("nvm", "never mind", "don't worry about it", "all set", "figured it out").
 - The message that CREATED an obligation does not resolve it. A promise to do it later ("will send tonight") does not resolve it. A new ask does not resolve anything.
-- Only include ids CLEARLY fulfilled or cancelled by these messages. When unsure, OMIT the id — an empty array is a good and common answer.
+- Only include ids CLEARLY fulfilled or cancelled by that entry's OWN messages — never an id from another entry. When unsure, OMIT the id — an empty array is a good and common answer.
 
-Return STRICT JSON ONLY — no prose, no markdown fences — an array (possibly empty):
-[{ "id": <commitment id from the list>, "resolved": true, "reason": "<short phrase citing the message>" }]`;
+Return STRICT JSON ONLY — no prose, no markdown fences — one object per numbered entry, using the SAME n:
+[{ "n": <number>, "resolved_ids": [<commitment id from THAT entry's list>], "reason": "<short phrase citing the message>" }]`;
+}
+
+/**
+ * The batched reply → n → resolved ids. Accepts the batched shape
+ * `[{n, resolved_ids: [...], reason}]` and, defensively, the older per-person shape
+ * `[{id, resolved: true, reason}]` — an `id` is attributed to whichever entry actually
+ * owns that open commitment, so a stray id still resolves nothing. Returns null when the
+ * payload is not an array at all (the caller then degrades the whole batch).
+ */
+function parseResolutions(
+  raw: unknown,
+  items: ResolutionItem[]
+): Map<number, { id: number; reason: string }[]> | null {
+  if (!Array.isArray(raw)) return null;
+  const out = new Map<number, { id: number; reason: string }[]>();
+  const ownerOf = new Map<number, number>(); // commitment id → entry n
+  for (const it of items) for (const c of it.open) ownerOf.set(c.id, it.n);
+  const push = (n: number, id: number, reason: string) => {
+    const list = out.get(n) ?? [];
+    if (!list.some((r) => r.id === id)) list.push({ id, reason });
+    out.set(n, list);
+  };
+
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    const reason = typeof o.reason === "string" && o.reason ? o.reason : "resolved by new messages";
+    const nRaw = Number(o.n);
+    const ids = Array.isArray(o.resolved_ids) ? o.resolved_ids : null;
+    if (ids) {
+      for (const v of ids) {
+        const id = Number(v);
+        // Only ids from THAT entry's own list survive. An id belonging to another
+        // person (or to nobody) is dropped, whatever `n` the model claimed.
+        const owner = ownerOf.get(id);
+        if (owner == null) continue;
+        if (Number.isFinite(nRaw) && owner !== nRaw) continue;
+        push(owner, id, reason);
+      }
+      continue;
+    }
+    // Legacy single-item shape: {id, resolved: true}. Same conservatism.
+    const id = Number(o.id);
+    if (o.resolved !== true || !Number.isFinite(id)) continue;
+    const owner = ownerOf.get(id);
+    if (owner == null) continue;
+    push(owner, id, reason);
+  }
+  return out;
 }
 
 /**
@@ -251,9 +325,13 @@ Return STRICT JSON ONLY — no prose, no markdown fences — an array (possibly 
  * resolved IN the message chain, it must not live on as an open task/commitment.
  * For each person with NEW messages this sync, load their OPEN commitments (status
  * open/scheduled); people with none are skipped before any LLM call (zero cost).
- * With an LLM: one fast-tier strict-JSON call per person — only ids CLEARLY
- * fulfilled/cancelled by the new messages come back; unsure ids are omitted.
- * Without an LLM (or on call failure): deterministic threadResolves only, and only
+ * With an LLM: ONE fast-tier strict-JSON call for the whole batch of people (owner
+ * standing directive — never one call per item; RESOLUTION_BATCH_PEOPLE per call, so
+ * six people cost one request, not six). Each numbered entry carries only its own
+ * person's open commitments and messages, and only ids from that entry's own list are
+ * accepted — unsure ids are omitted, exactly as before.
+ * Without an LLM (or when a batch's call fails / returns unusable JSON — the WHOLE batch
+ * degrades, never a silent partial): deterministic threadResolves only, and only
  * when the person has exactly ONE open commitment — a keyword match can't tell WHICH
  * of several "sent it" refers to, so ambiguity resolves nothing (conservative).
  *
@@ -299,57 +377,72 @@ export async function resolveFromThreads(
     "UPDATE task SET status = 'done', completed_at = datetime('now') WHERE id = ?"
   );
 
+  // ── phase 1 (ZERO tokens): only people who actually have something to resolve ──
+  const items: ResolutionItem[] = [];
   for (const [personId, personMsgs] of byPerson) {
     const open = openStmt.all(personId) as { id: number; description: string; due_at: string | null }[];
     if (open.length === 0) continue; // nothing to resolve — zero LLM cost
-
     out.peopleChecked++;
-    const resolutions: { id: number; reason: string }[] = [];
-    let usedLlm = false;
-    if (llm) {
-      const name = (nameStmt.get(personId) as { display_name: string | null } | undefined)?.display_name ?? null;
-      const res = await llm.call("thread-resolution", "fast", buildResolutionPrompt(name, open, personMsgs), {
+    items.push({
+      n: items.length + 1,
+      personId,
+      name: (nameStmt.get(personId) as { display_name: string | null } | undefined)?.display_name ?? null,
+      open,
+      msgs: personMsgs,
+    });
+  }
+  if (items.length === 0) return out;
+
+  // ── phase 2: ONE call per batch of people (never one per person) ─────────────
+  const resolutions = new Map<number, { id: number; reason: string }[]>();
+  const llmHandled = new Set<number>();
+  let calls = 0;
+  if (llm) {
+    for (let i = 0; i < items.length; i += RESOLUTION_BATCH_PEOPLE) {
+      const batch = items.slice(i, i + RESOLUTION_BATCH_PEOPLE);
+      // Renumber so each prompt's `n` runs 1..batch.length (the model never sees gaps).
+      const numbered = batch.map((it, j) => ({ ...it, n: j + 1 }));
+      const res = await llm.call("thread-resolution", "fast", buildResolutionPrompt(numbered), {
         json: true,
       });
-      if (res) {
-        usedLlm = true;
-        try {
-          const parsed = extractJson(res.text);
-          if (Array.isArray(parsed)) {
-            const openIds = new Set(open.map((c) => c.id));
-            for (const item of parsed) {
-              if (!item || typeof item !== "object") continue;
-              const o = item as Record<string, unknown>;
-              const id = Number(o.id);
-              // Only ids from the open list, explicitly resolved: true. Anything else
-              // (unknown ids, resolved: false, unsure omissions) leaves rows untouched.
-              if (o.resolved !== true || !openIds.has(id)) continue;
-              resolutions.push({
-                id,
-                reason: typeof o.reason === "string" && o.reason ? o.reason : "resolved by new messages",
-              });
-            }
-          }
-        } catch (e) {
-          console.warn(`workers: thread-resolution bad LLM JSON for person ${personId} (${(e as Error).message})`);
-        }
+      calls++;
+      if (!res) continue; // whole batch degrades to the deterministic path below
+      let parsed: Map<number, { id: number; reason: string }[]> | null = null;
+      try {
+        parsed = parseResolutions(extractJson(res.text), numbered);
+      } catch (e) {
+        console.warn(`workers: thread-resolution bad LLM JSON, batch degrades (${(e as Error).message})`);
+      }
+      if (!parsed) continue; // unusable shape — the WHOLE batch takes the deterministic path
+      for (const it of numbered) {
+        // A parsed reply IS the model's answer for every person in the batch: an
+        // omitted person means "nothing resolved", not "the call failed".
+        llmHandled.add(batch[it.n - 1].personId);
+        const found = parsed.get(it.n);
+        if (found?.length) resolutions.set(batch[it.n - 1].personId, found);
       }
     }
-    if (!usedLlm && open.length === 1) {
-      // Deterministic path (no LLM / call failed): conservative — only an unambiguous
-      // single open commitment can be closed by a keyword match.
-      const texts = personMsgs
+    console.log(`workers: thread-resolution checked ${items.length} person(s) in ${calls} LLM call(s)`);
+  }
+
+  for (const it of items) {
+    if (!llmHandled.has(it.personId) && it.open.length === 1) {
+      // Deterministic path (no LLM / call failed / unusable JSON): conservative — only an
+      // unambiguous single open commitment can be closed by a keyword match.
+      const texts = it.msgs
         .map((m) => [m.subject, m.body_summary].filter(Boolean).join(" — "))
         .filter((t) => t.length > 0);
-      if (threadResolves(open[0].description, texts)) {
-        resolutions.push({ id: open[0].id, reason: "deterministic thread-resolution match" });
+      if (threadResolves(it.open[0].description, texts)) {
+        resolutions.set(it.personId, [
+          { id: it.open[0].id, reason: "deterministic thread-resolution match" },
+        ]);
       }
     }
 
-    for (const r of resolutions) {
+    for (const r of resolutions.get(it.personId) ?? []) {
       markDone.run(r.id);
       out.resolved++;
-      const desc = open.find((c) => c.id === r.id)?.description ?? "";
+      const desc = it.open.find((c) => c.id === r.id)?.description ?? "";
       console.log(`workers: thread-resolution closed commitment ${r.id} ("${desc}") — ${r.reason}`);
       for (const t of openTasks.all(r.id) as { id: number; gtasks_id: string | null }[]) {
         closeTask.run(t.id);
@@ -848,14 +941,21 @@ export function startWorkers(
         console.warn(`screen time auto-capture failed: ${(e as Error).message}`);
       }
 
-      // A new fixed obligation on an accepted day re-solves it (local only; the
-      // regenerated plan is un-accepted, so nothing reaches Google until he says so).
+      // The calendar moving under a plan re-solves it — today AND the next two days, since
+      // he plans ahead (local only; the regenerated plan is un-accepted, so nothing reaches
+      // Google until he says so).
       try {
-        const today = new Date().toISOString().slice(0, 10);
-        const r = await replanIfConflicted(db, resolveDoctrineDir(), secrets, llm, today);
-        if (r.replanned) notify?.(`Replanned today around: ${r.displaced.join(", ")}`);
+        const r = await replanUpcoming(db, resolveDoctrineDir(), secrets, llm);
+        for (const d of r.replanned) {
+          const hit = r.displaced[d];
+          notify?.(
+            hit?.length
+              ? `Replanned ${d} around: ${hit.join(", ")}`
+              : `Replanned ${d} — freed time from: ${(r.freed[d] ?? []).join(", ")}`
+          );
+        }
       } catch (e) {
-        console.warn(`replan check failed: ${(e as Error).message}`);
+        console.warn(`replan sweep failed: ${(e as Error).message}`);
       }
 
       if (gmailConfigured({ secrets })) {

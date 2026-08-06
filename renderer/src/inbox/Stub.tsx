@@ -163,8 +163,10 @@ export default function Inbox() {
   const [panel, setPanel] = useState<string | null>(null); // open docked web panel, by service id
   const panelSlot = useRef<HTMLDivElement | null>(null);
 
+  // `limit` counts CONVERSATIONS, not messages — listInbox collapses first, so a
+  // chatty group can no longer crowd out the people who texted once.
   const refetch = useCallback(async () => {
-    const r = await window.pos.inbox.list({ limit: 50 });
+    const r = await window.pos.inbox.list({ limit: 60 });
     setItems(r.ok ? (r.data as InboxItem[]) : []);
   }, []);
   useEffect(() => {
