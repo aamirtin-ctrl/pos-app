@@ -10,7 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { openDb, getSetting, type Db } from "../../main/db/db.ts";
-import { isBulkMail, bulkAddressReason, isBulkDisplayName } from "../../main/connectors/common.ts";
+import { isBulkMail, bulkAddressReason, isBulkDisplayName, transactionalSubject } from "../../main/connectors/common.ts";
 import {
   purgeBulkContacts,
   purgeBulkContactsOnce,
@@ -397,5 +397,76 @@ describe("purgeBulkContacts", () => {
     // …but the underlying purge is still callable directly
     expect(purgeBulkContacts(db)).toBe(1);
     expect(alive(x)).toBe(false);
+  });
+});
+
+// ── transactional mail: machine-generated, and not a conversation ────────────
+//
+// Owner observation 2026-08-06, reading his eight most recent mail interactions: "Your Alexa
+// verification code" and "New forwarding email added" had both become interactions — and one
+// of them had already produced a contact.
+//
+// Neither is a newsletter, so every header rule correctly passes them: verification codes and
+// account notices are sent one-to-one and almost never carry List-Unsubscribe. That is exactly
+// why they slipped through a filter built for campaigns.
+describe("transactional subjects", () => {
+  it("catches the two he actually saw", () => {
+    expect(transactionalSubject("Your Alexa verification code")).toBeTruthy();
+    expect(transactionalSubject("New forwarding email added")).toBeTruthy();
+  });
+
+  it("catches the rest of the machine-issued family", () => {
+    for (const s of [
+      "Your security code",
+      "123456 is your verification code",
+      "Your one-time passcode",
+      "Reset your password",
+      "Password changed",
+      "New sign-in from Chrome on Mac",
+      "Verify your email address",
+      "Recovery email removed",
+    ]) {
+      expect(transactionalSubject(s), s).toBeTruthy();
+    }
+  });
+
+  // The rule reads a subject line rather than an envelope, so it is the one most able to
+  // misfire on real mail. These are the cases that must survive.
+  it("never touches real correspondence", () => {
+    for (const s of [
+      "Bailey Orthodontics",
+      "Re: Stanford advising — times that work",
+      "Invoice #4021 for the Como booking",
+      "Your order has shipped",
+      "Receipt from the flight",
+      "Quick question about the code review",
+      "Can you verify these numbers before Friday?",
+      "Password protected doc for the deal",
+    ]) {
+      expect(transactionalSubject(s), s).toBe("");
+    }
+  });
+
+  it("is empty for a missing subject", () => {
+    expect(transactionalSubject(null)).toBe("");
+    expect(transactionalSubject("   ")).toBe("");
+  });
+
+  it("fires through isBulkMail, and names itself in the reason", () => {
+    const v = isBulkMail({ headers: new Map(), subject: "Your Alexa verification code" });
+    expect(v.bulk).toBe(true);
+    expect(v.reason).toMatch(/^transactional:/);
+  });
+
+  it("runs LAST — real header evidence still names the rule that fired", () => {
+    const v = isBulkMail({
+      headers: new Map([["list-unsubscribe", "<mailto:x@y.z>"]]),
+      subject: "Your verification code",
+    });
+    expect(v.reason).toMatch(/^list-header:/);
+  });
+
+  it("leaves ordinary mail alone end to end", () => {
+    expect(isBulkMail({ headers: new Map(), subject: "Bailey Orthodontics" }).bulk).toBe(false);
   });
 });

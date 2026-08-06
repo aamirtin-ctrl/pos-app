@@ -1145,12 +1145,25 @@ export async function replanIfConflicted(
   const displaced = displacedByNewAnchors(spans, anchors, opts);
   const freedWindows =
     problems.length > 0 ? [] : freedByRemovedAnchors(spans, anchors, opts);
+  // What to REPORT: freed time is only news when something was waiting to use it.
   const freed =
     freedWindows.length > 0 && hasWorkWaiting(db, dateISO, plan.id)
       ? freedWindows.map((f) => f.title)
       : [];
 
-  if (displaced.length === 0 && freed.length === 0) return none;
+  // What to DO is a different question, and conflating the two was a bug.
+  //
+  // Owner report 2026-08-06: "even though I deleted the Yoga Foundation event from my calendar,
+  // it still shows up in the app." The deletion was visible — the live anchor set was empty and
+  // the stored fingerprint still held "Yoga foundation" — but the re-solve was gated on
+  // `hasWorkWaiting`, and nothing needed those 18:30-19:30 minutes. So the day was left exactly
+  // as it was, still showing an event he had cancelled.
+  //
+  // Skipping a re-solve because no work would benefit is right for CHURN. It is wrong for
+  // CORRECTNESS: an event that no longer exists must leave the plan whether or not anything
+  // fills the gap. An empty slot is honest; a cancelled event is not.
+  const anchorVanished = freedWindows.length > 0;
+  if (displaced.length === 0 && !anchorVanished) return none;
 
   // Same anchor set the decision was made on — see ReplanDeps.
   await generatePlan(db, doctrineDir, secrets, llm, dateISO, { ...deps, anchors: async () => anchors });

@@ -144,6 +144,40 @@ export interface BulkMailInput {
   headers?: unknown;
   headerLines?: unknown;
   from?: unknown;
+  /** Subject line — the only signal that catches transactional mail. See TRANSACTIONAL. */
+  subject?: unknown;
+}
+
+// ── transactional mail: machine-generated, and not a conversation ────────────
+//
+// Owner observation 2026-08-06, looking at his eight most recent mail interactions: "Your
+// Alexa verification code" and "New forwarding email added" had both become interactions.
+//
+// Neither is a newsletter, so every header rule above correctly passes them: verification
+// codes and account notices are sent one-to-one and almost never carry List-Unsubscribe —
+// that is precisely why they slip through a filter built for campaigns.
+//
+// This is the weakest rule in the file and runs LAST, after every piece of header evidence,
+// because it reads the subject line rather than the envelope. It is therefore deliberately
+// narrow: only the phrasings that are unambiguously machine-issued and never the opening of a
+// conversation. Receipts, invoices and order confirmations are NOT here — those are real
+// business correspondence for him, and dropping one would cost more than keeping it.
+const TRANSACTIONAL: [RegExp, string][] = [
+  [/\b(verification|security|confirmation|access|login|sign[- ]?in)\s+code\b/i, "verification-code"],
+  [/\byour\s+(one[- ]?time|otp|2fa|mfa)\b|\bone[- ]?time\s+(code|password|passcode)\b/i, "one-time-code"],
+  [/\bis\s+your\s+(\w+\s+)?(code|passcode|pin)\b/i, "code-in-subject"],
+  [/\b(reset|change[d]?)\s+your\s+password\b|\bpassword\s+(reset|changed)\b/i, "password-notice"],
+  [/\bnew\s+(sign[- ]?in|login|device)\b|\bsign[- ]?in\s+(alert|attempt)\b/i, "signin-alert"],
+  [/\b(forwarding|recovery)\s+(email|address)\s+(added|removed|changed)\b/i, "account-change"],
+  [/\bverify\s+your\s+(email|account|address)\b|\bconfirm\s+your\s+(email|account)\b/i, "verify-request"],
+];
+
+/** Subject-only transactional check. Empty reason when it does not fire. */
+export function transactionalSubject(subject: string | null | undefined): string {
+  const s = (subject ?? "").replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  for (const [re, reason] of TRANSACTIONAL) if (re.test(s)) return reason;
+  return "";
 }
 
 /** Presence of ANY of these means the message was sent to a list. Strongest signal. */
@@ -526,6 +560,12 @@ export function isBulkMail(
   const candidate = opts?.fromEmail ?? fromHeader;
   const addressReason = bulkAddressReason(candidate);
   if (addressReason) return { bulk: true, reason: addressReason };
+
+  // 8. Transactional subject — weakest rule, deliberately last. Verification codes and
+  // account notices are sent one-to-one and carry no List-Unsubscribe, so every check above
+  // correctly passes them; the subject line is the only thing that gives them away.
+  const txn = transactionalSubject(flattenHeaderValue(parsed?.subject) || get("subject"));
+  if (txn) return { bulk: true, reason: `transactional:${txn}` };
 
   return { bulk: false, reason: "" };
 }

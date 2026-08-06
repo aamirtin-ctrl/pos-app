@@ -377,7 +377,16 @@ describe("a cancelled obligation frees its window", () => {
     expect(planCount()).toBe(1);
   });
 
-  it("freed time with NOTHING waiting for it is left alone", async () => {
+  // Owner report 2026-08-06: "even though I deleted the Yoga Foundation event from my calendar,
+  // it still shows up in the app." This test asserted the behaviour that caused it.
+  //
+  // The deletion WAS visible — the live anchor set was empty while the plan still held the
+  // event — but the re-solve was gated on something waiting to use the freed minutes, and
+  // nothing was. So the day kept showing an event he had cancelled.
+  //
+  // Skipping a re-solve when no work would benefit is right for CHURN and wrong for
+  // CORRECTNESS. An empty slot is honest; a cancelled event is not.
+  it("removes a cancelled event even when nothing is waiting for its time", async () => {
     seedPlan({
       accepted: false,
       blocks: [
@@ -392,7 +401,12 @@ describe("a cancelled obligation frees its window", () => {
       ],
     });
     const r = await replanIfConflicted(db, doctrineDir, secrets, null, DATE, calendar([]));
-    expect(r.replanned).toBe(false);
+    expect(r.replanned).toBe(true);
+    // …and the event is gone from the regenerated day.
+    const blocks = (getPlan(db, DATE)!.blocks as Record<string, unknown>[]);
+    expect(blocks.some((b) => b.title === "Dentist appointment")).toBe(false);
+    // Nothing was waiting, so there is no freed-time news to report — only the removal.
+    expect(r.freed).toEqual([]);
   });
 });
 
