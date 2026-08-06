@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import PreviewColumn from "./PreviewColumn.tsx";
 import {
   COLORS, DOCTRINE_NARRATION, FALLBACK_COLOR, GRID_END_MIN, GRID_START_MIN, GUTTER_PX,
-  MIN_CARD_PX, PX_PER_MIN, WINDOW_START_MIN, addDaysISO, buildItems, firstSentences, fmtDur,
+  PX_PER_MIN, WINDOW_START_MIN, addDaysISO, buildItems, cardHeights, firstSentences, fmtDur,
   fmtHour, fmtMin, freeGaps, layoutLanes, todayISO, yOf,
   type DayData, type ExternalEvent, type Item, type LaidOutItem, type PlanView,
 } from "./shared.ts";
@@ -261,6 +261,9 @@ export default function DayPlanner() {
 
   // Side-by-side lanes for anything that overlaps in time (see layoutLanes).
   const laid = useMemo(() => layoutLanes(items), [items]);
+  // Painted height per card — the readable minimum, capped so a short block
+  // (break, transition) can never spill onto the block that follows it.
+  const heights = useMemo(() => cardHeights(laid), [laid]);
   // Empty stretches, painted as faint dashed affordances in otherwise-blank grid.
   const gaps = useMemo(() => freeGaps(items), [items]);
 
@@ -366,7 +369,8 @@ export default function DayPlanner() {
             ))}
 
             {laid.map((it) => (
-              <EventCard key={it.key} item={it} status={status(it)} nowMin={nowMin} />
+              <EventCard key={it.key} item={it} height={heights.get(it.key) ?? (it.endMin - it.startMin) * PX_PER_MIN}
+                status={status(it)} nowMin={nowMin} />
             ))}
 
             {isToday && <NowLine nowMin={nowMin} />}
@@ -448,16 +452,20 @@ function GapHint({ startMin, endMin, dim }: { startMin: number; endMin: number; 
 
 /**
  * One event, absolutely positioned by clock time: `top` is its start minute and
- * `height` its duration, both scaled by PX_PER_MIN. Horizontally it occupies
- * its packed lane span, so overlapping events sit side by side. The card sheds
- * detail as it gets shorter (time row, then the icon circle, then padding).
+ * `height` comes from `cardHeights` — its duration scaled by PX_PER_MIN, allowed
+ * to round up to a readable minimum ONLY into empty grid, never over the next
+ * block. Horizontally it occupies its packed lane span, so overlapping events sit
+ * side by side. The card sheds detail as it gets shorter: first the time row and
+ * meta pills, then padding and the icon shrink to a single compact line.
  */
-function EventCard({ item, status, nowMin }: { item: LaidOutItem; status: "past" | "current" | "future"; nowMin: number }) {
+function EventCard({ item, height, status, nowMin }: {
+  item: LaidOutItem; height: number; status: "past" | "current" | "future"; nowMin: number;
+}) {
   const c = COLORS[item.type] ?? FALLBACK_COLOR;
   const dur = item.endMin - item.startMin;
-  const height = Math.max(MIN_CARD_PX, dur * PX_PER_MIN);
   const progress = status === "current" ? Math.min(100, Math.max(0, ((nowMin - item.startMin) / Math.max(1, dur)) * 100)) : 0;
   const dim = status === "past";
+  const micro = height < 30;   // one compact line: small icon + title, nothing else
   const tight = height < 44;   // no time row / meta pills
   const roomy = height >= 76;  // full card: icon circle, time row, progress bar
   const laneW = 100 / item.lanes;
@@ -470,10 +478,10 @@ function EventCard({ item, status, nowMin }: { item: LaidOutItem; status: "past"
         opacity: dim ? 0.55 : 1,
         zIndex: 2 + item.lane,
       }}>
-      <div className="h-full w-full rounded-2xl border shadow-sm overflow-hidden flex gap-2 items-start"
+      <div className={`h-full w-full rounded-2xl border shadow-sm overflow-hidden flex ${micro ? "gap-1.5 items-center" : tight ? "gap-2 items-center" : "gap-2 items-start"}`}
         style={{
-          padding: tight ? "3px 8px" : "7px 10px",
-          borderRadius: tight ? 10 : 14,
+          padding: micro ? "0 6px" : tight ? "3px 8px" : "7px 10px",
+          borderRadius: micro ? 8 : tight ? 10 : 14,
           background: item.external
             ? "color-mix(in srgb, var(--pink-1) 40%, white)"
             : `color-mix(in srgb, ${c.bg} 22%, white)`,
@@ -486,16 +494,16 @@ function EventCard({ item, status, nowMin }: { item: LaidOutItem; status: "past"
         {/* tinted type circle, shrinking with the card */}
         <span className="shrink-0 rounded-full flex items-center justify-center shadow-sm"
           style={{
-            width: roomy ? 28 : 20, height: roomy ? 28 : 20,
-            background: c.bg, color: c.fg, border: "1.5px solid var(--bg)",
+            width: micro ? 14 : roomy ? 28 : 20, height: micro ? 14 : roomy ? 28 : 20,
+            background: c.bg, color: c.fg, border: micro ? "1px solid var(--bg)" : "1.5px solid var(--bg)",
           }}>
-          <TypeIcon type={item.type} size={roomy ? 14 : 11} />
+          <TypeIcon type={item.type} size={micro ? 9 : roomy ? 14 : 11} />
         </span>
 
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5">
             <span className="flex-1 min-w-0 truncate font-semibold"
-              style={{ color: "var(--ink)", fontSize: tight ? 11 : 13, lineHeight: 1.3 }}>
+              style={{ color: "var(--ink)", fontSize: micro ? 10 : tight ? 11 : 13, lineHeight: micro ? 1.1 : 1.3 }}>
               {item.title}
             </span>
             {item.locked && <span title="Locked" style={{ color: "var(--danger)" }}><LockGlyph /></span>}
@@ -570,20 +578,81 @@ function NarrationFooter({ plan }: { plan: PlanView | null }) {
   );
 }
 
-/** Accept/push strip; the narration itself now lives in NarrationFooter above. */
+/** What plan.accept / plan.push report back (mirrors PlanPushResult in pos.d.ts). */
+type PushResult = { pushed: number; tasks: number; error?: string };
+
+/** The stale-grant case: the owner must re-authorize before anything can go out. */
+const RECONSENT = "reconsent_required";
+
+/** Plain-English reason for a typed push error. */
+function pushErrorCopy(error: string): string {
+  if (error === RECONSENT) return "Google needs re-authorizing since POS's calendar permissions changed.";
+  if (error === "not_connected") return "Not pushed — connect Google in Settings.";
+  if (error === "auto_push_off") return "Automatic push is off — use Push now, or turn it back on in Settings.";
+  return `Not pushed — ${error}`;
+}
+
+function pushOkCopy(r: PushResult): string {
+  const blocks = `Pushed ${r.pushed} block${r.pushed === 1 ? "" : "s"} to Google`;
+  return r.tasks > 0 ? `${blocks} and ${r.tasks} task${r.tasks === 1 ? "" : "s"}` : blocks;
+}
+
+/**
+ * Accept/push strip; the narration itself lives in NarrationFooter above.
+ *
+ * Accept is the whole gesture (owner directive 2026-08-05) — it accepts AND pushes, and
+ * reports what landed inline. "Push now" is only a retry, shown when a push has actually
+ * failed; a `reconsent_required` failure additionally offers Reconnect Google, which
+ * re-runs the push as soon as consent comes back.
+ */
 function PlanControls({ plan, onChange }: { plan: PlanView | null; onChange: () => void }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
+  const [push, setPush] = useState<PushResult | null>(null);
   if (!plan?.plan) return (
     <p className="text-xs mt-4 text-center" style={{ color: "var(--muted)" }}>
       No plan yet — use the sparkle button (top right) to braindump the day.
     </p>
   );
-  const run = async (label: string, fn: () => Promise<unknown>) => {
+  const planId = plan.plan.id;
+
+  const run = async (label: string, fn: () => Promise<PushResult | null>) => {
     setBusy(label); setMsg(null);
-    try { await fn(); onChange(); } catch (e) { setMsg(String((e as Error).message ?? e)); }
+    try {
+      const res = await fn();
+      if (res) setPush(res);
+      onChange();
+    } catch (e) {
+      setMsg(String((e as Error).message ?? e));
+    }
     setBusy(null);
   };
+
+  const accept = () => run("Accepting…", async () => {
+    const r = await window.pos.plan.accept(planId);
+    if (!r.ok) throw new Error(r.error ?? "could not accept the plan");
+    return (r.data as { push?: PushResult } | undefined)?.push ?? null;
+  });
+
+  const pushNow = () => run("Pushing…", async () => {
+    const r = await window.pos.plan.push(planId);
+    if (!r.ok) throw new Error(r.error ?? "connect Google in Settings first");
+    return (r.data as PushResult) ?? null;
+  });
+
+  // Re-consent, then immediately retry — the owner asked for one click, not two.
+  const reconnect = () => run("Reconnecting…", async () => {
+    const r = await window.pos.gcal.connect();
+    if (!r.ok || r.data === false) throw new Error(r.error ?? "Google sign-in did not complete");
+    const p = await window.pos.plan.push(planId);
+    if (!p.ok) throw new Error(p.error ?? "push failed after reconnecting");
+    return (p.data as PushResult) ?? null;
+  });
+
+  const failed = !!push?.error;
+  // Retry is offered for a failure we saw, or for an accepted plan Google never got.
+  const showRetry = !!plan.plan.accepted_at && (failed || (!push && !plan.plan.pushed_at));
+
   return (
     <div className="mt-3 rounded-2xl border bg-white p-4 shadow-sm" style={{ borderColor: "var(--line)" }}>
       {(plan.unplaced?.length ?? 0) > 0 && (
@@ -591,24 +660,35 @@ function PlanControls({ plan, onChange }: { plan: PlanView | null; onChange: () 
           Didn't fit: {plan.unplaced.map((u) => `${u.title} (${u.reason.replace(/_/g, " ")})`).join(", ")}
         </p>
       )}
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
         {!plan.plan.accepted_at && (
-          <button onClick={() => run("Accepting…", () => window.pos.plan.accept(plan.plan.id))}
-            className="px-3.5 py-1.5 rounded-full text-xs font-medium text-white shadow-sm" style={{ background: "var(--accent)" }}>
-            {busy ?? "Accept plan"}
+          <button onClick={accept} disabled={!!busy}
+            className="px-3.5 py-1.5 rounded-full text-xs font-medium text-white shadow-sm disabled:opacity-60"
+            style={{ background: "var(--accent)" }}>
+            {busy ?? "Accept & push"}
           </button>
         )}
-        {plan.plan.accepted_at && (
-          <button onClick={() => run("Pushing…", async () => {
-              const r = await window.pos.plan.push(plan.plan.id);
-              if (!r.ok) throw new Error(r.error ?? "connect Google in Settings first");
-            })}
-            className="px-3.5 py-1.5 rounded-full text-xs font-medium text-white shadow-sm" style={{ background: "var(--accent)" }}>
-            {busy ?? "Push to Google"}
+        {showRetry && (
+          <button onClick={pushNow} disabled={!!busy}
+            className="px-3.5 py-1.5 rounded-full text-xs font-medium border bg-white shadow-sm disabled:opacity-60"
+            style={{ borderColor: "var(--line)" }}>
+            {busy ?? "Push now"}
+          </button>
+        )}
+        {failed && push?.error === RECONSENT && (
+          <button onClick={reconnect} disabled={!!busy}
+            className="px-3.5 py-1.5 rounded-full text-xs font-medium text-white shadow-sm disabled:opacity-60"
+            style={{ background: "var(--accent)" }}>
+            Reconnect Google
           </button>
         )}
         {msg && <span className="text-xs" style={{ color: "var(--danger)" }}>{msg}</span>}
       </div>
+      {push && (
+        <p className="text-xs mt-2" style={{ color: push.error ? "var(--danger)" : "var(--muted)" }}>
+          {push.error ? pushErrorCopy(push.error) : pushOkCopy(push)}
+        </p>
+      )}
     </div>
   );
 }

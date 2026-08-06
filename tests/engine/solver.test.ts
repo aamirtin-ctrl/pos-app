@@ -192,6 +192,41 @@ describe("solver — §9 gate", () => {
     expect(b.startMin).toBeLessThanOrEqual(12 * 60);
   });
 
+  it("a full day of blocks never double-books a single minute", () => {
+    // A rich day: MIT + 2 deep work + gym + 3 admin + 2 meeting anchors, on top of
+    // the doctrine's own fixed rituals, breaks and cluster transitions. Whatever the
+    // solver returns has to be a partition of the day — the calendar paints these
+    // blocks by clock time, so any overlap here is an overlap the owner sees.
+    const anchors: Anchor[] = [
+      { startMin: 10 * 60, endMin: 10 * 60 + 30, blockType: "meeting", title: "standup" },
+      { startMin: 15 * 60, endMin: 16 * 60, blockType: "meeting", title: "partner sync", movable: true },
+    ];
+    const ts = [
+      mkTask({ blockType: "deep_work", estimatedMinutes: 90, isMit: true, cognitiveLoad: 5, title: "MIT" }),
+      mkTask({ blockType: "deep_work", estimatedMinutes: 60, cognitiveLoad: 4, title: "deep A" }),
+      mkTask({ blockType: "deep_work", estimatedMinutes: 60, cognitiveLoad: 3, title: "deep B" }),
+      mkTask({ blockType: "gym", estimatedMinutes: 60, title: "Gym" }),
+      mkTask({ blockType: "admin", estimatedMinutes: 30, project: "ops", title: "admin 1" }),
+      mkTask({ blockType: "admin", estimatedMinutes: 30, project: "ops", title: "admin 2" }),
+      mkTask({ blockType: "admin", estimatedMinutes: 15, title: "admin 3" }),
+    ];
+    const r = solve(ts, doctrine, anchors);
+    // sanity: this really is a full day, not an empty result trivially passing
+    expect(r.blocks.length).toBeGreaterThanOrEqual(10);
+    expect(r.blocks.some((b) => b.blockType === "break")).toBe(true);
+    expect(r.blocks.some((b) => b.blockType === "transition")).toBe(true);
+
+    const sorted = [...r.blocks].sort((a, b) => a.startMin - b.startMin || a.endMin - b.endMin);
+    for (const b of sorted) expect(b.endMin).toBeGreaterThan(b.startMin); // no zero-length cards
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = sorted[i - 1], cur = sorted[i];
+      expect(
+        cur.startMin,
+        `"${cur.title}" (${cur.startMin}-${cur.endMin}) overlaps "${prev.title}" (${prev.startMin}-${prev.endMin})`
+      ).toBeGreaterThanOrEqual(prev.endMin);
+    }
+  });
+
   it("breaks are inserted after deep work blocks", () => {
     const t = mkTask({ blockType: "deep_work", estimatedMinutes: 90, cognitiveLoad: 5 });
     const r = solve([t], doctrine, []);

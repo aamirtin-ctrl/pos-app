@@ -51,7 +51,12 @@ export const WINDOW_START_MIN = 7 * 60;
 export const WINDOW_END_MIN = 22 * 60;
 /** Left gutter holding the hour labels, in px. */
 export const GUTTER_PX = 54;
-/** Shortest card we will draw, so a 10-minute block stays readable. */
+/**
+ * Shortest card we would LIKE to draw, so a 10/15-minute block stays readable.
+ * It is a wish, not a floor: `cardHeightPx` only grants it when the grid space
+ * below the card is genuinely empty (see there — a short card must never paint
+ * over the block that starts right after it).
+ */
 export const MIN_CARD_PX = 26;
 
 /** Absolute offset (px from 00:00) of a minute-of-day on the grid. */
@@ -120,6 +125,51 @@ export function layoutLanes(items: Item[]): LaidOutItem[] {
   return out.sort((a, b) => a.startMin - b.startMin || a.lane - b.lane);
 }
 
+/* ── card height: readable, but never spilling onto the next block ──
+   Cards are painted at `duration * PX_PER_MIN`, which at 1.2 px/min makes a
+   15-minute break 18px and a 10-minute transition 12px — too short to read. The
+   old rule was `max(MIN_CARD_PX, duration * PX_PER_MIN)`, which inflated those
+   cards by 8-14px and painted them straight over the block starting immediately
+   after (exactly the break/transition overlaps the owner reported). The minimum
+   is now capped by the real distance to the next card sharing the column, so a
+   short block borrows only empty grid and never a neighbor's space. */
+
+/** Do two laid-out items occupy any of the same lanes (i.e. the same column)? */
+export const sharesColumn = (a: LaidOutItem, b: LaidOutItem) =>
+  a.lane < b.lane + b.span && b.lane < a.lane + a.span;
+
+/**
+ * Painted height in px for a card of `durationMin`, given the minutes from its
+ * own start to the start of the next card in its column (null = nothing after
+ * it, so the grid below is free).
+ *
+ * Never shorter than the card's real time span, never longer than the space
+ * actually available before the next card begins.
+ */
+export function cardHeightPx(durationMin: number, minutesToNextStart: number | null): number {
+  const natural = Math.max(0, durationMin) * PX_PER_MIN;
+  const available =
+    minutesToNextStart === null ? Infinity : Math.max(0, minutesToNextStart) * PX_PER_MIN;
+  return Math.max(natural, Math.min(MIN_CARD_PX, available));
+}
+
+/** Painted height per item key for a whole laid-out day (see `cardHeightPx`). */
+export function cardHeights(laid: LaidOutItem[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const it of laid) {
+    let nextStart = Infinity;
+    for (const o of laid) {
+      if (o.key === it.key || !sharesColumn(it, o)) continue;
+      if (o.startMin > it.startMin && o.startMin < nextStart) nextStart = o.startMin;
+    }
+    out.set(
+      it.key,
+      cardHeightPx(it.endMin - it.startMin, nextStart === Infinity ? null : nextStart - it.startMin)
+    );
+  }
+  return out;
+}
+
 /**
  * Empty stretches between busy time, from a merged sweep of the day's items
  * (so overlapping events don't fake a gap). Only used to paint a faint dashed
@@ -152,15 +202,39 @@ export const fmtHour = (m: number) => {
 export const fmtDur = (m: number) =>
   m < 60 ? `${m} min` : m % 60 === 0 ? `${m / 60} hr` : `${Math.floor(m / 60)} hr ${m % 60} min`;
 
+/** Titles compare case- and whitespace-insensitively when deduping calendars. */
+const titleKey = (s: string | null | undefined) => String(s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+/** How far two copies of the same meeting may drift and still be one meeting. */
+const DEDUPE_SLOP_MIN = 2;
+
+/**
+ * Is this external event already on the grid as a plan block?
+ *
+ * The old test was an exact `start-end` string match, so a meeting the plan
+ * anchored at 10:00–10:30 and Google now reports as 10:00–10:31 rendered TWICE,
+ * as two near-identical stacked cards. Two looser tests replace it: the same
+ * span within ±2 minutes on both ends, or an identical title with any overlap
+ * at all (which also catches a meeting that has since been moved or extended).
+ */
+function alreadyOnPlan(blocks: Block[], e: ExternalEvent): boolean {
+  const eTitle = titleKey(e.title);
+  return blocks.some((b) => {
+    const bs = minOf(b.starts_at), be = minOf(b.ends_at);
+    if (Math.abs(bs - e.startMin) <= DEDUPE_SLOP_MIN && Math.abs(be - e.endMin) <= DEDUPE_SLOP_MIN) return true;
+    const bTitle = titleKey(b.title);
+    return !!bTitle && bTitle === eTitle && bs < e.endMin && e.startMin < be;
+  });
+}
+
 /**
  * One chronological stream for a day: plan blocks + external Google events,
- * hiding externals a plan already shows as anchors (same start/end span).
+ * hiding externals a plan already shows as anchors (see `alreadyOnPlan`).
  * Used identically by the center timeline and the preview columns so both
  * always agree on what a day contains.
  */
 export function buildItems(plan: PlanView | null, external: ExternalEvent[]): Item[] {
-  const spans = plan ? new Set(plan.blocks.map((b) => `${minOf(b.starts_at)}-${minOf(b.ends_at)}`)) : null;
-  const externalsToShow = spans ? external.filter((e) => !spans.has(`${e.startMin}-${e.endMin}`)) : external;
+  const planBlocks = plan?.blocks ?? [];
+  const externalsToShow = plan ? external.filter((e) => !alreadyOnPlan(planBlocks, e)) : external;
   const fromPlan: Item[] = (plan?.blocks ?? []).map((b) => ({
     key: `b${b.id}`, startMin: minOf(b.starts_at), endMin: minOf(b.ends_at),
     title: b.title || b.block_type.replace(/_/g, " "), type: b.block_type,
