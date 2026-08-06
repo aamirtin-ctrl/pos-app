@@ -773,6 +773,27 @@ export async function replanIfConflicted(
 }
 
 /** `days` ISO dates starting at `today`, in order. UTC arithmetic — no DST surprises. */
+/**
+ * Schedulable work sitting on a date that has NO plan at all.
+ *
+ * The signal that a day needs planning rather than re-planning. Zero for a date that already
+ * has a plan (however stale — that is the stale-engine sweep's job) and zero for an empty
+ * day, so this never manufactures a plan out of nothing.
+ */
+export function tasksAwaitingPlan(db: Db, dateISO: string): number {
+  const planned = db.prepare("SELECT 1 FROM plan WHERE plan_date = ? LIMIT 1").get(dateISO);
+  if (planned) return 0;
+  return (
+    db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM task
+          WHERE plan_date = ?
+            AND status IN (${SCHEDULABLE_TASK_STATUSES.map(() => "?").join(",")})`
+      )
+      .get(dateISO, ...SCHEDULABLE_TASK_STATUSES) as { n: number }
+  ).n;
+}
+
 export function upcomingDates(today: string, days: number): string[] {
   const base = Date.parse(`${today}T00:00:00Z`);
   const out: string[] = [];
@@ -817,6 +838,22 @@ export async function replanUpcoming(
   for (const dateISO of upcomingDates(today, opts.days ?? REPLAN_HORIZON_DAYS)) {
     out.checked.push(dateISO);
     try {
+      // ── a day with work on it and no plan yet gets one ──
+      //
+      // Owner report 2026-08-06: "Why did you completely delete the Stanford two hour block
+      // thing from earlier?" It had not been deleted — it was DEFERRED to the next day inside
+      // its window, exactly as intended. But deferral was only half a feature: nothing ever
+      // planned a fresh day. replanIfConflicted returns early when a date has no plan ("that
+      // is generatePlan's job"), and generatePlan only ran when he braindumped.
+      //
+      // So the task sat in `inbox` with tomorrow's date and no block anywhere, and from the
+      // calendar it was indistinguishable from having been thrown away. A deferral that lands
+      // on a day nobody plans IS a deletion, whatever the database says.
+      if (tasksAwaitingPlan(db, dateISO) > 0) {
+        await generatePlan(db, doctrineDir, secrets, llm, dateISO, opts.deps);
+        out.replanned.push(dateISO);
+        continue;
+      }
       const r = await replanIfConflicted(db, doctrineDir, secrets, llm, dateISO, opts.deps);
       if (!r.replanned) continue;
       out.replanned.push(dateISO);

@@ -22,6 +22,7 @@ import {
   replanUpcoming,
   displacedByNewAnchors,
   freedByRemovedAnchors,
+  tasksAwaitingPlan,
   ANCHOR_FINGERPRINT_PREFIX,
   type PlannedSpan,
   type ReplanDeps,
@@ -514,5 +515,42 @@ describe("replanUpcoming — today is not the only day he plans", () => {
     });
     expect(r.checked).toHaveLength(3);
     expect(r.replanned).toEqual([IN_TWO_DAYS]);
+  });
+});
+
+// ── a deferral that lands on an unplanned day is a deletion ──────────────────
+//
+// Owner report 2026-08-06: "Why did you completely delete the Stanford two hour block thing
+// from earlier?" It had not been deleted — it was deferred to the next day inside its window,
+// exactly as the deadline-window feature intends. But deferral was only half a feature:
+// replanIfConflicted returns early when a date has no plan ("that is generatePlan's job"),
+// and generatePlan only ran when he braindumped. So the task sat in `inbox` carrying
+// tomorrow's date with no block anywhere, and from the calendar that is indistinguishable
+// from having been thrown away.
+describe("tasksAwaitingPlan", () => {
+  it("counts schedulable work on a day that has no plan", () => {
+    addTask({ title: "Deferred advising", dateISO: "2026-08-07" });
+    expect(tasksAwaitingPlan(db, "2026-08-07")).toBe(1);
+  });
+
+  it("is zero once the day has a plan — that is re-planning, not planning", () => {
+    addTask({ title: "Deferred advising", dateISO: "2026-08-07" });
+    db.prepare(
+      `INSERT INTO plan (plan_date, engine_version, doctrine_snapshot, narration, unplaced_tasks)
+       VALUES ('2026-08-07', 'test', '{}', '', '[]')`
+    ).run();
+    expect(tasksAwaitingPlan(db, "2026-08-07")).toBe(0);
+  });
+
+  it("never manufactures a plan for an empty day", () => {
+    expect(tasksAwaitingPlan(db, "2026-08-07")).toBe(0);
+  });
+
+  it("ignores work that is already finished or retired", () => {
+    for (const status of ["done", "deferred"]) {
+      const id = addTask({ title: `x-${status}`, dateISO: "2026-08-08" });
+      db.prepare("UPDATE task SET status = ? WHERE id = ?").run(status, id);
+    }
+    expect(tasksAwaitingPlan(db, "2026-08-08")).toBe(0);
   });
 });
