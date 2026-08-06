@@ -4,7 +4,7 @@
 // no randomness. Never places into a slot the eligibility mask excluded, regardless
 // of score. Never silently drops a task — everything unplaced carries a reason.
 
-import { BLOCK_DEFAULTS, hhmmToMin, type BlockType, type Doctrine } from "./doctrine.ts";
+import { BLOCK_DEFAULTS, WORK_TYPES, hhmmToMin, type BlockType, type Doctrine } from "./doctrine.ts";
 import { buildGrid, SLOT_MIN, type Anchor, type Slot } from "./grid.ts";
 
 export interface PlannerTask {
@@ -43,6 +43,10 @@ export interface SolveResult {
 }
 
 const slotsFor = (minutes: number) => Math.max(1, Math.ceil(minutes / SLOT_MIN));
+
+/** minutes-since-midnight → "HH:MM" (wraps past-midnight values back into clock time). */
+const fmtMin = (min: number) =>
+  `${String(Math.floor(min / 60) % 24).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}`;
 
 export function solve(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[]): SolveResult {
   const hc = doctrine.hard_constraints;
@@ -137,7 +141,17 @@ export function solve(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[
   }
 
   // ── 1. Fixed rituals — bend around anchors, don't disappear ──
-  for (const r of doctrine.fixed_rituals) {
+  //
+  // Rituals are placed before ANY work (gym, meetings, MIT, deep work, shallow batching all
+  // follow), so the shutdown boundary is known and occupied before a single task is sited.
+  // Within the loop, shutdown goes first: the boundary must claim its own minutes before a
+  // comms window or a lunch that bent late can take them. The eligibility mask does the
+  // actual enforcement (grid.ts bans work at/after `shutdownStartMin`); this ordering just
+  // guarantees the ritual block itself lands where the mask says the wall is.
+  const rituals = [...doctrine.fixed_rituals].sort(
+    (a, b) => (a.type === "shutdown" ? 0 : 1) - (b.type === "shutdown" ? 0 : 1)
+  );
+  for (const r of rituals) {
     const target =
       r.at_hours_after_wake !== undefined
         ? wakeMin + r.at_hours_after_wake * 60
@@ -398,6 +412,21 @@ export function solve(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[
   for (const t of shallow) {
     take(t);
     placeDeepOrFocused(t, false);
+  }
+
+  // ── 7b. explain the wall, don't just enforce it ──
+  // "no_eligible_slot" is opaque when the day visibly has free evening hours. If work was
+  // cut while time remains AFTER the shutdown boundary, say so — that free time is a
+  // deliberate choice, not an oversight the owner should try to fill.
+  if (grid.shutdownMin !== null) {
+    const cut = unplaced.filter((u) => u.reason === "no_eligible_slot" && WORK_TYPES.has(u.task.blockType));
+    const eveningFree = slots.some((s, i) => s.startMin >= grid.shutdownMin! && occ[i] === null);
+    if (cut.length > 0 && eveningFree) {
+      notes.push(
+        `The work day closes at ${fmtMin(grid.shutdownMin)} (shutdown ritual); ${cut.length} task(s) had no room before it. ` +
+          `The evening is free on purpose — it is not schedulable work time.`
+      );
+    }
   }
 
   // ── 8. stable output ordering ──

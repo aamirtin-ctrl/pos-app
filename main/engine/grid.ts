@@ -4,8 +4,8 @@
 // set before scoring ever happens. Hard constraints are filters, not penalties.
 
 import {
-  BLOCK_TYPES, COGNITIVE_TYPES, capacityAt, hhmmToMin,
-  type BlockType, type Doctrine,
+  BLOCK_TYPES, COGNITIVE_TYPES, WORK_TYPES, capacityAt, dayBounds,
+  shutdownStartMin, type BlockType, type Doctrine,
 } from "./doctrine.ts";
 
 export const SLOT_MIN = 15;
@@ -39,13 +39,14 @@ export interface Slot {
 export interface Grid {
   wakeMin: number;
   sleepMin: number;
+  /** Start of the shutdown ritual = the minute the WORK day closes. null = no such ritual. */
+  shutdownMin: number | null;
   slots: Slot[];
 }
 
 export function buildGrid(doctrine: Doctrine, anchors: Anchor[]): Grid {
-  const wakeMin = hhmmToMin(doctrine.chronotype.wake_time);
-  let sleepMin = hhmmToMin(doctrine.chronotype.sleep_onset);
-  if (sleepMin <= wakeMin) sleepMin += 24 * 60; // past-midnight sleep
+  const { wakeMin, sleepMin } = dayBounds(doctrine);
+  const shutdownMin = shutdownStartMin(doctrine);
 
   const hc = doctrine.hard_constraints;
   const peak = doctrine.physical_curve.peak_window;
@@ -108,11 +109,17 @@ export function buildGrid(doctrine: Doctrine, anchors: Anchor[]): Grid {
       if (t === "gym" && s.hoursToSleep < hc.min_gym_end_before_sleep_hours) ok = false;
       // Comms must end >= latest_comms_window_before_sleep_hours before sleep.
       if (t === "comms" && s.hoursToSleep < hc.latest_comms_window_before_sleep_hours) ok = false;
+      // The shutdown ritual CLOSES the work day. No work type may start at or after it.
+      // Because the solver requires every slot of a run to be eligible, this also stops a
+      // work block that starts before the boundary from running through it — work must be
+      // finished by shutdown, not merely begun. Non-work (personal/meal/break/gym, each
+      // still subject to its own rules) stays legal: the evening is theirs.
+      if (shutdownMin !== null && WORK_TYPES.has(t) && s.startMin >= shutdownMin) ok = false;
       s.eligible[t] = ok;
     }
   }
 
-  return { wakeMin, sleepMin, slots };
+  return { wakeMin, sleepMin, shutdownMin, slots };
 }
 
 /** Largest run of consecutive free slots (minutes) — soft-pref signal. */

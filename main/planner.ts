@@ -9,6 +9,7 @@ import { parseBraindump } from "./engine/parse.ts";
 import { solve, ENGINE_VERSION, type PlannerTask } from "./engine/solver.ts";
 import type { Anchor } from "./engine/grid.ts";
 import { narrate } from "./engine/narrate.ts";
+import { withPreferences } from "./preferences.ts";
 import {
   readAnchors,
   mergeCalendarSources,
@@ -22,6 +23,7 @@ import { getSetting } from "./db/db.ts";
 import { hasCalendarWriteScope, isGoogleConnected, RECONSENT_REQUIRED } from "./gcal/auth.ts";
 import { readAppleEvents, appleBlockType, excludedCalendarNames } from "./applecal.ts";
 import { eventsForDate as icsEventsForDate, icsBlockType } from "./icscal.ts";
+import { wakeTimeFor } from "./wake.ts";
 
 const toIso = (dateISO: string, min: number) =>
   `${dateISO}T${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}:00`;
@@ -32,7 +34,15 @@ const fromIso = (iso: string) => {
 
 export async function braindump(db: Db, doctrineDir: string, llm: LlmClient | null, text: string, dateISO: string) {
   const doctrine = loadDoctrine(doctrineDir);
-  const { tasks, usedLlm } = await parseBraindump(text, doctrine, llm);
+  // The braindump parse is a JUDGMENT call ("is this deep work?", "how long will it take?"),
+  // so the owner's own preferences ride along with it. engine/parse.ts takes no context
+  // argument and owns its prompt, so the block is injected at the LLM client instead of
+  // through the signature — see withPreferences() in main/preferences.ts.
+  const { tasks, usedLlm } = await parseBraindump(
+    text,
+    doctrine,
+    withPreferences(llm, doctrineDir, ["plan_parse"])
+  );
   const ins = db.prepare(
     `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
        is_mit, hard_deadline_at, status, splittable, estimate_source, plan_date, notes)
@@ -66,7 +76,21 @@ export async function generatePlan(
   llm: LlmClient | null,
   dateISO: string
 ) {
-  const doctrine: Doctrine = loadDoctrine(doctrineDir);
+  const stored: Doctrine = loadDoctrine(doctrineDir);
+
+  // Plan against the wake time that ACTUALLY happened, when the owner reported one
+  // (main/wake.ts). The whole doctrine is expressed in hours-after-wake — the energy curve,
+  // the first-hour cognitive ban, every ritual offset, and therefore the shutdown boundary —
+  // so overriding this one field shifts the entire day correctly and nothing downstream
+  // needs to know about it.
+  //
+  // A COPY, for this date's plan only: the stored doctrine.yaml is the owner's intention and
+  // is never rewritten by an observation. Tomorrow, with no wake reported, falls back to it.
+  const wakeTime = wakeTimeFor(db, dateISO, stored);
+  const doctrine: Doctrine =
+    wakeTime === stored.chronotype.wake_time
+      ? stored
+      : { ...stored, chronotype: { ...stored.chronotype, wake_time: wakeTime } };
 
   // anchors: external GCal events + locked blocks from prior plans for this date
   const anchors: Anchor[] = [];
@@ -150,7 +174,9 @@ export async function generatePlan(
   }));
 
   const result = solve(tasks, doctrine, anchors);
-  const narration = await narrate(result, doctrine, llm);
+  // Same injection for the narration: a chief of staff explaining the day should know the
+  // owner's standing preferences, not just the blocks that came out of the solver.
+  const narration = await narrate(result, doctrine, withPreferences(llm, doctrineDir, ["narration"]));
 
   // persist: replace any prior un-accepted plan for the date
   const persist = db.transaction(() => {
@@ -158,6 +184,9 @@ export async function generatePlan(
       .prepare("SELECT id FROM plan WHERE plan_date = ? AND accepted_at IS NULL")
       .all(dateISO) as { id: number }[];
     for (const o of old) db.prepare("DELETE FROM plan WHERE id = ?").run(o.id); // blocks cascade
+    // The snapshot is the EFFECTIVE doctrine (observed wake folded in), not the file on
+    // disk: it exists to explain why this plan looks the way it does, and a 06:40 wake is
+    // the reason half of it moved.
     const { lastInsertRowid } = db
       .prepare("INSERT INTO plan (plan_date, engine_version, doctrine_snapshot, narration, unplaced_tasks) VALUES (?, ?, ?, ?, ?)")
       .run(dateISO, ENGINE_VERSION, JSON.stringify(doctrine), narration,

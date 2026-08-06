@@ -2,7 +2,9 @@
 // capacity scores and eligibility masks.
 
 import { describe, it, expect } from "vitest";
-import { parseDoctrine, DEFAULT_DOCTRINE_YAML, capacityAt, bufferedMinutes } from "../../main/engine/doctrine.ts";
+import {
+  parseDoctrine, DEFAULT_DOCTRINE_YAML, capacityAt, bufferedMinutes, shutdownStartMin,
+} from "../../main/engine/doctrine.ts";
 import { buildGrid, type Anchor } from "../../main/engine/grid.ts";
 
 const doctrine = parseDoctrine(DEFAULT_DOCTRINE_YAML);
@@ -76,6 +78,67 @@ describe("buildGrid (Phase 3 gate)", () => {
     expect(late.eligible.comms).toBe(false);
     const eightPm = grid.slots.find((s) => s.startMin === 19 * 60 + 45)!; // ends 20:00, 3h
     expect(eightPm.eligible.gym).toBe(true);
+  });
+
+  // Owner report 2026-08-05: shutdown fired at ~19:30, then 2.5h of "free time", then a
+  // task at 22:15–23:00. Shutdown means the work day is CLOSED.
+  describe("shutdown closes the work day", () => {
+    it("shipped default puts the boundary 2.5h before sleep (20:30)", () => {
+      expect(shutdownStartMin(doctrine)).toBe(20 * 60 + 30);
+      expect(grid.shutdownMin).toBe(20 * 60 + 30);
+    });
+
+    it("no work type is eligible at or after the boundary", () => {
+      const after = grid.slots.filter((s) => s.startMin >= 20 * 60 + 30);
+      expect(after.length).toBeGreaterThan(0);
+      for (const s of after) {
+        for (const t of ["deep_work", "focused_work", "admin", "comms", "meeting"] as const) {
+          expect(s.eligible[t], `${t} at ${s.startMin}`).toBe(false);
+        }
+      }
+    });
+
+    it("the last slot BEFORE the boundary is still open for work", () => {
+      const last = grid.slots.find((s) => s.startMin === 20 * 60 + 15)!;
+      expect(last.eligible.focused_work).toBe(true);
+      expect(last.eligible.admin).toBe(true);
+      expect(last.eligible.meeting).toBe(true);
+    });
+
+    it("personal, meal and break stay legal after the boundary", () => {
+      const evening = grid.slots.find((s) => s.startMin === 21 * 60)!;
+      expect(evening.eligible.personal).toBe(true);
+      expect(evening.eligible.meal).toBe(true);
+      expect(evening.eligible.break).toBe(true);
+      expect(evening.eligible.transition).toBe(true);
+      // Gym is life, not work, so the boundary does not touch it — but its OWN rule
+      // (end ≥3h before sleep) still applies, and at 21:00 that is what rejects it.
+      expect(evening.eligible.gym).toBe(false);
+    });
+
+    it("gym remains eligible after an early boundary — the ban is on work, not on the evening", () => {
+      // Shutdown 5h before sleep = 18:00, leaving post-boundary slots that clear the 3h gym floor.
+      const early = parseDoctrine(
+        DEFAULT_DOCTRINE_YAML.replace("before_sleep_hours: 2.5", "before_sleep_hours: 5.0")
+      );
+      const g = buildGrid(early, []);
+      expect(g.shutdownMin).toBe(18 * 60);
+      const s = g.slots.find((x) => x.startMin === 18 * 60 + 30)!; // after the boundary, 4.25h to sleep
+      expect(s.eligible.gym).toBe(true);
+      expect(s.eligible.personal).toBe(true);
+      expect(s.eligible.deep_work).toBe(false);
+      expect(s.eligible.admin).toBe(false);
+    });
+
+    it("a doctrine with no shutdown ritual bans nothing (boundary is null)", () => {
+      const none = parseDoctrine(
+        DEFAULT_DOCTRINE_YAML.replace(/^\s*- \{ type: shutdown.*$/m, "")
+      );
+      expect(shutdownStartMin(none)).toBeNull();
+      const g = buildGrid(none, []);
+      expect(g.shutdownMin).toBeNull();
+      expect(g.slots.find((s) => s.startMin === 21 * 60)!.eligible.focused_work).toBe(true);
+    });
   });
 
   it("computes contiguous free runs and physical peak", () => {

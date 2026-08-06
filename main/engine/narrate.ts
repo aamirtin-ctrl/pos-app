@@ -3,7 +3,7 @@
 // motivational language. Chief of staff, not a wellness app.
 // Deterministic template fallback when the LLM is unavailable.
 
-import type { Doctrine } from "./doctrine.ts";
+import { shutdownStartMin, type Doctrine } from "./doctrine.ts";
 import type { SolveResult, PlacedBlock } from "./solver.ts";
 import type { LlmClient } from "../llm/provider.ts";
 
@@ -16,11 +16,17 @@ export async function narrate(
   llm: LlmClient | null
 ): Promise<string> {
   const summary = summarize(result);
+  const closes = shutdownStartMin(doctrine);
   if (llm) {
     const prompt = `You are a chief of staff summarizing a generated day plan. Write 3-5 plain sentences:
 the shape of the day, what got prioritized, what got cut and why, and one specific flag if the
 day is over-committed. No emoji. No motivational language. No bullet points.
-
+${
+  closes === null
+    ? ""
+    : `\nThe work day CLOSES at ${fmt(closes)} (the shutdown ritual). Free time after that hour is
+deliberate — never suggest moving work into it, and never call it wasted or available.\n`
+}
 PLAN:
 ${summary}
 
@@ -32,7 +38,7 @@ ${result.notes.length === 0 ? "(none)" : result.notes.map((n) => `- ${n}`).join(
     const res = await llm.call("narration", "smart", prompt, { maxTokens: 400 });
     if (res?.text.trim()) return res.text.trim();
   }
-  return deterministicNarration(result);
+  return deterministicNarration(result, doctrine);
 }
 
 function summarize(result: SolveResult): string {
@@ -41,7 +47,12 @@ function summarize(result: SolveResult): string {
     .join("\n");
 }
 
-export function deterministicNarration(result: SolveResult): string {
+/**
+ * `doctrine` is optional only so older callers keep compiling; pass it when you have it.
+ * With it, the over-commitment flag names the real cause — the work day has an end, and
+ * tasks that missed it were deferred rather than pushed into the evening.
+ */
+export function deterministicNarration(result: SolveResult, doctrine?: Doctrine): string {
   const deep = result.blocks.filter((b) => b.blockType === "deep_work");
   const meetings = result.blocks.filter((b) => b.blockType === "meeting");
   const parts: string[] = [];
@@ -59,7 +70,12 @@ export function deterministicNarration(result: SolveResult): string {
       `${result.unplaced.length} task${result.unplaced.length > 1 ? "s" : ""} did not fit: ` +
         result.unplaced.map((u) => `${u.task.title} (${u.reason.replace(/_/g, " ")})`).join(", ") + "."
     );
-    parts.push("The day is over-committed; either defer these explicitly or cut scope now rather than at 22:00.");
+    const closes = doctrine ? shutdownStartMin(doctrine) : null;
+    parts.push(
+      closes === null
+        ? "The day is over-committed; either defer these explicitly or cut scope now rather than at 22:00."
+        : `The work day closes at ${fmt(closes)}, so the overflow is deferred rather than pushed into the evening; defer it explicitly or cut scope now.`
+    );
   }
   if (result.notes.length > 0) parts.push(result.notes[0]);
   return parts.slice(0, 5).join(" ");

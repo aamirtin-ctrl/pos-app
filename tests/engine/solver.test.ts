@@ -4,7 +4,7 @@
 // no deep right after a meeting cluster; zero free slots → no crash; determinism.
 
 import { describe, it, expect } from "vitest";
-import { parseDoctrine, DEFAULT_DOCTRINE_YAML } from "../../main/engine/doctrine.ts";
+import { parseDoctrine, DEFAULT_DOCTRINE_YAML, shutdownStartMin } from "../../main/engine/doctrine.ts";
 import { solve, type PlannerTask } from "../../main/engine/solver.ts";
 import type { Anchor } from "../../main/engine/grid.ts";
 
@@ -233,5 +233,86 @@ describe("solver — §9 gate", () => {
     const deep = r.blocks.find((b) => b.taskId === t.id)!;
     const brk = r.blocks.find((b) => b.blockType === "break" && b.startMin === deep.endMin);
     expect(brk).toBeTruthy();
+  });
+});
+
+// Owner report 2026-08-05: "shutdown at ~19:30, then 2.5h of free time, then another task
+// at 22:15–23:00." Shutdown is a BOUNDARY — after it the work day is closed.
+describe("solver — shutdown is a hard end-of-work boundary", () => {
+  const SHUTDOWN = shutdownStartMin(doctrine)!; // 20:30 with the shipped default
+  const WORK = ["deep_work", "focused_work", "admin", "comms", "meeting"];
+
+  it("the shutdown ritual itself lands on the boundary", () => {
+    const r = solve([], doctrine, []);
+    const sd = r.blocks.find((b) => b.blockType === "shutdown");
+    expect(sd).toBeTruthy();
+    expect(sd!.startMin).toBe(SHUTDOWN);
+  });
+
+  it("a heavy day never starts a work block at or after shutdown", () => {
+    // Far more work than the day can hold, of every work type, so the solver is under
+    // maximum pressure to spill into the evening.
+    const ts = [
+      mkTask({ blockType: "deep_work", estimatedMinutes: 120, cognitiveLoad: 5, isMit: true }),
+      mkTask({ blockType: "deep_work", estimatedMinutes: 120, cognitiveLoad: 4 }),
+      ...[1, 2, 3, 4].map((i) => mkTask({ blockType: "focused_work", estimatedMinutes: 90, title: `focus ${i}` })),
+      ...[1, 2, 3, 4].map((i) => mkTask({ blockType: "admin", estimatedMinutes: 45, title: `admin ${i}` })),
+      ...[1, 2].map((i) => mkTask({ blockType: "comms", estimatedMinutes: 25, title: `comms ${i}` })),
+    ];
+    const r = solve(ts, doctrine, []);
+    const work = r.blocks.filter((b) => WORK.includes(b.blockType));
+    expect(work.length).toBeGreaterThan(3); // the day really did fill up
+    for (const b of work) {
+      expect(b.startMin, `"${b.title}" starts at ${b.startMin}, boundary is ${SHUTDOWN}`).toBeLessThan(SHUTDOWN);
+      // and it may not run THROUGH the boundary either — work ends by shutdown
+      expect(b.endMin, `"${b.title}" runs past the boundary`).toBeLessThanOrEqual(SHUTDOWN);
+    }
+    // Something had to give, and it went to unplaced rather than into the evening.
+    expect(r.unplaced.length).toBeGreaterThan(0);
+  });
+
+  it("a task that only fits in the evening becomes unplaced with no_eligible_slot", () => {
+    // Every minute from wake to 21:00 is anchored; only 21:00–23:00 is free.
+    const anchors: Anchor[] = [
+      { startMin: W, endMin: 21 * 60, blockType: "personal", title: "all day out" },
+    ];
+    const t = mkTask({ blockType: "focused_work", estimatedMinutes: 60, title: "evening orphan" });
+    const r = solve([t], doctrine, anchors);
+    expect(r.blocks.filter((b) => b.taskId === t.id)).toHaveLength(0);
+    expect(r.unplaced).toHaveLength(1);
+    expect(r.unplaced[0].reason).toBe("no_eligible_slot");
+    // and the solver explains the wall rather than leaving "no eligible slot" to be read as a bug
+    expect(r.notes.some((n) => /work day closes at 20:30/i.test(n))).toBe(true);
+  });
+
+  it("gym and personal blocks may still be placed after shutdown", () => {
+    // Boundary at 18:00 so the evening has room that clears the 3h gym-before-sleep floor.
+    const early = parseDoctrine(DEFAULT_DOCTRINE_YAML.replace("before_sleep_hours: 2.5", "before_sleep_hours: 5.0"));
+    // Everything before 18:00 is occupied, so the ONLY place gym can go is after shutdown.
+    const anchors: Anchor[] = [
+      { startMin: W, endMin: 18 * 60, blockType: "personal", title: "packed" },
+    ];
+    const gym = mkTask({ blockType: "gym", estimatedMinutes: 60, title: "Gym" });
+    const personal = mkTask({ blockType: "personal", estimatedMinutes: 30, title: "Call Mum" });
+    const r = solve([gym, personal], early, anchors);
+
+    const g = r.blocks.find((b) => b.taskId === gym.id);
+    expect(g).toBeTruthy();
+    expect(g!.startMin).toBeGreaterThanOrEqual(18 * 60); // genuinely after the boundary
+    const p = r.blocks.find((b) => b.taskId === personal.id);
+    expect(p).toBeTruthy();
+    expect(p!.startMin).toBeGreaterThanOrEqual(18 * 60);
+  });
+
+  it("an editable boundary actually moves — 4.0h closes the day at 19:00", () => {
+    const late = parseDoctrine(DEFAULT_DOCTRINE_YAML.replace("before_sleep_hours: 2.5", "before_sleep_hours: 4.0"));
+    expect(shutdownStartMin(late)).toBe(19 * 60);
+    const ts = [1, 2, 3, 4, 5].map((i) =>
+      mkTask({ blockType: "focused_work", estimatedMinutes: 90, title: `focus ${i}` })
+    );
+    const r = solve(ts, late, []);
+    for (const b of r.blocks.filter((x) => WORK.includes(x.blockType))) {
+      expect(b.endMin).toBeLessThanOrEqual(19 * 60);
+    }
   });
 });

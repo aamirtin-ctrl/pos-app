@@ -1,8 +1,10 @@
 // Morning capture — ingest the user's SELF-messages (note-to-self email + the iMessage
 // note-to-self thread) and route each through the unified assistant (handleCommand), which
 // turns braindumps into a generated day plan, notes into contact updates, etc.
-// Two exceptions (main/digest.ts): the app's OWN digests (prefix "POS — ") are skipped
-// outright, and confirm/drop replies to a digest route to handleDigestReply instead.
+// Three exceptions: the app's OWN digests (prefix "POS — ", main/digest.ts) are skipped
+// outright; confirm/drop replies to a digest route to handleDigestReply instead; and a
+// morning wake report ("just woke up", "morning!") is consumed by main/wake.ts, which
+// records the MESSAGE'S timestamp as that day's real wake time (see runCapture).
 //
 // Sources:
 //   - Email: for every configured mail account, INBOX messages whose From address is the
@@ -50,8 +52,9 @@ import { handleCommand } from "./assistant.ts";
 import { listMailAccounts, type MailAccount } from "./connectors/gmail.ts";
 import { getCursor, setCursor, type ConnectorDeps, type SyncReport } from "./connectors/common.ts";
 import { contentHash, contentSeen, logExtraction } from "./crm/commitments.ts";
-import { decodeAttributedBody, imessageAvailable, DEFAULT_CHAT_DB } from "./connectors/imessage.ts";
+import { appleDateToDate, decodeAttributedBody, imessageAvailable, DEFAULT_CHAT_DB } from "./connectors/imessage.ts";
 import { isDigestMessage, isDigestReply, handleDigestReply } from "./digest.ts";
+import { isWakeMessage, recordWake } from "./wake.ts";
 
 const req: ReturnType<typeof createRequire> =
   typeof require === "function" ? require : createRequire(import.meta.url);
@@ -222,6 +225,13 @@ export function captureText(
 export interface SelfMessage {
   channel: "mail" | "imessage";
   text: string;
+  /**
+   * When the message was SENT, ISO — mail internalDate, iMessage message.date. Not the
+   * moment capture read it: capture runs on a worker tick, so a 06:40 text is routinely
+   * processed at 07:15. Anything that cares about when the owner did something (the wake
+   * report in main/wake.ts) must use this, never Date.now().
+   */
+  sentAt: string;
   /** Commit this message's cursor position — call ONLY after successful processing. */
   advance: () => void;
 }
@@ -358,6 +368,7 @@ async function captureFromAccount(
     batch.messages.push({
       channel: "mail",
       text: m.text,
+      sentAt: new Date(m.timeMs).toISOString(),
       advance: () => setCursor(db, cursorSource, new Date(m.timeMs).toISOString()),
     });
   }
@@ -571,7 +582,8 @@ export async function captureFromIMessage(
     try {
       chat.exec("PRAGMA query_only = ON;");
       const stmt = chat.prepare(`
-        SELECT m.ROWID AS rowid, m.text AS text, m.attributedBody AS body, ch.id AS counterpart
+        SELECT m.ROWID AS rowid, m.text AS text, m.attributedBody AS body, m.date AS date,
+               ch.id AS counterpart
         FROM message m
         JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
         JOIN chat c ON c.ROWID = cmj.chat_id
@@ -590,6 +602,7 @@ export async function captureFromIMessage(
         rowid: bigint;
         text: string | null;
         body: Uint8Array | null;
+        date: bigint;
         counterpart: string | null;
       }>;
 
@@ -607,6 +620,8 @@ export async function captureFromIMessage(
         batch.messages.push({
           channel: "imessage",
           text,
+          // chat.db keeps Apple-epoch ns (older rows: seconds) — appleDateToDate handles both.
+          sentAt: appleDateToDate(row.date ?? 0n).toISOString(),
           advance: () => setCursor(db, "capture:imessage", rowid.toString()),
         });
       }
@@ -666,6 +681,31 @@ export async function runCapture(deps: ConnectorDeps): Promise<SyncReport> {
       // The app's own morning digests land in the same self thread — never re-ingest them.
       if (isDigestMessage(m.text)) {
         report.skipped++;
+        m.advance();
+        continue;
+      }
+      // "just woke up" / "morning!" is a WAKE REPORT, not a task (owner request
+      // 2026-08-05): he texts his own number or has Alexa mail him when he gets up, and the
+      // day is then planned against the real wake instead of the doctrine's 07:30.
+      //
+      // The MESSAGE'S OWN timestamp is recorded, never now() — capture runs on a worker
+      // tick, so a 06:40 text is routinely read at 07:15 and now() would log the wrong hour.
+      // The morning cutoff lives in isWakeMessage, so an afternoon "awake" stays a normal
+      // capture and reaches the assistant.
+      //
+      // This sits BEFORE the content-hash dedupe on purpose: wake pings are the most
+      // repetitive text the owner ever sends ("morning!" every single day), and the hash is
+      // global and permanent — deduping them would record a wake exactly once, ever, and
+      // silently ignore every morning after. It is consumed either way (no assistant call,
+      // no extraction_log entry), so nothing downstream can double-process it.
+      if (isWakeMessage(m.text, m.sentAt)) {
+        const rec = recordWake(deps.db, m.sentAt);
+        if (rec) {
+          report.ingested++;
+          kinds.set("wake", (kinds.get("wake") ?? 0) + 1);
+        } else {
+          report.skipped++;
+        }
         m.advance();
         continue;
       }

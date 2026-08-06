@@ -34,6 +34,19 @@ export const COGNITIVE_TYPES: ReadonlySet<BlockType> = new Set([
   "deep_work", "focused_work", "admin", "comms", "shutdown",
 ]);
 
+/**
+ * WORK. Everything the shutdown ritual closes the door on (owner report 2026-08-05: the
+ * ritual fired at 19:30 and a task still landed at 22:15 — a shutdown you schedule work
+ * after is not a shutdown). Deliberately NOT the same set as COGNITIVE_TYPES:
+ *   - `meeting` is work even though it is not "cognitive" for the first-hour ban;
+ *   - `shutdown` is the boundary itself, so it must stay legal at its own start;
+ *   - `gym`, `meal`, `break`, `personal`, `transition` are life, not work — the evening
+ *     is exactly where they belong.
+ */
+export const WORK_TYPES: ReadonlySet<BlockType> = new Set([
+  "deep_work", "focused_work", "admin", "comms", "meeting",
+]);
+
 const curvePoint = z.object({ hours_after_wake: z.number().min(0), capacity: z.number().min(0).max(100) });
 
 const doctrineSchema = z.object({
@@ -151,10 +164,25 @@ soft_preferences:
     comms_windows_at_fixed_times: 3
 
 fixed_rituals:
+  # The shutdown ritual is a BOUNDARY, not a suggestion: it marks the end of the WORK day.
+  # Nothing of type deep_work / focused_work / admin / comms / meeting may start at or after
+  # it, and a work block may not run through it — the engine sends anything that doesn't fit
+  # to the unplaced list instead of spilling into the evening. After it: personal time,
+  # dinner, gym, wind-down. 2.5h before a 23:00 sleep = 20:30, which leaves a real evening
+  # without amputating the after-dinner hours a student actually works in. Raise it to end
+  # the day earlier; lower it to keep working later. Edit freely — this is your call.
+  #
+  # The morning routine is the OTHER boundary, and it is the owner's own words (2026-08-05):
+  # "in the morning I'd like half an hour to shower and read before starting anything."
+  # A line in preferences.md states that intent; only a ritual can RESERVE the time, so it
+  # lives here too. It pairs with no_cognitive_work_before_hours_after_wake below and the
+  # two reinforce each other: for the first hour nothing cognitive may be scheduled at all,
+  # and the first 30 minutes of that hour are explicitly his rather than merely empty.
+  - { type: personal, at_hours_after_wake: 0.0,  duration: 30, label: "Morning routine (shower, reading)" }
   - { type: comms,    at_hours_after_wake: 2.0,  duration: 25, label: "Comms window 1" }
   - { type: meal,     at_hours_after_wake: 5.5,  duration: 40, label: "Lunch" }
   - { type: comms,    at_hours_after_wake: 8.5,  duration: 25, label: "Comms window 2" }
-  - { type: shutdown, before_sleep_hours: 4.0,   duration: 15, label: "Shutdown ritual" }
+  - { type: shutdown, before_sleep_hours: 2.5,   duration: 15, label: "Shutdown ritual" }
 
 estimation:
   # Planning-fallacy correction: percentage buffers scale with task size; fixed additions don't.
@@ -196,6 +224,47 @@ export function saveDoctrine(dir: string, yamlText: string): Doctrine {
 export function hhmmToMin(hhmm: string): number {
   const [h, m] = hhmm.split(":").map(Number);
   return h * 60 + m;
+}
+
+/**
+ * The day's outer bounds in minutes-since-midnight. `sleepMin` is pushed past 24:00 when
+ * sleep onset is after midnight, so `sleepMin > wakeMin` always holds. ONE definition,
+ * shared by the grid and the shutdown boundary below — if these ever disagreed, the grid
+ * would ban work at a different minute than the solver puts the ritual.
+ */
+export function dayBounds(doctrine: Doctrine): { wakeMin: number; sleepMin: number } {
+  const wakeMin = hhmmToMin(doctrine.chronotype.wake_time);
+  let sleepMin = hhmmToMin(doctrine.chronotype.sleep_onset);
+  if (sleepMin <= wakeMin) sleepMin += 24 * 60; // past-midnight sleep
+  return { wakeMin, sleepMin };
+}
+
+/**
+ * Minutes-since-midnight at which the WORK day closes — the start of the shutdown ritual.
+ * null when the doctrine defines no shutdown ritual (then nothing is banned; the day runs
+ * to sleep as it always did).
+ *
+ * Computed EXACTLY the way solver.ts computes a ritual's target (`at_hours_after_wake`
+ * wins over `before_sleep_hours`), because grid.ts uses this as the work cutoff and
+ * solver.ts places the ritual there. Two shutdown rituals → the earliest one wins: the
+ * boundary is the moment work stops, and the first one is that moment.
+ *
+ * Note this is the ritual's NOMINAL target. If an immovable anchor forces the solver to
+ * bend the actual shutdown block off that minute, the ban stays anchored here — a
+ * conservative cutoff beats work sneaking in behind a displaced ritual.
+ */
+export function shutdownStartMin(doctrine: Doctrine): number | null {
+  const { wakeMin, sleepMin } = dayBounds(doctrine);
+  let earliest: number | null = null;
+  for (const r of doctrine.fixed_rituals) {
+    if (r.type !== "shutdown") continue;
+    let at: number;
+    if (r.at_hours_after_wake !== undefined) at = wakeMin + r.at_hours_after_wake * 60;
+    else if (r.before_sleep_hours !== undefined) at = sleepMin - r.before_sleep_hours * 60;
+    else continue; // a ritual with neither offset has no position — solver skips it too
+    if (earliest === null || at < earliest) earliest = at;
+  }
+  return earliest;
 }
 
 /** Linear interpolation over the energy curve. Clamps outside the control points. */
