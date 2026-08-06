@@ -2,8 +2,9 @@
 // Gmail, Outlook, or custom IMAP. Ported from PersonalCRM2 connectors/gmail.ts; adapted
 // to the no-staging architecture: each message's counterpart is resolved inline via
 // resolveHandle and written directly to `interaction`. Unknown REAL senders become
-// unverified tier-3 contacts (owner spec 2026-08-05); automated senders are skipped
-// evidence of a real relationship).
+// unverified tier-3 contacts (owner spec 2026-08-05); bulk mail (newsletters, campaigns,
+// notification blasts — see isBulkMail in common.ts) is dropped before identity resolution
+// so it never becomes a person or an interaction.
 //
 // Accounts: JSON array under secret MAIL_ACCOUNTS (id/provider/user/password/host/port).
 // Back-compat: legacy GMAIL_USER / GMAIL_APP_PASSWORD secrets are synthesized into the
@@ -29,8 +30,9 @@ import {
   setCursor,
   snippet,
   resolvedPct,
+  isBulkMail,
 } from "./common.ts";
-import { isAutomatedSender, parseForwardedHeaders, stripFwdPrefix } from "./email-utils.ts";
+import { parseForwardedHeaders, stripFwdPrefix } from "./email-utils.ts";
 
 const FIRST_RUN_MONTHS = 12;
 
@@ -314,8 +316,20 @@ export async function syncMailAccount(
               subject = parsed.subject ?? null;
             }
 
-            if (!cpEmail || selfSet.has(cpEmail.toLowerCase()) || isAutomatedSender(cpEmail)) {
+            if (!cpEmail || selfSet.has(cpEmail.toLowerCase())) {
               report.skipped++;
+              continue;
+            }
+
+            // Bulk gate, BEFORE identity resolution: newsletters and campaign blasts must
+            // never create a person or an interaction row. Header-based (List-Unsubscribe,
+            // Precedence, Auto-Submitted, ESP fingerprints, bounce return-paths) so senders
+            // with real-looking addresses — newsletters@nytimes.com, info@x.com — can't
+            // evade it the way they evaded the old local-part denylist.
+            const verdict = isBulkMail(parsed, { fromEmail: cpEmail });
+            if (verdict.bulk) {
+              report.skipped++;
+              report.skippedBulk = (report.skippedBulk ?? 0) + 1;
               continue;
             }
 
@@ -429,6 +443,7 @@ export async function syncAllMail(deps: ConnectorDeps): Promise<SyncReport> {
     report.ingested += r.ingested;
     report.skipped += r.skipped;
     report.created += r.created;
+    if (r.skippedBulk) report.skippedBulk = (report.skippedBulk ?? 0) + r.skippedBulk;
     if (r.error) errors.push(`${account.user}: ${r.error}`);
   }
   if (errors.length) report.error = errors.join("; ");

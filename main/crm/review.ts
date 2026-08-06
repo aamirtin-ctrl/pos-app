@@ -25,6 +25,7 @@ import { getSetting, setSetting } from "../db/db.ts";
 import { assignToGroup } from "./groups.ts";
 import { mergePeople } from "./people.ts";
 import { emailDomain, isGenericEmailDomain, normalizeName } from "./normalize.ts";
+import { bulkAddressReason, isBulkDisplayName } from "../connectors/common.ts";
 
 /** The tag connectors put on auto-created contacts (main/connectors/{imessage,gmail}.ts). */
 export const UNVERIFIED_TAG = "unverified";
@@ -163,6 +164,123 @@ export function groupContacts(db: Db, ids: number[], groupName: string): { added
   if (!name) throw new Error("group name is empty");
   const added = assignToGroup(db, list, name);
   return { added, kept: keepContacts(db, list) };
+}
+
+// ─────────────────── bulk-mail cleanup (what leaked before the gate) ───────────────────
+// The mail connector only gained a header-based bulk gate on 2026-08-05. Everything the
+// old local-part denylist let through is already sitting in the DB as `unverified`
+// contacts with inbound-only email history: Half Baked, X, the NYT, Instagram, Alexa.
+//
+// This is a DELETE, so the qualifying test is deliberately narrow — three conditions,
+// ALL required:
+//   1. carries the `unverified` tag (never touches a contact a human confirmed);
+//   2. has at least one interaction and EVERY interaction is an inbound mail-channel row
+//      (one reply, one iMessage, one meeting → a real relationship, left alone);
+//   3. looks bulk: every email alias matches bulkAddressReason, OR the display name is a
+//      robot name, OR every stored subject is unmistakably newsletter/notification copy.
+
+/** Channels that count as email for condition 2. Anything else disqualifies the person. */
+const MAIL_CHANNELS = new Set(["gmail", "outlook", "email", "mail", "mailfile", "linkedin-email"]);
+
+/**
+ * Subject copy no human writes to one person. Only consulted when the address and name
+ * were inconclusive, and only when EVERY stored subject matches.
+ */
+const BULK_SUBJECT =
+  /(unsubscribe|newsletter|\bdigest\b|your (daily|weekly|monthly)\b|this week in\b|\d+% off|limited time|shop now|new arrivals|sale ends|order (confirmation|update|#)|your order|your receipt|invoice #|verify your (email|account)|confirm your (email|subscription|account)|reset your password|password reset|security alert|new sign-?in|we've updated our|terms of service|privacy policy|webinar|black friday|cyber monday|recommended for you|trending (now|today)|new (post|episode|video) from|liked your|started following|weekly recap|latest issue)/i;
+
+export interface BulkPurgeCandidate {
+  id: number;
+  display_name: string;
+  /** Which rule condemned them — surfaced so a surprising purge count is explainable. */
+  reason: string;
+  interactions: number;
+}
+
+/** The people purgeBulkContacts would delete, with the reason — the dry-run view. */
+export function bulkContactCandidates(db: Db): BulkPurgeCandidate[] {
+  const people = db
+    .prepare(
+      `SELECT p.id, p.display_name
+         FROM person p
+         JOIN person_tag t ON t.person_id = p.id AND t.tag = ?
+        ORDER BY p.id`
+    )
+    .all(UNVERIFIED_TAG) as { id: number; display_name: string }[];
+  if (people.length === 0) return [];
+
+  const aliasesOf = db.prepare("SELECT kind, value FROM alias WHERE person_id = ?");
+  const rowsOf = db.prepare(
+    "SELECT channel, direction, subject, body_summary FROM interaction WHERE person_id = ?"
+  );
+
+  const out: BulkPurgeCandidate[] = [];
+  for (const p of people) {
+    const rows = rowsOf.all(p.id) as {
+      channel: string;
+      direction: string | null;
+      subject: string | null;
+      body_summary: string | null;
+    }[];
+    // Condition 2 — inbound email and nothing else. No history at all is NOT enough
+    // evidence to delete somebody, so an empty list disqualifies too.
+    if (rows.length === 0) continue;
+    if (rows.some((r) => !MAIL_CHANNELS.has(r.channel) || r.direction !== "inbound")) continue;
+
+    // Condition 3 — address, then name, then subjects.
+    const aliases = aliasesOf.all(p.id) as { kind: string; value: string }[];
+    const emails = aliases.filter((a) => a.kind === "email").map((a) => a.value);
+    const addressReasons = emails.map((e) => bulkAddressReason(e));
+    let reason: string | null = null;
+    if (emails.length > 0 && addressReasons.every((r) => r !== null)) {
+      reason = addressReasons[0];
+    } else if (isBulkDisplayName(p.display_name) || bulkAddressReason(p.display_name.trim())) {
+      reason = `bulk-display-name:${p.display_name.trim()}`;
+    } else {
+      const subjects = rows.map((r) => (r.subject ?? "").trim()).filter(Boolean);
+      if (subjects.length === rows.length && subjects.every((s) => BULK_SUBJECT.test(s))) {
+        reason = "bulk-subjects";
+      }
+    }
+    if (!reason) continue;
+    out.push({ id: p.id, display_name: p.display_name, reason, interactions: rows.length });
+  }
+  return out;
+}
+
+/**
+ * Delete the leaked newsletter contacts and their interactions (alias/interaction rows
+ * cascade off person — see migration 1). Returns how many people were removed.
+ */
+export function purgeBulkContacts(db: Db): number {
+  const candidates = bulkContactCandidates(db);
+  if (candidates.length === 0) return 0;
+  const del = db.prepare("DELETE FROM person WHERE id = ?");
+  const run = db.transaction(() => {
+    let n = 0;
+    for (const c of candidates) n += del.run(c.id).changes;
+    return n;
+  });
+  return run();
+}
+
+/** Setting key that makes the cleanup a one-shot — see purgeBulkContactsOnce. */
+export const BULK_CLEANUP_SETTING = "cleanup_bulk_v1";
+
+/**
+ * One-shot wrapper for startup wiring (main/index.ts or main/workers.ts — NOT edited
+ * here). Call it once after migrations run; the `cleanup_bulk_v1` setting makes every
+ * later call a no-op, so re-running it on each boot is safe:
+ *
+ *     import { purgeBulkContactsOnce } from "./crm/review.ts";
+ *     const { ran, purged } = purgeBulkContactsOnce(db);
+ *     if (ran) console.log(`[cleanup] purged ${purged} bulk contacts`);
+ */
+export function purgeBulkContactsOnce(db: Db): { ran: boolean; purged: number } {
+  if (getSetting(db, BULK_CLEANUP_SETTING)) return { ran: false, purged: 0 };
+  const purged = purgeBulkContacts(db);
+  setSetting(db, BULK_CLEANUP_SETTING, JSON.stringify({ at: new Date().toISOString(), purged }));
+  return { ran: true, purged };
 }
 
 // ───────────────────────────── #9 duplicate clustering ─────────────────────────────
