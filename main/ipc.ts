@@ -5,7 +5,7 @@ import { ipcMain, shell, dialog, BrowserWindow } from "electron";
 import type { Db } from "./db/db.ts";
 import { getSetting, setSetting, hasVec } from "./db/db.ts";
 import { SecretStore, SECRET_NAMES } from "./secrets.ts";
-import { LlmClient } from "./llm/provider.ts";
+import { LlmClient, llmHealth } from "./llm/provider.ts";
 import { monthSpend, getCeiling, setCeiling } from "./llm/meter.ts";
 import {
   listPeople,
@@ -528,6 +528,9 @@ export function registerIpc(deps: IpcDeps) {
     return { saved: true };
   });
   h("settings.spend", () => ({ ...monthSpend(db), ceiling: getCeiling(db) }));
+  // Is the AI actually working? Polled by the settings gear (red ring), the Spend card and
+  // the planner footer — all of which otherwise show a silent deterministic fallback.
+  h("llm.health", () => llmHealth(db, secrets));
   h("settings.setCeiling", (usd: number) => {
     setCeiling(db, usd);
     return { saved: true };

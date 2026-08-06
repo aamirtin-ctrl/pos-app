@@ -224,10 +224,57 @@ export function applyFact(db: Db, req: FactRequest): AssistantResult {
 /** Deterministic entry point for a preference statement. */
 export const PREFER_PREFIX = /^(prefer|preference|i like|i want|i'd like|remind me that i)\b/i;
 
+/**
+ * Preferences the owner states WITHOUT announcing them (owner ask 2026-08-05: "I typically
+ * need a half hour for showering and reading before starting the day" should file itself).
+ * These are habit-shaped openings — the grammar of a standing rule rather than a request.
+ *
+ * They are weaker than PREFER_PREFIX by design: handleCommand lets the classifier's stronger
+ * intents (a braindump, an event, a note, a search) win over an implicit match, because
+ * "I always send the deck Monday 9am" is an event first and a habit second.
+ */
+const IMPLICIT_PREFERENCE_PATTERNS: RegExp[] = [
+  /^i (typically|usually|generally|always|never|like to|prefer to|need|want|try to)\b/i,
+  /^(don't|do not|never) (schedule|book|put|plan)\b/i,
+  /^my \w+ (routine|preference|rule)\b/i,
+  /\bworks? best for me\b/i,
+  /\bi'?m (a )?(morning|night) person\b/i,
+];
+
+/**
+ * "I need to call the dentist" opens exactly like "I need a half hour every morning" and is
+ * the opposite thing: one errand, done once, gone. The split is the infinitive — "need/want
+ * to <verb>" is an action the owner is about to take — unless the sentence also says the
+ * action RECURS, which turns the same words back into a habit.
+ *
+ * This guard applies to "I want to …" as well as to the unannounced patterns, because that
+ * opening was always ambiguous; only an explicit "prefer:"/"preference:" label is exempt,
+ * since there the owner has said outright what he is filing.
+ */
+const ONE_OFF_TASK = /^i\s+(?:need|want|have)\s+to\s+\w+/i;
+
+const EXPLICIT_LABEL = /^\s*prefer(?:ence)?\b/i;
+
+/**
+ * Markers that a statement describes what is NORMALLY true. The bare plurals are doing real
+ * work: in English "I want to keep mornings free" means every morning, while "I want to
+ * email Raj back today" means once.
+ */
+const HABITUAL = new RegExp(
+  "\\b(typically|usually|generally|always|never|routinely|habitually|as a rule|by default" +
+    "|every\\s+(?:day|morning|night|evening|week|weekend)|each\\s+(?:day|morning|night|week)" +
+    "|(?:morning|evening|afternoon|night|weekend)s" +
+    "|on (?:mondays|tuesdays|wednesdays|thursdays|fridays|saturdays|sundays)" +
+    "|routine|habit|prefer|preference)\\b",
+  "i"
+);
+
 /** One parsed preference, ready for appendPreference. */
 export interface PreferenceRequest {
   section: string;
   line: string;
+  /** True when nothing announced it — matched by grammar alone, so it yields to stronger intents. */
+  implicit?: boolean;
 }
 
 /**
@@ -235,7 +282,7 @@ export interface PreferenceRequest {
  * unrecognized is Personal, which is the honest answer for "I don't cook on Sundays".
  */
 const SECTION_HINTS: [RegExp, string][] = [
-  [/\b(morning|wake|wake\s*up|shower|breakfast|first thing|before\s+(?:i\s+)?start|early)\b/i, "Mornings"],
+  [/\b(morning|wake|wake\s*up|shower(?:ing)?|breakfast|first thing|before\s+(?:i\s+)?start|start(?:ing)?\s+(?:the|my)\s+day|early)\b/i, "Mornings"],
   [/\b(deep work|focus|focused|uninterrupted|study|studying|problem set|writing|coding|essay|research)\b/i, "Deep work"],
   [/\b(meeting|meetings|call|calls|1:1|zoom|sync|standup|back to back|back-to-back)\b/i, "Meetings"],
   [/\b(email|inbox|reply|replies|respond|text|texts|imessage|slack|message|messages|comms|dm)\b/i, "Communication"],
@@ -266,20 +313,42 @@ const CALENDAR_DATE = new RegExp(
 );
 
 /**
+ * The one place a statement is refused as a preference, shared by the deterministic parser
+ * and the LLM classifier's `preference` intent — so a fact cannot become a taste by taking
+ * the other route in. An explicit "remember" prefix always wins, and a statement naming a
+ * calendar date is a fact whatever verb introduced it.
+ */
+export function refusedAsPreference(text: string, now: Date = new Date()): boolean {
+  const t = (text ?? "").trim();
+  if (!t) return true;
+  if (REMEMBER_PREFIX.test(t)) return true;
+  const body = stripPreferLabel(t);
+  if (CALENDAR_DATE.test(body)) return true;
+  return parseFactDeterministic(body, now)?.kind === "date_anchor";
+}
+
+/**
  * Regex-only preference parsing. Returns null when the text is not a preference statement
  * OR when it is really a fact in disguise — both of which mean "let another intent have it".
+ *
+ * Two strengths of match: an announced preference ("prefer: …", "I'd like …") and an
+ * implicit one ("I typically need half an hour before starting the day"), flagged so the
+ * caller can rank it below the classifier's stronger intents.
  */
 export function parsePreferenceDeterministic(text: string, now: Date = new Date()): PreferenceRequest | null {
   const t = (text ?? "").trim();
   if (!t) return null;
-  if (REMEMBER_PREFIX.test(t)) return null; // an explicit "remember: …" is always a fact
-  if (!PREFER_PREFIX.test(t)) return null;
+  const announced = PREFER_PREFIX.test(t);
+  const implicit = !announced && IMPLICIT_PREFERENCE_PATTERNS.some((re) => re.test(t));
+  if (!announced && !implicit) return null;
+  // "I need to call the dentist" is an errand, not a habit — unless it says it recurs.
+  if (!EXPLICIT_LABEL.test(t) && ONE_OFF_TASK.test(t) && !HABITUAL.test(t)) return null;
+  if (refusedAsPreference(t, now)) return null;
   const body = stripPreferLabel(t).replace(/\s+/g, " ").trim();
   if (!body) return null;
-  // "I want school to start Sept 22" is a dated fact wearing a preference's clothes.
-  if (CALENDAR_DATE.test(body)) return null;
-  if (parseFactDeterministic(body, now)?.kind === "date_anchor") return null;
-  return { section: sectionForPreference(body), line: body };
+  return implicit
+    ? { section: sectionForPreference(body), line: body, implicit: true }
+    : { section: sectionForPreference(body), line: body };
 }
 
 /** LLM parse of a free-form preference statement. Null on no key / bad JSON / no content. */
@@ -403,19 +472,23 @@ export async function handleCommand(
   let intent = "question";
   let person: string | null = null;
   let content = t;
+  let llmPref: PreferenceRequest | null = null;
   if (llm) {
     const res = await llm.call(
       "assistant_route",
       "fast",
       `Classify this personal-assistant command. STRICT JSON only:
-{"intent":"plan_day"|"add_event"|"find_people"|"add_note"|"log_work"|"remember"|"prefer"|"search"|"rule"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>"}
+{"intent":"plan_day"|"add_event"|"find_people"|"add_note"|"log_work"|"remember"|"preference"|"search"|"rule"|"question","person":"<name if the command is about a specific person, else null>","content":"<the note text if add_note, else the original>","section":"<preference section, only when intent is preference>","line":"<the preference in the user's own words, only when intent is preference>"}
 "plan_day" = a braindump of tasks to schedule, or asking to plan the day.
 "add_event" = ONE specific commitment at a stated time ("lunch with Raj Thursday 1pm", "dentist tomorrow at 9"). A time must be stated or clearly implied.
 "find_people" = who should I talk to / reach out to / intro ideas.
 "add_note" = remember/save a fact about a person in the network.
 "log_work" = record something the USER did into their worklog ("log: shipped the deck", "log closed the Series A intro").
 "remember" = a durable fact about the USER THEMSELVES, not about a contact ("remember: school starts Sept 22", "I go to Stanford", "my birthday is March 4", "I live in Dallas"). Facts about someone else in the network are add_note, not remember.
-"prefer" = how the USER likes their time, work or communication handled — a habit, taste or standing rule that has no date and resolves to nothing ("I'd like half an hour to shower and read before starting anything", "no meetings before 10", "I answer email in batches"). A statement that names a DATE the app will look up later is "remember", not "prefer".
+"preference" = a durable habit, working style, or standing rule about how the user likes to operate — how they want their time, work or communication handled. It has no date, resolves to nothing, and describes what is normally true rather than something to do once ("I typically need a half hour for showering and reading before starting the day", "I'd like half an hour to shower and read before starting anything", "no meetings before 10", "I answer email in batches", "I'm a morning person"). It does NOT need a "prefer:" prefix — recognize it from the statement itself.
+  NOT a one-off task: "I need to call the dentist" is something to do once, so it is plan_day, not preference.
+  NOT a dated fact: a statement naming a DATE the app will look up later ("school starts Sept 22") is "remember", not preference.
+  When intent is "preference", also return "section" — one of ${PREFERENCE_SECTIONS.map((s) => `"${s}"`).join(", ")} — and "line", the preference in the user's own first-person words, under 160 characters, keeping the specifics (times, durations, exceptions).
 "rule" = change how the CRM behaves for a GROUP of people ("my family group shouldn't show as follow-ups", "stop follow-ups for recruiters", "re-enable follow-ups for investors", "delete the mentors group").
 "search" = find/look up specific info they saved (a person, message, commitment, task, note).
 "question" = anything else about their calendar, commitments, or contacts.
@@ -428,6 +501,21 @@ Command: """${t.slice(0, 600)}"""`,
         if (typeof p.intent === "string") intent = p.intent;
         person = typeof p.person === "string" && p.person.trim() ? p.person.trim() : null;
         content = typeof p.content === "string" && p.content.trim() ? p.content.trim() : t;
+        // The classifier returns {section, line} with a "preference" intent, so recognizing
+        // an unannounced preference costs ONE call, not a classify-then-parse round trip.
+        if (intent === "preference" || intent === "prefer") {
+          intent = "prefer";
+          const line = typeof p.line === "string" ? p.line.replace(/\s+/g, " ").trim() : "";
+          if (line) {
+            const raw = typeof p.section === "string" ? p.section.trim() : "";
+            llmPref = {
+              section:
+                PREFERENCE_SECTIONS.find((s) => s.toLowerCase() === raw.toLowerCase()) ??
+                (raw ? raw.slice(0, 40) : sectionForPreference(line)),
+              line: line.slice(0, 200),
+            };
+          }
+        }
       } catch { /* fall through to regex */ }
     }
   }
@@ -443,11 +531,24 @@ Command: """${t.slice(0, 600)}"""`,
   if (/^log[:\s]/i.test(t)) intent = "log_work";
   // Same for the "remember: …" prefix — it must never be read as a note about a contact.
   if (REMEMBER_PREFIX.test(t)) intent = "remember";
-  // Preferences are deterministic when they announce themselves ("prefer: …", "I'd like …").
-  // parsePreferenceDeterministic refuses anything with an explicit "remember" prefix or a
-  // resolvable date, so a fact can never be filed away as a taste.
+  // Preferences are deterministic when they announce themselves ("prefer: …", "I'd like …")
+  // and, since 2026-08-05, when they merely SOUND like a standing habit ("I typically need
+  // half an hour before starting the day"). parsePreferenceDeterministic refuses anything
+  // with an explicit "remember" prefix or a resolvable date, so a fact can never be filed
+  // away as a taste.
+  //
+  // An announced preference outranks the classifier outright. An IMPLICIT one does not: the
+  // same grammar opens plenty of braindumps and events ("I need to ship the deck, 2h"), so
+  // it only claims commands the classifier left as question/remember.
   const prefReq = parsePreferenceDeterministic(t);
-  if (prefReq) intent = "prefer";
+  const STRONGER_THAN_IMPLICIT = ["plan_day", "add_event", "add_note", "log_work", "search", "rule", "find_people"];
+  if (prefReq && (!prefReq.implicit || !STRONGER_THAN_IMPLICIT.includes(intent))) intent = "prefer";
+  // The classifier can call something a preference that the shared guard refuses (a dated
+  // fact). Those are facts, and "remember" is where facts are parsed and stored.
+  if (intent === "prefer" && !prefReq && refusedAsPreference(t)) {
+    intent = "remember";
+    llmPref = null;
+  }
   // Group rules are unambiguous when a pattern matches, so they win over the classifier.
   const ruleReq = parseRuleDeterministic(t);
   if (ruleReq) intent = "rule";
@@ -471,9 +572,10 @@ Command: """${t.slice(0, 600)}"""`,
     }
 
     if (intent === "prefer") {
-      // Deterministic first, LLM only for phrasings the prefixes miss ("mornings are for
+      // Deterministic first, then the {section,line} the classifier already returned, and
+      // only then a dedicated parse call for phrasings both missed ("mornings are for
       // reading, not email"). Same two-layer shape as remember/rule.
-      const req = prefReq ?? (await parsePreferenceRequest(llm, t));
+      const req = prefReq ?? llmPref ?? (await parsePreferenceRequest(llm, t));
       if (!req) {
         return {
           kind: "error",

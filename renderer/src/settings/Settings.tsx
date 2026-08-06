@@ -6,6 +6,18 @@ import { useCallback, useEffect, useState } from "react";
 
 type KeyRow = { name: string; present: boolean };
 type Spend = { total: number; byFeature: Record<string, number>; ceiling: number };
+// Mirrors LlmHealth in pos.d.ts (main/llm/provider.ts). `ok: false` is the state the app
+// used to keep to itself: calls fail, the deterministic fallbacks take over, and nothing
+// on screen changes except the quality of the output.
+type LlmHealth = {
+  provider: "anthropic" | "gemini" | null;
+  configured: boolean;
+  ok: boolean;
+  reason?: "no_key" | "quota" | "ceiling" | "error";
+  lastFailureAt?: string;
+  monthSpend: number;
+  ceiling: number;
+};
 // canWrite is false when the stored token predates the calendar-write scope widening:
 // it still refreshes, so nothing looks disconnected, but every push is refused with 403.
 type GcalState = { connected: boolean; hasCreds: boolean; canWrite: boolean };
@@ -2250,8 +2262,66 @@ function Preferences() {
 
 // ── b. Spend ─────────────────────────────────────────────────────────────────
 
+/** Headline + what it costs the owner, per reason. Written to be read while annoyed. */
+function healthCopy(h: LlmHealth): { title: string; detail: string } {
+  const provider = h.provider === "anthropic" ? "Anthropic" : h.provider === "gemini" ? "Gemini" : "The provider";
+  if (h.reason === "quota") {
+    return {
+      title: `${provider} is out of quota`,
+      detail: `${provider} refused the last call as over-quota or rate-limited. Free-tier limits reset on their own — usually within the day.`,
+    };
+  }
+  if (h.reason === "ceiling") {
+    return {
+      title: "Monthly spend ceiling reached",
+      detail: "Calls are being refused locally, before they reach the provider. Raise the ceiling below to turn the AI back on.",
+    };
+  }
+  if (h.reason === "no_key") {
+    return {
+      title: "No AI key set",
+      detail: "Add a Gemini or Anthropic key under Integrations above.",
+    };
+  }
+  return {
+    title: "AI calls are failing",
+    detail: "The provider returned an error on the last call. If it persists, check the key under Integrations.",
+  };
+}
+
+/** The prominent not-ok state at the top of the Spend card. Nothing renders when healthy. */
+function HealthNotice({ health }: { health: LlmHealth | null }) {
+  if (!health || health.ok) return null;
+  const { title, detail } = healthCopy(health);
+  const when = health.lastFailureAt ? new Date(health.lastFailureAt) : null;
+  return (
+    <div
+      className="rounded-xl border px-3 py-2.5 mb-3"
+      style={{
+        borderColor: "var(--danger)",
+        background: "color-mix(in srgb, var(--danger) 7%, white)",
+      }}
+    >
+      <div className="text-sm font-medium" style={{ color: "var(--danger)" }}>
+        {title}
+      </div>
+      <p className="text-[12px] mt-1 leading-relaxed" style={{ color: "var(--ink)" }}>
+        {detail}
+      </p>
+      {/* The concrete symptoms, so the degraded output is recognizable rather than mysterious. */}
+      <p className="text-[11px] mt-1.5 leading-relaxed" style={{ color: "var(--muted)" }}>
+        Until it recovers: planning still works, but block titles are copied verbatim from what
+        you typed instead of being rewritten, and extraction from messages falls back to keyword
+        rules.
+        {when ? ` Last failure ${when.toLocaleString()}.` : ""}
+      </p>
+    </div>
+  );
+}
+
 function SpendMeter() {
   const [spend, setSpend] = useState<Spend | null>(null);
+  const [health, setHealth] = useState<LlmHealth | null>(null);
   const [ceiling, setCeilingInput] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -2262,6 +2332,8 @@ function SpendMeter() {
       setSpend(s);
       setCeilingInput(String(s.ceiling));
     }
+    const hr = await window.pos.llm.health();
+    if (hr.ok) setHealth(hr.data as LlmHealth);
   }, []);
   useEffect(() => { refetch(); }, [refetch]);
 
@@ -2279,6 +2351,7 @@ function SpendMeter() {
 
   return (
     <Section title="Spend">
+      <HealthNotice health={health} />
       {spend == null ? (
         <p className="text-sm" style={{ color: "var(--muted)" }}>Loading…</p>
       ) : (

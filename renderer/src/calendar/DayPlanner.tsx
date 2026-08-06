@@ -610,17 +610,51 @@ function NowLine({ nowMin }: { nowMin: number }) {
   );
 }
 
+/**
+ * "named without AI" — the tell that block titles are the owner's own braindump text rather
+ * than headlines the model wrote (main/engine/parse.ts deterministicParse).
+ *
+ * DELIBERATE APPROXIMATION: braindump() returns `usedLlm`, but that value is not carried on
+ * the plan row and `plan.get` therefore cannot report it. Rather than plumb a new field
+ * through the main process for a chip, this asks `llm.health` AT RENDER TIME — so it means
+ * "the AI is unavailable right now", not "this specific plan was parsed without it". The two
+ * disagree only in the window between a plan being generated and the provider changing
+ * state, and in that window the chip is still telling the owner something true and useful.
+ */
+function useAiUnavailable(): boolean {
+  const [down, setDown] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const r = await window.pos.llm.health();
+      if (alive && r.ok) setDown(!(r.data as { ok: boolean }).ok);
+    })();
+    return () => { alive = false; };
+  }, []);
+  return down;
+}
+
 /** Always-visible footer: why the engine shaped the day the way it did. */
 function NarrationFooter({ plan }: { plan: PlanView | null }) {
   const text = firstSentences(plan?.plan?.narration, 2) || DOCTRINE_NARRATION;
+  const aiDown = useAiUnavailable();
   return (
     <div className="mt-5 rounded-2xl border px-4 py-3"
       style={{
         borderColor: "color-mix(in srgb, var(--line) 70%, transparent)",
         background: "color-mix(in srgb, var(--wash) 60%, white)",
       }}>
-      <div className="text-[10px] font-medium uppercase tracking-wide mb-1" style={{ color: "var(--accent)", opacity: 0.85 }}>
-        Why today looks like this
+      <div className="text-[10px] font-medium uppercase tracking-wide mb-1 flex items-center gap-2" style={{ color: "var(--accent)", opacity: 0.85 }}>
+        <span>Why today looks like this</span>
+        {aiDown && (
+          <span
+            className="normal-case tracking-normal font-normal rounded-full border px-1.5 py-[1px]"
+            title="The AI is unavailable, so block titles are your own words rather than rewritten headlines. See Settings → Spend."
+            style={{ borderColor: "var(--line)", color: "var(--muted)", opacity: 0.9 }}
+          >
+            named without AI
+          </span>
+        )}
       </div>
       <p className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>{text}</p>
     </div>

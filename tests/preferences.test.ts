@@ -238,6 +238,70 @@ describe("the assistant's prefer intent", () => {
     expect(sectionForPreference("I don't cook on Sundays")).toBe("Personal");
   });
 
+  // Owner ask 2026-08-05 (the second one): the sentence should file itself as a preference
+  // with no "prefer:" in front of it. Everything below is about the line between a habit
+  // stated in passing and the two things that look exactly like one — a dated fact, and an
+  // errand.
+  it("files the owner's own sentence with NO prefix at all, under Mornings", () => {
+    const req = parsePreferenceDeterministic(
+      "I typically need a half hour for showering and reading before starting the day"
+    );
+    expect(req).toBeTruthy();
+    expect(req!.section).toBe("Mornings");
+    expect(req!.implicit).toBe(true); // matched by grammar, so it yields to stronger intents
+    expect(req!.line).toBe("I typically need a half hour for showering and reading before starting the day");
+
+    const res = applyPreference(dir, req!);
+    expect(res.reply).toContain("Mornings");
+    expect(res.reply).toMatch(/settings/i); // it says where he can edit it
+    expect(read()).toContain("- I typically need a half hour for showering and reading");
+  });
+
+  it("recognizes the other unannounced habit shapes, and routes each to a section", () => {
+    const cases: [string, string][] = [
+      ["I usually keep the first hour of the morning clear", "Mornings"],
+      ["I never take calls after 6", "Meetings"],
+      ["I try to answer email in one batch", "Communication"],
+      ["don't schedule meetings before 10", "Meetings"],
+      ["my morning routine is sacred", "Mornings"],
+      ["a long uninterrupted block for writing works best for me", "Deep work"],
+      ["I'm a morning person", "Mornings"],
+    ];
+    for (const [text, section] of cases) {
+      const req = parsePreferenceDeterministic(text);
+      expect(req, text).toBeTruthy();
+      expect(req!.implicit, text).toBe(true);
+      expect(req!.section, text).toBe(section);
+    }
+  });
+
+  it("does NOT treat a one-off task as a preference: 'I need to call the dentist'", () => {
+    for (const t of [
+      "I need to call the dentist",
+      "I need to finish the deck",
+      "I want to email Raj back today",
+      "I have to pick up the prescription",
+    ]) {
+      expect(parsePreferenceDeterministic(t), t).toBeNull();
+    }
+    // …but the same opening WITH a recurrence is a habit again.
+    expect(parsePreferenceDeterministic("I need to be at my desk by 8 every morning")).toBeTruthy();
+    expect(parsePreferenceDeterministic("I typically need to protect the first hour")).toBeTruthy();
+    expect(parsePreferenceDeterministic("I want to keep mornings free")).toBeTruthy();
+    // An explicit label is the owner saying outright what he is filing — never second-guessed.
+    expect(parsePreferenceDeterministic("prefer: I want to call the dentist myself")).toBeTruthy();
+  });
+
+  it("still refuses a dated statement, prefix or not — that is a fact", () => {
+    for (const t of [
+      "I always fly out Sept 22",
+      "I usually see my advisor on 9/22",
+      "remember: I typically need a half hour in the morning",
+    ]) {
+      expect(parsePreferenceDeterministic(t), t).toBeNull();
+    }
+  });
+
   it("does NOT swallow a fact: 'remember: school starts Sept 22' stays a fact", () => {
     const text = "remember: school starts Sept 22";
     expect(parsePreferenceDeterministic(text)).toBeNull();

@@ -7,7 +7,16 @@
 
 import { GoogleGenAI } from "@google/genai";
 import type { Db } from "../db/db.ts";
-import { recordCall, underCeiling } from "./meter.ts";
+import {
+  recordCall,
+  underCeiling,
+  recordFailure,
+  clearFailure,
+  lastFailure,
+  failureIsCurrent,
+  monthSpend,
+  getCeiling,
+} from "./meter.ts";
 import type { SecretStore } from "../secrets.ts";
 
 export type LlmTier = "fast" | "smart";
@@ -30,14 +39,21 @@ const MODELS: Record<"anthropic" | "gemini", Record<LlmTier, string>> = {
   gemini: { fast: "gemini-2.5-flash", smart: "gemini-2.5-pro" },
 };
 
+export type LlmProvider = "anthropic" | "gemini";
+
+/** Which provider a key set selects (Anthropic wins when a key is present). */
+export function providerFor(secrets: SecretStore): LlmProvider | null {
+  if (secrets.get("ANTHROPIC_API_KEY")) return "anthropic";
+  if (secrets.get("GEMINI_API_KEY")) return "gemini";
+  return null;
+}
+
 export class LlmClient {
   constructor(private db: Db, private secrets: SecretStore) {}
 
   /** Which provider is live right now (Anthropic wins when a key is present). */
-  provider(): "anthropic" | "gemini" | null {
-    if (this.secrets.get("ANTHROPIC_API_KEY")) return "anthropic";
-    if (this.secrets.get("GEMINI_API_KEY")) return "gemini";
-    return null;
+  provider(): LlmProvider | null {
+    return providerFor(this.secrets);
   }
 
   /**
@@ -58,9 +74,14 @@ export class LlmClient {
           ? await this.callAnthropic(model, prompt, opts)
           : await this.callGemini(model, prompt, opts);
       recordCall(this.db, feature, res.model, res.inputTokens, res.outputTokens);
+      // A call that lands is the only proof the provider is healthy again.
+      clearFailure(this.db);
       return res;
     } catch (e) {
-      console.warn(`llm(${feature}/${model}) failed: ${(e as Error).message}`);
+      // Classified and remembered so the UI can say WHY the app went deterministic —
+      // silence here is what let an exhausted quota look like a styling change.
+      const f = recordFailure(this.db, e);
+      console.warn(`llm(${feature}/${model}) failed [${f.code}]: ${(e as Error).message}`);
       return null;
     }
   }
@@ -111,6 +132,51 @@ export class LlmClient {
       outputTokens: j.usage?.output_tokens ?? 0,
     };
   }
+}
+
+// ── health ───────────────────────────────────────────────────────────────────
+//
+// One answer to "is the AI actually working right now?", for the settings gear ring, the
+// Spend card and the planner's "named without AI" chip. Cheap enough to poll: two small
+// SQLite reads plus the cached failure state.
+
+export type LlmHealthReason = "no_key" | "quota" | "ceiling" | "error";
+
+export interface LlmHealth {
+  provider: LlmProvider | null;
+  /** A key exists for some provider. */
+  configured: boolean;
+  /** False whenever the next call would degrade to the deterministic path. */
+  ok: boolean;
+  reason?: LlmHealthReason;
+  /** ISO time of the failure behind a "quota"/"error" reason. */
+  lastFailureAt?: string;
+  /** Month-to-date spend, so the caller can render the ceiling case without a second IPC. */
+  monthSpend: number;
+  ceiling: number;
+}
+
+/**
+ * Reasons are ordered by what the owner would have to DO about them: no key beats the
+ * ceiling beats a provider-side failure, because fixing the earlier one is a precondition
+ * for the later one mattering at all. A failure older than FAILURE_WINDOW_MS is treated as
+ * past — the provider may well have recovered, and a stale red ring teaches people to
+ * ignore rings.
+ */
+export function llmHealth(db: Db, secrets: SecretStore, now: Date = new Date()): LlmHealth {
+  const provider = providerFor(secrets);
+  const spend = monthSpend(db).total;
+  const ceiling = getCeiling(db);
+  const base = { provider, configured: provider !== null, monthSpend: spend, ceiling };
+
+  if (!provider) return { ...base, ok: false, reason: "no_key" };
+  if (!underCeiling(db)) return { ...base, ok: false, reason: "ceiling" };
+
+  const failure = lastFailure(db);
+  if (failureIsCurrent(failure, now)) {
+    return { ...base, ok: false, reason: failure!.code, lastFailureAt: failure!.at };
+  }
+  return { ...base, ok: true };
 }
 
 /** Defensive JSON extraction, ported from PersonalCRM2 lib/llm.ts (battle-tested). */

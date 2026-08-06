@@ -20,6 +20,22 @@ export interface PlanPushResult {
   error?: string;
 }
 
+/**
+ * `llm.health` (main/llm/provider.ts): whether the next AI call would actually reach a
+ * model. `ok: false` means the app is running its deterministic fallbacks — event titles
+ * copied verbatim instead of rewritten, keyword-rule extraction — which is otherwise
+ * indistinguishable from working normally.
+ */
+export interface LlmHealth {
+  provider: "anthropic" | "gemini" | null;
+  configured: boolean;
+  ok: boolean;
+  reason?: "no_key" | "quota" | "ceiling" | "error";
+  lastFailureAt?: string;
+  monthSpend: number;
+  ceiling: number;
+}
+
 /** `gcal.scopeStatus`: canWrite is false when the grant cannot create calendars. */
 export interface GoogleScopeStatus {
   connected: boolean;
@@ -59,6 +75,8 @@ declare global {
         keys: Call; setKey: Call; doctrineGet: Call; doctrineSet: Call;
         spend: Call; setCeiling: Call; get: Call; set: Call;
       };
+      /** Provider reachability — see LlmHealth above. */
+      llm: { health: Call<LlmHealth> };
       msgplans: { run: Call; list: Call };
       digest: { send: Call; preview: Call };
       capture: { senders: Call };

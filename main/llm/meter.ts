@@ -64,3 +64,136 @@ export function setCeiling(db: Db, usd: number): void {
 export function underCeiling(db: Db): boolean {
   return monthSpend(db).total < getCeiling(db);
 }
+
+// ── failure classification ───────────────────────────────────────────────────
+//
+// The app's never-throw contract (provider.call returns null) means a dead API key, an
+// exhausted free tier and a transient 500 all look IDENTICAL from the outside: planning
+// quietly falls back to the deterministic path and the owner sees his own braindump text
+// copied into event titles with no explanation. Owner report 2026-08-05.
+//
+// So every failure is classified and remembered. "quota" is the one that matters — Gemini's
+// free tier is ~250 fast-tier requests/day, and hitting it is a state that persists for
+// hours, not a blip worth retrying. Everything else is "error".
+
+export type LlmFailureCode = "quota" | "error";
+
+export interface LlmFailure {
+  code: LlmFailureCode;
+  /** ISO timestamp of the failure. */
+  at: string;
+  /** Truncated provider message, for the Settings card. Never contains the API key. */
+  message: string;
+}
+
+/** Setting key holding the last failure as JSON, so the state survives a restart. */
+export const LLM_LAST_FAILURE_KEY = "llm_last_failure";
+
+/** How long a recorded failure keeps describing the CURRENT state of the provider. */
+export const FAILURE_WINDOW_MS = 60 * 60 * 1000;
+
+/**
+ * Quota/rate-limit shapes across both providers:
+ *   Google  → HTTP 429, `"status": "RESOURCE_EXHAUSTED"`, "Quota exceeded for quota metric…"
+ *   Anthropic → HTTP 429, `{"type":"rate_limit_error"}`, "insufficient_quota"
+ */
+const QUOTA_SHAPES = [
+  /RESOURCE_EXHAUSTED/i,
+  /\bquota\b/i,
+  /insufficient_quota/i,
+  /rate[_\s-]?limit/i,
+  /too many requests/i,
+];
+
+/** Everything we can read off a thrown value, flattened to one searchable string. */
+function errorText(err: unknown): string {
+  if (err == null) return "";
+  if (typeof err === "string") return err;
+  const e = err as Record<string, unknown> & { message?: string };
+  const parts = [e.message ?? "", String((e as { toString?: () => string }).toString?.() ?? "")];
+  try {
+    // Errors carry their interesting fields (status, error.status, response body) as own
+    // enumerable props; `message` is not enumerable, hence the explicit push above.
+    parts.push(JSON.stringify(e));
+  } catch {
+    /* circular or otherwise unserializable — the message alone will have to do */
+  }
+  return parts.filter(Boolean).join(" ");
+}
+
+/** The numeric HTTP status, wherever the SDK hid it. Null when there isn't one. */
+function statusOf(err: unknown): number | null {
+  const e = err as Record<string, any> | null;
+  if (!e || typeof e !== "object") return null;
+  for (const v of [e.status, e.statusCode, e.code, e.error?.code, e.error?.status, e.response?.status]) {
+    const n = typeof v === "string" ? Number(v) : v;
+    if (typeof n === "number" && Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+/** "quota" for anything rate-limit/credit shaped, "error" for everything else. */
+export function classifyLlmError(err: unknown): LlmFailureCode {
+  if (statusOf(err) === 429) return "quota";
+  const text = errorText(err);
+  // A bare "429" in the message is how both providers' plain-fetch paths surface the status
+  // ("anthropic 429: …"); the digit boundaries keep it from matching a token count.
+  if (/(?:^|[^\d])429(?:[^\d]|$)/.test(text)) return "quota";
+  return QUOTA_SHAPES.some((re) => re.test(text)) ? "quota" : "error";
+}
+
+// Module state mirrors the persisted setting so llmHealth() and the hot call path don't hit
+// SQLite on every check. `undefined` means "not loaded from the DB yet" — distinct from
+// `null`, which means "loaded, and there is no outstanding failure".
+let failureState: LlmFailure | null | undefined = undefined;
+
+/** Test seam: forget what this process learned, so the next read comes from the DB. */
+export function resetFailureCache(): void {
+  failureState = undefined;
+}
+
+function parseFailure(raw: string | null): LlmFailure | null {
+  if (!raw) return null;
+  try {
+    const p = JSON.parse(raw) as Partial<LlmFailure>;
+    if (!p || (p.code !== "quota" && p.code !== "error") || typeof p.at !== "string") return null;
+    return { code: p.code, at: p.at, message: typeof p.message === "string" ? p.message : "" };
+  } catch {
+    return null;
+  }
+}
+
+/** The last recorded failure, or null when the provider's last word was a success. */
+export function lastFailure(db: Db): LlmFailure | null {
+  if (failureState !== undefined) return failureState;
+  failureState = parseFailure(getSetting(db, LLM_LAST_FAILURE_KEY));
+  return failureState;
+}
+
+/** Classify and remember a failed call. Returns what was recorded. */
+export function recordFailure(db: Db, err: unknown, now: Date = new Date()): LlmFailure {
+  const failure: LlmFailure = {
+    code: classifyLlmError(err),
+    at: now.toISOString(),
+    message: String((err as Error)?.message ?? err ?? "").slice(0, 300),
+  };
+  failureState = failure;
+  setSetting(db, LLM_LAST_FAILURE_KEY, JSON.stringify(failure));
+  return failure;
+}
+
+/** A successful call means the provider is healthy again. No-op when nothing was wrong. */
+export function clearFailure(db: Db): void {
+  if (lastFailure(db) === null) return;
+  failureState = null;
+  setSetting(db, LLM_LAST_FAILURE_KEY, "");
+}
+
+/** True when the failure is recent enough to still describe the provider's current state. */
+export function failureIsCurrent(f: LlmFailure | null, now: Date = new Date()): boolean {
+  if (!f) return false;
+  const at = Date.parse(f.at);
+  if (!Number.isFinite(at)) return false;
+  const age = now.getTime() - at;
+  return age >= 0 && age < FAILURE_WINDOW_MS;
+}

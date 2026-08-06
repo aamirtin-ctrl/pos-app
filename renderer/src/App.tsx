@@ -143,6 +143,61 @@ function makeRecorder() {
   };
 }
 
+// ── LLM health (main/llm/provider.ts llmHealth) ──────────────────────────────
+//
+// When the provider stops answering, nothing breaks — the app just silently swaps in its
+// deterministic fallbacks, which is how an exhausted Gemini free tier showed up as raw
+// braindump text in event titles with no explanation (owner report 2026-08-05). The gear
+// wears a red ring for exactly as long as that is true.
+
+/** Mirrors LlmHealth in pos.d.ts. */
+type LlmHealth = {
+  provider: "anthropic" | "gemini" | null;
+  configured: boolean;
+  ok: boolean;
+  reason?: "no_key" | "quota" | "ceiling" | "error";
+  lastFailureAt?: string;
+  monthSpend: number;
+  ceiling: number;
+};
+
+/** The event CommandBar fires after a command, so the ring reacts to the call that failed. */
+const ASSISTANT_COMMAND_EVENT = "pos:assistant-command";
+
+const PROVIDER_LABEL: Record<string, string> = { gemini: "Gemini", anthropic: "Anthropic" };
+
+/** What the ring says on hover — the reason, and that planning lost the AI because of it. */
+export function healthTitle(h: LlmHealth): string {
+  const degraded = "planning is running without AI";
+  if (h.reason === "quota") {
+    return `${PROVIDER_LABEL[h.provider ?? ""] ?? "AI"} quota exhausted — ${degraded}`;
+  }
+  if (h.reason === "ceiling") return `Monthly spend ceiling reached — ${degraded}`;
+  if (h.reason === "no_key") return `No AI key set — ${degraded}`;
+  return `AI calls are failing — ${degraded}`;
+}
+
+/** Polls on mount, every 60s, and after any assistant command. */
+function useLlmHealth(): LlmHealth | null {
+  const [health, setHealth] = useState<LlmHealth | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const poll = async () => {
+      const r = await window.pos.llm.health();
+      if (alive && r.ok) setHealth(r.data as LlmHealth);
+    };
+    poll();
+    const id = setInterval(poll, 60_000);
+    window.addEventListener(ASSISTANT_COMMAND_EVENT, poll);
+    return () => {
+      alive = false;
+      clearInterval(id);
+      window.removeEventListener(ASSISTANT_COMMAND_EVENT, poll);
+    };
+  }, []);
+  return health;
+}
+
 // One unified command box: small top-right button → one-line popup. Routes to
 // planning, people search, notes, or questions over everything (main/assistant.ts).
 function CommandBar() {
@@ -223,6 +278,9 @@ function CommandBar() {
     setReply(r.ok ? (r.data as never) : { kind: "error", reply: r.error ?? "failed" });
     setBusy(false);
     setText("");
+    // A command is the most likely moment for the provider's state to have changed —
+    // re-check now rather than leaving the gear stale for up to a minute.
+    window.dispatchEvent(new Event(ASSISTANT_COMMAND_EVENT));
     if ((r.data as { kind?: string } | undefined)?.kind === "plan") window.location.hash = "#/calendar";
   };
   return (
@@ -406,6 +464,8 @@ function ProfileBadge() {
 export default function App() {
   const route = useRoute();
   const view = route.split("/")[1] ?? "calendar";
+  const health = useLlmHealth();
+  const aiDown = health != null && !health.ok;
   const [activity, setActivity] = useState(() => Number(localStorage.getItem("pos_activity") ?? 0));
   // Global undo/redo: ⌘Z / ⌘⇧Z → main-process journal, feedback via a transient toast.
   const [toast, setToast] = useState<string | null>(null);
@@ -477,15 +537,19 @@ export default function App() {
         </div>
       )}
 
-      {/* settings gear — bottom left */}
+      {/* settings gear — bottom left. A red ring (never a badge) when the AI is unavailable;
+          the reason lives in the tooltip and, in full, in Settings → Spend. */}
       <a
         href="#/settings"
-        title="Settings"
+        title={aiDown ? `Settings — ${healthTitle(health!)}` : "Settings"}
         className="no-drag fixed bottom-4 left-4 z-20 flex items-center justify-center w-9 h-9 rounded-full border bg-white/90 backdrop-blur shadow-sm transition-transform duration-[120ms] hover:scale-110 active:scale-95"
         style={{
-          borderColor: "var(--line)",
+          borderColor: aiDown ? "var(--danger)" : "var(--line)",
           color: view === "settings" ? "var(--accent)" : "var(--muted)",
           background: "color-mix(in srgb, white 70%, var(--pink-1))",
+          boxShadow: aiDown
+            ? "0 0 0 3px color-mix(in srgb, var(--danger) 22%, transparent)"
+            : undefined,
         }}
       >
         {ICONS.settings}

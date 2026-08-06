@@ -108,6 +108,7 @@ contextBridge.exposeInMainWorld("pos", {
     get: call("settings.get"),
     set: call("settings.set"),
   },
+  llm: { health: call("llm.health") },
   msgplans: { run: call("msgplans.run"), list: call("msgplans.list") },
   digest: { send: call("digest.send"), preview: call("digest.preview") },
   capture: { senders: call("capture.senders") },
