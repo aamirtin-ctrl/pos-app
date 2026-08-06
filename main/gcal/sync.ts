@@ -1086,7 +1086,14 @@ export async function commitmentToTask(
     // Only explicit dates schedule things (owner directive 2026-08-05): a commitment
     // with no due date and no picked date becomes an INBOX item — plan_date NULL,
     // hard_deadline_at NULL, Google task with no due date. Never default to today.
-    const due = c.due_at ? c.due_at.slice(0, 10) : null;
+    // A due date that has already PASSED is overdue, not dead. Left as-is it becomes a
+    // plan_date the solver will never look at again (it only plans today forward), so the
+    // task exists and is silently unschedulable — which is what happened to "Provide Papa
+    // with Europe trip credit card charges", dated 2026-07-01 by extraction and therefore
+    // invisible from the moment it was created. Overdue work belongs on today.
+    const rawDue = c.due_at ? c.due_at.slice(0, 10) : null;
+    const todayISO = new Date().toISOString().slice(0, 10);
+    const due = rawDue && rawDue < todayISO ? todayISO : rawDue;
     // …unless the description names a date the app actually knows (main/context.ts):
     // "meetup at the start of school" lands on the user's term-start anchor. This is the
     // owner's exact click-path — the picker used to prefill TODAY for exactly this row.
