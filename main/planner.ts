@@ -56,8 +56,8 @@ export async function braindump(db: Db, doctrineDir: string, llm: LlmClient | nu
   const ins = db.prepare(
     `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
        is_mit, hard_deadline_at, status, splittable, estimate_source, plan_date, notes,
-       window_start, window_end)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?)`
+       window_start, window_end, day_part)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?)`
   );
   const tx = db.transaction(() => {
     for (const t of tasks) {
@@ -65,13 +65,19 @@ export async function braindump(db: Db, doctrineDir: string, llm: LlmClient | nu
       // invariant). "Tomorrow" also carries a date, but it is a commitment to a day, and a
       // window_end there would license the planner to shuffle it — the opposite of what he said.
       const windowEnd = t.flexible && t.windowEnd && t.windowEnd > dateISO ? t.windowEnd : null;
+      // A NAMED day is a commitment to that day, and it used to be discarded: parseWindow
+      // resolves "tomorrow" correctly and returns it with flexible=false, but only the
+      // flexible branch was ever persisted, so plan_date stayed the day of capture. That is
+      // why work he said was for tomorrow landed on today (owner report 2026-08-06).
+      const namedDay = !t.flexible && t.windowEnd && t.windowEnd >= dateISO ? t.windowEnd : null;
+      const planDate = namedDay ?? dateISO;
       ins.run(
         t.title, t.blockType, t.cognitiveLoad, t.estimatedMinutes, t.rawEstimateMinutes,
         t.isMit ? 1 : 0,
-        t.hardDeadlineAt ? `${dateISO}T${t.hardDeadlineAt}:00` : null,
-        t.splittable ? 1 : 0, t.estimateSource, dateISO,
+        t.hardDeadlineAt ? `${planDate}T${t.hardDeadlineAt}:00` : null,
+        t.splittable ? 1 : 0, t.estimateSource, planDate,
         t.personHint ? `person: ${t.personHint}` : null,
-        windowEnd ? dateISO : null, windowEnd
+        windowEnd ? dateISO : null, windowEnd, t.dayPart ?? null
       );
     }
   });
@@ -405,6 +411,7 @@ export async function generatePlan(
     // A window makes plan_date a CHOICE rather than a commitment — the solver may hand this
     // task back as `deferred_within_window` and it is moved below.
     windowEnd: (r.window_end as string | null) ?? null,
+    dayPart: (r.day_part as "morning" | "afternoon" | "evening" | null) ?? null,
     // Every task is offered to the solver AS THIS DAY'S candidate, including one reclaimed
     // from later: `planDate` is what the solver ranks and defers against, and the question it
     // is answering is "does this belong today?". The real parked date lives in `pulledBack`.

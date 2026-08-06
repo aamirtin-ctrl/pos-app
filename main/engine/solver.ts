@@ -28,6 +28,15 @@ export interface PlannerTask {
   windowEnd?: string | null;
   /** The day currently being solved for. With a `windowEnd`, this is a CHOICE, not a commitment. */
   planDate?: string;
+  /**
+   * The part of the day he NAMED ("tonight", "first thing"), or null.
+   *
+   * Owner report 2026-08-06: "the one that I said for tonight is in the afternoon." Nothing in
+   * a task could express a time of day, so the energy curve placed it wherever scored best —
+   * which is right when nothing was stated and wrong when something was. A stated part of the
+   * day is a constraint, not a preference: he did not ask for the best slot, he named one.
+   */
+  dayPart?: "morning" | "afternoon" | "evening" | null;
 }
 
 export type UnplacedReason =
@@ -109,6 +118,23 @@ export interface SolveResult {
 }
 
 const slotsFor = (minutes: number) => Math.max(1, Math.ceil(minutes / SLOT_MIN));
+
+/** Minutes-since-midnight bounds for a named part of the day. */
+const DAY_PART_BOUNDS: Record<string, { earliest: number; latest: number }> = {
+  morning: { earliest: 0, latest: 12 * 60 },
+  afternoon: { earliest: 12 * 60, latest: 17 * 60 },
+  evening: { earliest: 17 * 60, latest: 24 * 60 },
+};
+
+/**
+ * Does a run starting at `startMin` and ending at `endMin` sit inside the part of the day the
+ * owner named? True whenever he named none, which is the overwhelming majority.
+ */
+export function withinDayPart(t: PlannerTask, startMin: number, endMin: number): boolean {
+  const b = t.dayPart ? DAY_PART_BOUNDS[t.dayPart] : null;
+  if (!b) return true;
+  return startMin >= b.earliest && endMin <= b.latest;
+}
 
 /** minutes-since-midnight → "HH:MM" (wraps past-midnight values back into clock time). */
 const fmtMin = (min: number) =>
@@ -654,7 +680,9 @@ function solvePass(
       const placedIdx: number[] = [];
       for (const chunk of chunks) {
         const len = slotsFor(chunk);
-        let cands = candidates("deep_work", len).filter((i0) => prevEnd === null || i0 >= prevEnd);
+        let cands = candidates("deep_work", len)
+          .filter((i0) => prevEnd === null || i0 >= prevEnd)
+          .filter((i0) => withinDayPart(t, minOf(i0), minOf(i0 + len)));
         if (t.deadlineMin !== null) {
           const all = cands;
           cands = cands.filter((i0) => minOf(i0 + len) <= t.deadlineMin!);
@@ -682,7 +710,7 @@ function solvePass(
     }
     // focused/admin/comms/other single block
     const len = slotsFor(t.estimatedMinutes);
-    let cands = candidates(t.blockType, len);
+    let cands = candidates(t.blockType, len).filter((i0) => withinDayPart(t, minOf(i0), minOf(i0 + len)));
     if (t.deadlineMin !== null) {
       const all = cands;
       cands = cands.filter((i0) => minOf(i0 + len) <= t.deadlineMin!);

@@ -506,4 +506,28 @@ CREATE TABLE capture_inbox (
 CREATE INDEX idx_capture_pending ON capture_inbox(processed_at, id) WHERE processed_at IS NULL;
 `,
   },
+  {
+    version: 13,
+    name: "task_day_part",
+    sql: `
+-- Owner report 2026-08-06: "the one that I said for tonight is in the afternoon and not in the
+-- night. And the one that I said for tomorrow is today."
+--
+-- He said "tonight" and "tomorrow" — the two least ambiguous scheduling words there are — and
+-- both were understood and then discarded:
+--
+--   TOMORROW was parsed correctly (parseWindow returns that date with flexible=false) and then
+--   thrown away, because braindump only persisted a date when the range was FLEXIBLE. plan_date
+--   was hardcoded to the day of capture, so work for tomorrow landed on today. No model needed
+--   to get this right; the answer was already computed and then dropped on the floor.
+--
+--   TONIGHT had nowhere to be stored at all. A parsed task could express a duration and a date
+--   but never a time of day, so the energy curve placed it wherever scored best — 14:00. That
+--   is the correct behaviour when nothing was stated and the wrong one when something was.
+--
+-- day_part is that missing dimension: 'morning' | 'afternoon' | 'evening', NULL when he named
+-- none, which is the overwhelming majority and behaves exactly as before.
+ALTER TABLE task ADD COLUMN day_part TEXT;
+`,
+  },
 ];

@@ -25,6 +25,8 @@ export interface ParsedTask {
    * the engine's licence to move the task to a later day inside the window.
    */
   windowEnd: string | null;
+  /** Part of the day he named ("tonight", "this morning"), or null. */
+  dayPart: DayPart | null;
   /**
    * True when the user said the work can happen ACROSS a range ("this week", "by Friday",
    * "no rush") rather than on one named day. A specific day is `false` with `windowEnd`
@@ -54,6 +56,37 @@ const onOrAfterWeekday = (from: Date, target: number) =>
 
 /** The Sunday that closes the current week — today, when today IS Sunday. */
 export const endOfThisWeek = (refISO: string) => isoOf(onOrAfterWeekday(utcMidnight(refISO), 0));
+
+/**
+ * Part of the day the work belongs in, when the text names one.
+ *
+ * Owner report 2026-08-06: "the one that I said for tonight is in the afternoon and not in the
+ * night." He said "tonight" and the solver placed it at 14:00, because nothing in a parsed
+ * task could express a time of day at all — only a duration and a date. The energy curve then
+ * picked whatever slot scored best, which is exactly right when no preference was stated and
+ * exactly wrong when one was.
+ */
+export type DayPart = "morning" | "afternoon" | "evening";
+
+const DAY_PART_PATTERNS: [RegExp, DayPart][] = [
+  [/\btonight\b|\bthis evening\b|\bin the evening\b|\bafter dinner\b|\bat night\b/i, "evening"],
+  [/\bthis afternoon\b|\bin the afternoon\b|\bafter lunch\b/i, "afternoon"],
+  [/\bthis morning\b|\bin the morning\b|\bfirst thing\b|\bbefore lunch\b/i, "morning"],
+];
+
+/** The part of the day the text names, or null when it names none. */
+export function parseDayPart(text: string): DayPart | null {
+  const t = text ?? "";
+  for (const [re, part] of DAY_PART_PATTERNS) if (re.test(t)) return part;
+  return null;
+}
+
+/** Minutes-since-midnight bounds for a day part. Soft in spirit, hard in the grid. */
+export const DAY_PART_BOUNDS: Record<DayPart, { earliest: number; latest: number }> = {
+  morning: { earliest: 0, latest: 12 * 60 },
+  afternoon: { earliest: 12 * 60, latest: 17 * 60 },
+  evening: { earliest: 17 * 60, latest: 24 * 60 },
+};
 
 export interface ParsedWindow {
   /** Last day the work may happen (ISO date), or null when the text names no timeframe. */
@@ -304,6 +337,9 @@ function coerce(raw: unknown, doctrine: Doctrine, text: string, refISO: string):
       reasoning: typeof r.reasoning === "string" ? r.reasoning : "",
       windowEnd: window.windowEnd,
       flexible: window.flexible,
+      // Read from the owner's own words, not from the model: "tonight" is unambiguous and a
+      // model that omits it should not cost him the constraint.
+      dayPart: parseDayPart(sourceSegment(title, segments) ?? text),
     });
   }
   return out;
@@ -432,7 +468,12 @@ export interface WorkSegment {
  */
 export function workSegments(text: string): WorkSegment[] {
   const parts = (text ?? "")
-    .split(/\n|;|(?<!\d),(?!\d)| and (?=[a-z])/i)
+    // Sentence boundaries split too. "Tonight I need to do research for Liatris. Tomorrow I
+    // need to continue working on it." is two instructions with two different days, and
+    // without this it is one task that takes the FIRST day it sees. The lookarounds keep
+    // "2.5 hours" and "a.m." intact: only a period between a word and a capitalised word ends
+    // a sentence here.
+    .split(/\n|;|(?<!\d),(?!\d)| and (?=[a-z])|(?<=[a-z0-9])\.\s+(?=[A-Z])/i)
     .map((s) => s.trim())
     .filter((s) => s.length > 1);
 
@@ -534,6 +575,7 @@ export function deterministicParse(
       reasoning: "deterministic fallback (no LLM)",
       windowEnd: window.windowEnd,
       flexible: window.flexible,
+      dayPart: parseDayPart(p),
     });
   }
   return out;
