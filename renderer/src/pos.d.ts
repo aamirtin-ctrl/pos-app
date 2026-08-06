@@ -119,7 +119,10 @@ declare global {
       mail: { list: Call; add: Call; remove: Call; connectOAuth: Call };
       gcal: { connect: Call; cancel: Call; connected: Call; scopeStatus: Call; reconcile: Call; events: Call };
       ics: { list: Call; add: Call; remove: Call };
-      notion: { available: Call; targets: Call; setParent: Call; sync: Call };
+      notion: {
+        available: Call; targets: Call; setParent: Call; sync: Call;
+        pages: Call; page: Call; append: Call; check: Call; createPage: Call;
+      };
       applecal: { available: Call; calendars: Call; events: Call; mirror: Call };
       settings: {
         keys: Call; setKey: Call; doctrineGet: Call; doctrineSet: Call;

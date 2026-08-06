@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import PreviewColumn from "./PreviewColumn.tsx";
 import EventPopover from "./EventPopover.tsx";
+import NotionTab from "./NotionTab.tsx";
 import {
   COLORS, DOCTRINE_NARRATION, FALLBACK_COLOR, GRID_END_MIN, GRID_START_MIN, GUTTER_PX,
   PX_PER_MIN, WINDOW_START_MIN, addDaysISO, buildItems, cardHeights, firstSentences, fmtDur,
@@ -347,6 +348,9 @@ export default function DayPlanner() {
 
   return (
     <div className="h-full flex flex-col relative" onWheel={onDayWheel}>
+      {/* The long-term list lives HERE, inside the day view, so it exists only on the calendar
+          page — mounting it in App would put it on Relationships and Messaging too. */}
+      <NotionTab />
       <style>{`
         @keyframes plannerPulse {
           0% { box-shadow: 0 0 0 0 rgba(217,93,93,0.45); }

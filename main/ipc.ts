@@ -100,7 +100,10 @@ import {
 import { google } from "googleapis";
 import { reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent, dropCommitmentCascade } from "./gcal/sync.ts";
 import { listSubscriptions, addSubscription, removeSubscription, eventsForDate as icsEventsForDate, icsBlockType } from "./icscal.ts";
-import { notionAvailable, searchTargets, syncNotion, PARENT_PAGE_KEY } from "./notion.ts";
+import {
+  notionAvailable, searchTargets, syncNotion, PARENT_PAGE_KEY,
+  listWorkspacePages, readPageBlocks, appendToPage, setTodoChecked, createWorkspacePage,
+} from "./notion.ts";
 import {
   appleCalendarAvailable,
   readAppleEvents,
@@ -639,6 +642,15 @@ export function registerIpc(deps: IpcDeps) {
     return { saved: true };
   });
   h("notion.sync", () => syncNotion(db, secrets));
+  // The workspace tab (owner ask 2026-08-06): HIS Notion pages, read and written live. No
+  // local mirror — "they all talk to each other" holds because there is only ever one copy.
+  h("notion.pages", () => listWorkspacePages(secrets));
+  h("notion.page", (pageId: string) => readPageBlocks(secrets, pageId));
+  h("notion.append", (pageId: string, line: string, kind?: "todo" | "text") =>
+    appendToPage(secrets, pageId, line, kind ?? "todo"));
+  h("notion.check", (blockId: string, checked: boolean) => setTodoChecked(secrets, blockId, checked));
+  h("notion.createPage", (title: string, firstLine?: string) =>
+    createWorkspacePage(db, secrets, title, { firstLine }));
 
   // ── apple calendar (Calendar.app) ──
   // available() is also what triggers macOS's Automation permission prompt.

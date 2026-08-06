@@ -93,6 +93,12 @@ contextBridge.exposeInMainWorld("pos", {
     targets: call("notion.targets"),
     setParent: call("notion.setParent"),
     sync: call("notion.sync"),
+  
+    pages: call("notion.pages"),
+    page: call("notion.page"),
+    append: call("notion.append"),
+    check: call("notion.check"),
+    createPage: call("notion.createPage"),
   },
   applecal: {
     available: call("applecal.available"),

@@ -502,3 +502,164 @@ export async function syncNotion(db: Db, secrets: SecretStore): Promise<NotionSy
   const pulled = await pullNotionTasks(db, secrets);
   return { ...push, pulled };
 }
+
+// ── the workspace tab: HIS pages, live, not a local copy ─────────────────────
+//
+// Owner ask 2026-08-06: "add in, like, a long term to-do list… a little side tab below the
+// sparkle button, only viewed on the calendar page. Make this actually a tab that connects to
+// my notion — so whatever is in there, this tab is also in my notion, and they all talk to
+// each other. Currently in my notion I have my social media scheduling and another page. So I
+// should be able to view both of these from that tab and then also create pages and add info."
+//
+// The design decision that matters: there is NO local mirror. Everything below reads and
+// writes Notion directly, so "they all talk to each other" is true by construction rather than
+// by a sync that can drift. A long-term list is exactly the kind of thing that is edited on a
+// phone at midnight and in this tab the next morning; a second copy would be wrong within a
+// day. The cost is that the tab needs the network and does nothing without a token, which is
+// the honest trade and is what the UI says.
+//
+// This is deliberately separate from pushToNotion/pullNotionTasks above, which mirror POS's
+// OWN databases (tasks/journal/commitments). Those are POS data published to Notion. This is
+// his workspace, borrowed.
+
+/** One page in the tab's list. */
+export interface NotionPageRef {
+  id: string;
+  title: string;
+  /** Notion's own URL, for "open in Notion". */
+  url: string | null;
+  /** Last edit time, ISO — the tab sorts on it so what he touched last is on top. */
+  editedAt: string | null;
+}
+
+/** A block rendered in the tab. Only the shapes a to-do list actually needs. */
+export interface NotionBlock {
+  id: string;
+  /** "todo" carries `checked`; everything else is read as a line of text. */
+  kind: "todo" | "text" | "heading" | "other";
+  text: string;
+  checked?: boolean;
+}
+
+/**
+ * Pages the integration can see, newest edit first.
+ *
+ * Notion's /search returns only what the owner has explicitly shared with the integration,
+ * which is the permission model doing exactly what it should — the tab can never show a page
+ * he did not connect.
+ */
+export async function listWorkspacePages(secrets: SecretStore, limit = 50): Promise<NotionPageRef[]> {
+  const token = requireToken(secrets);
+  const res = await notionFetch(token, "/search", {
+    method: "POST",
+    body: {
+      page_size: Math.min(100, Math.max(1, limit)),
+      filter: { property: "object", value: "page" },
+      sort: { direction: "descending", timestamp: "last_edited_time" },
+    },
+  });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return ((res.results ?? []) as any[])
+    .filter((r) => r.object === "page" && !r.archived)
+    .map((r) => ({
+      id: r.id as string,
+      title: extractTitle(r),
+      url: (r.url as string) ?? null,
+      editedAt: (r.last_edited_time as string) ?? null,
+    }));
+}
+
+/** Read one page's top-level blocks — what the tab shows when a page is opened. */
+export async function readPageBlocks(secrets: SecretStore, pageId: string, limit = 100): Promise<NotionBlock[]> {
+  const token = requireToken(secrets);
+  const res = await notionFetch(
+    token,
+    `/blocks/${pageId}/children?page_size=${Math.min(100, Math.max(1, limit))}`
+  );
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return ((res.results ?? []) as any[]).map((b) => {
+    const t = b.type as string;
+    const body = b[t] ?? {};
+    const line = plain(body.rich_text);
+    if (t === "to_do") return { id: b.id, kind: "todo" as const, text: line, checked: !!body.checked };
+    if (t === "paragraph") return { id: b.id, kind: "text" as const, text: line };
+    if (t?.startsWith("heading_")) return { id: b.id, kind: "heading" as const, text: line };
+    // Anything else (toggles, callouts, embeds…) is shown as its text so the page still reads.
+    return { id: b.id, kind: "other" as const, text: line || `(${t})` };
+  });
+}
+
+/** Append one line to a page. `todo` makes it a checkbox — the long-term list's whole point. */
+export async function appendToPage(
+  secrets: SecretStore,
+  pageId: string,
+  line: string,
+  kind: "todo" | "text" = "todo"
+): Promise<{ added: boolean }> {
+  const token = requireToken(secrets);
+  const body = line.replace(/\s+/g, " ").trim();
+  if (!body) return { added: false };
+  const block =
+    kind === "todo"
+      ? { object: "block", type: "to_do", to_do: { rich_text: text(body), checked: false } }
+      : { object: "block", type: "paragraph", paragraph: { rich_text: text(body) } };
+  await notionFetch(token, `/blocks/${pageId}/children`, {
+    method: "PATCH",
+    body: { children: [block] },
+  });
+  return { added: true };
+}
+
+/** Tick or untick a to-do, in Notion. The tab never keeps its own copy of the state. */
+export async function setTodoChecked(
+  secrets: SecretStore,
+  blockId: string,
+  checked: boolean
+): Promise<{ ok: true }> {
+  const token = requireToken(secrets);
+  await notionFetch(token, `/blocks/${blockId}`, {
+    method: "PATCH",
+    body: { to_do: { checked } },
+  });
+  return { ok: true };
+}
+
+/**
+ * Create a page. `parentId` defaults to the configured parent, so "new page" works with no
+ * picking; pass one to nest a page under something specific.
+ *
+ * Notion refuses a page with no parent, and a workspace-level parent needs a capability most
+ * integrations are not granted — so a missing parent is reported as the actionable thing it
+ * is rather than as a raw 400.
+ */
+export async function createWorkspacePage(
+  db: Db,
+  secrets: SecretStore,
+  title: string,
+  opts: { parentId?: string; firstLine?: string } = {}
+): Promise<NotionPageRef> {
+  const token = requireToken(secrets);
+  const name = title.replace(/\s+/g, " ").trim();
+  if (!name) throw new Error("A page needs a title");
+  const parentId = opts.parentId ?? getSetting(db, PARENT_PAGE_KEY);
+  if (!parentId) {
+    throw new Error("Pick a parent page in Settings → Notion first — Notion won't create a page without one");
+  }
+  const children = opts.firstLine?.trim()
+    ? [{ object: "block", type: "to_do", to_do: { rich_text: text(opts.firstLine.trim()), checked: false } }]
+    : [];
+  const res = await notionFetch(token, "/pages", {
+    method: "POST",
+    body: {
+      parent: { page_id: parentId },
+      properties: { title: { title: text(name) } },
+      ...(children.length > 0 ? { children } : {}),
+    },
+  });
+  return {
+    id: res.id as string,
+    title: name,
+    url: (res.url as string) ?? null,
+    editedAt: (res.last_edited_time as string) ?? null,
+  };
+}
