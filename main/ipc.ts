@@ -486,6 +486,10 @@ export function registerIpc(deps: IpcDeps) {
     planner.braindump(db, doctrineDir, deps.llm(), text, dateISO)
   );
   h("tasks.list", (dateISO: string) => planner.listTasks(db, dateISO));
+  // The calendar's Google Tasks strip: outstanding work for the day PLUS everything undated,
+  // which is otherwise invisible because only a scheduled task gets a block (owner ask
+  // 2026-08-06 — "a place for me to see the Google tasks").
+  h("tasks.strip", (dateISO: string) => planner.tasksForStrip(db, dateISO));
   h("tasks.setStatus", (id: number, status: string) => {
     const prior = db.prepare("SELECT status, completed_at FROM task WHERE id = ?").get(id) as
       | { status: string; completed_at: string | null } | undefined;

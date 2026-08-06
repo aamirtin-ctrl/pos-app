@@ -1304,3 +1304,64 @@ export function outcomesNeeded(db: Db, dateISO: string) {
     )
     .all(dateISO) as Record<string, unknown>[];
 }
+
+
+// ── the Google Tasks strip ───────────────────────────────────────────────────
+//
+// Owner ask 2026-08-06: "maybe you should add little test [tasks] that are, like, on the
+// calendar that are shown with the drop down list, like Google test [Tasks], and you can
+// always place it at, like, a four AM time slot. It's not actually a calendar event, but it's
+// just a place for me to see the Google tasks."
+//
+// The gap it closes: a task only becomes visible once the solver gives it a block. Anything
+// undated — which is most of what arrives from Google Tasks, and everything the "only explicit
+// dates schedule things" rule leaves alone — existed in the database and appeared nowhere he
+// looks. He asked whether things had populated and could not tell, which is the whole problem.
+//
+// Deliberately NOT a block: it occupies no minutes, the solver never sees it, and it cannot be
+// dragged. It is a reading surface parked at 04:00 where the day is always empty.
+
+export interface DayTaskRow {
+  id: number;
+  title: string;
+  status: string;
+  /** ISO date it is planned for, or null for an undated inbox item. */
+  planDate: string | null;
+  /** True when this task came from (or is mirrored to) Google Tasks. */
+  fromGoogle: boolean;
+  /** True when the solver has given it a block on this day — already visible on the grid. */
+  scheduled: boolean;
+}
+
+/**
+ * What to show in the strip for `dateISO`: the day's own tasks, plus every UNDATED task, which
+ * is the pile that would otherwise be invisible. Done and deferred work is excluded — the strip
+ * is what is outstanding, not an archive.
+ */
+export function tasksForStrip(db: Db, dateISO: string): DayTaskRow[] {
+  const status = SCHEDULABLE_TASK_STATUSES.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      `SELECT t.id, t.title, t.status, t.plan_date, t.gtasks_id,
+              EXISTS (
+                SELECT 1 FROM block b JOIN plan p ON p.id = b.plan_id
+                 WHERE b.task_id = t.id AND p.plan_date = ?
+              ) AS scheduled
+         FROM task t
+        WHERE t.status IN (${status})
+          AND (t.plan_date = ? OR t.plan_date IS NULL)
+        ORDER BY t.plan_date IS NULL, t.id`
+    )
+    .all(dateISO, ...SCHEDULABLE_TASK_STATUSES, dateISO) as {
+    id: number; title: string; status: string; plan_date: string | null;
+    gtasks_id: string | null; scheduled: number;
+  }[];
+  return rows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    status: r.status,
+    planDate: r.plan_date,
+    fromGoogle: r.gtasks_id != null,
+    scheduled: r.scheduled === 1,
+  }));
+}

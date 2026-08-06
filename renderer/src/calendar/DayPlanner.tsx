@@ -79,6 +79,14 @@ const MOVE_SNAP_MIN = 15;
 /** Movement only begins after this much travel, so a click still opens the popover. */
 const DRAG_THRESHOLD_PX = 4;
 
+type StripTask = {
+  id: number; title: string; status: string;
+  planDate: string | null; fromGoogle: boolean; scheduled: boolean;
+};
+
+/** Where the strip parks: 04:00, which is always empty, and never occupies any minutes. */
+const STRIP_MIN = 4 * 60;
+
 const FLIP_FETCH_DEBOUNCE_MS = 250; // settle time before external-events IPC after day flips
 const PREFETCH_TTL_MS = 60_000; // a neighbor prefetched this recently is not refetched
 
@@ -119,6 +127,12 @@ export default function DayPlanner() {
   // braindumped task can name it in the popover. Best-effort: the popover just
   // omits the line when the lookup misses (e.g. the task is already done).
   const [tasksById, setTasksById] = useState<Map<number, { title: string; status: string }>>(() => new Map());
+  // The Google Tasks strip (owner ask 2026-08-06). A task only becomes visible once the solver
+  // gives it a block, so everything UNDATED — most of what arrives from Google Tasks — existed
+  // in the database and appeared nowhere he looks. He asked whether things had populated and
+  // could not tell, which is exactly the gap this closes.
+  const [stripTasks, setStripTasks] = useState<StripTask[]>([]);
+  const [stripOpen, setStripOpen] = useState(false);
 
   // Per-date client cache: flipping to a seen day renders instantly from here while
   // the (debounced) fetch revalidates in the background.
@@ -251,6 +265,9 @@ export default function DayPlanner() {
     let cancelled = false;
     void (async () => {
       try {
+        void window.pos.tasks.strip(date).then((sr) => {
+          if (!cancelled && sr.ok && Array.isArray(sr.data)) setStripTasks(sr.data as StripTask[]);
+        });
         const r = await window.pos.tasks.list(date);
         if (cancelled || !r.ok || !Array.isArray(r.data)) return;
         const m = new Map<number, { title: string; status: string }>();
@@ -427,6 +444,16 @@ export default function DayPlanner() {
                 dim={isPastDay || (isToday && g.endMin <= nowMin)} />
             ))}
 
+            <TasksStrip
+              tasks={stripTasks}
+              open={stripOpen}
+              onToggle={() => setStripOpen((v) => !v)}
+              onDone={async (id) => {
+                await window.pos.tasks.setStatus(id, "done");
+                const sr = await window.pos.tasks.strip(date);
+                if (sr.ok && Array.isArray(sr.data)) setStripTasks(sr.data as StripTask[]);
+              }}
+            />
             {moveNote && (
               <div className="absolute z-[70] left-1/2 -translate-x-1/2 rounded-full px-3 py-1 text-[11px] shadow-sm border"
                 style={{ top: 6, background: "white", borderColor: "var(--line)", color: "var(--danger)" }}>
@@ -965,6 +992,97 @@ function OutcomeCapture({ blocks, onDone }: { blocks: any[]; onDone: () => void 
         style={{ background: "var(--accent)" }}>
         Save outcomes
       </button>
+    </div>
+  );
+}
+
+
+/**
+ * Tasks parked on the grid at 04:00 — a reading surface, not a block.
+ *
+ * Owner ask 2026-08-06: "add little tasks that are on the calendar shown with the drop down
+ * list, like Google Tasks, and you can always place it at like a four AM time slot. It's not
+ * actually a calendar event, but it's just a place for me to see the Google tasks."
+ *
+ * It occupies no minutes, the solver never sees it, and it cannot be dragged. Collapsed it is
+ * one line with a count; open it lists what is outstanding, marking which items already have a
+ * block on the grid below and which came from Google.
+ */
+function TasksStrip({
+  tasks, open, onToggle, onDone,
+}: {
+  tasks: StripTask[];
+  open: boolean;
+  onToggle: () => void;
+  onDone: (id: number) => void | Promise<void>;
+}) {
+  if (tasks.length === 0) return null;
+  const undated = tasks.filter((t) => t.planDate === null).length;
+  return (
+    <div
+      className="absolute"
+      style={{
+        top: yOf(STRIP_MIN),
+        left: GUTTER_PX + 6,
+        right: 4,
+        zIndex: 3,
+      }}
+    >
+      <button
+        onClick={onToggle}
+        className="w-full text-left rounded-2xl border px-3 py-1.5 shadow-sm transition-[background-color] duration-[120ms]"
+        style={{
+          background: "color-mix(in srgb, var(--pink-1) 30%, white)",
+          borderColor: "var(--accent-soft)",
+          borderStyle: "dashed",
+        }}
+        title="Your tasks — not calendar events"
+      >
+        <span className="text-xs font-medium" style={{ color: "var(--ink)" }}>
+          {open ? "▾" : "▸"} Tasks · {tasks.length}
+        </span>
+        {undated > 0 && (
+          <span className="text-[10px] ml-2" style={{ color: "var(--muted)" }}>
+            {undated} with no date
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div
+          className="mt-1 rounded-2xl border shadow-sm px-3 py-2"
+          style={{ background: "white", borderColor: "var(--line)" }}
+        >
+          {tasks.map((t) => (
+            <div key={t.id} className="flex items-start gap-2 py-1">
+              <input
+                type="checkbox"
+                onChange={() => void onDone(t.id)}
+                className="mt-0.5 shrink-0 cursor-pointer"
+                title="Mark done"
+              />
+              <span className="text-xs flex-1" style={{ color: "var(--ink)" }}>
+                {t.title}
+                {t.scheduled && (
+                  <span className="text-[10px] ml-1.5" style={{ color: "var(--muted)" }}>
+                    · on the grid
+                  </span>
+                )}
+                {t.planDate === null && (
+                  <span className="text-[10px] ml-1.5" style={{ color: "var(--accent)" }}>
+                    · no date
+                  </span>
+                )}
+              </span>
+              {t.fromGoogle && (
+                <span className="text-[10px] shrink-0" style={{ color: "var(--muted)" }} title="From Google Tasks">
+                  G
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

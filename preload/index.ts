@@ -52,6 +52,7 @@ contextBridge.exposeInMainWorld("pos", {
   tasks: {
     braindump: call("tasks.braindump"),
     list: call("tasks.list"),
+    strip: call("tasks.strip"),
     setStatus: call("tasks.setStatus"),
   },
   plan: {

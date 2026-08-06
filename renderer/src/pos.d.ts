@@ -112,7 +112,7 @@ declare global {
         hide: Call; hideContacts: Call; suppressFollowUps: Call;
       };
       commitments: { list: Call; confirm: Call; drop: Call; schedule: Call; toTask: Call; toEvent: Call; updateText: Call };
-      tasks: { braindump: Call; list: Call; setStatus: Call };
+      tasks: { braindump: Call; list: Call; setStatus: Call; strip: Call };
       plan: { generate: Call; get: Call; accept: Call; push: Call; moveBlock: Call; unpinBlock: Call };
       outcomes: { needed: Call; capture: Call; adherence: Call };
       sync: { run: Call; status: Call; embed: Call; pickAndRun: Call };
