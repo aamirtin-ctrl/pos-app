@@ -23,6 +23,8 @@ export type ExternalEvent = { startMin: number; endMin: number; title: string; b
 export type Item = {
   key: string; startMin: number; endMin: number; title: string; type: string;
   external: boolean; anchor: boolean; locked: boolean;
+  /** The block row this came from — what a drag pins. Absent on external events. */
+  blockId?: number | null;
   /** Detail-popover extras — absent on preview columns, which never open one. */
   taskId?: number | null;
   capacityScore?: number | null;
@@ -385,7 +387,7 @@ export function buildItems(plan: PlanView | null, external: ExternalEvent[]): It
   const planBlocks = plan?.blocks ?? [];
   const externalsToShow = plan ? external.filter((e) => !alreadyOnPlan(planBlocks, e)) : external;
   const fromPlan: Item[] = (plan?.blocks ?? []).map((b) => ({
-    key: `b${b.id}`, startMin: minOf(b.starts_at), endMin: minOf(b.ends_at),
+    key: `b${b.id}`, blockId: b.id, startMin: minOf(b.starts_at), endMin: minOf(b.ends_at),
     title: b.title || b.block_type.replace(/_/g, " "), type: b.block_type,
     external: false, anchor: !!b.is_anchor, locked: !!b.is_locked,
     taskId: b.task_id ?? null, capacityScore: b.capacity_score_at_placement ?? null,

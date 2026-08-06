@@ -59,6 +59,8 @@ contextBridge.exposeInMainWorld("pos", {
     get: call("plan.get"),
     accept: call("plan.accept"),
     push: call("plan.push"),
+    moveBlock: call("plan.moveBlock"),
+    unpinBlock: call("plan.unpinBlock"),
   },
   outcomes: {
     needed: call("outcomes.needed"),

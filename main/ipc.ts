@@ -497,6 +497,12 @@ export function registerIpc(deps: IpcDeps) {
   h("plan.accept", (planId: number) => planner.acceptPlan(db, planId, secrets));
   // Manual retry affordance only — the automatic paths are acceptPlan and the worker sweep.
   h("plan.push", (planId: number) => planner.pushPlanToGoogle(db, secrets, planId));
+  // Dragging a block PINS it and re-solves the day around it, so breaks and transitions are
+  // recomputed by doctrine instead of dragged along by hand (owner ask 2026-08-06).
+  h("plan.moveBlock", (blockId: number, startMin: number) =>
+    planner.moveBlock(db, doctrineDir, secrets, deps.llm(), blockId, startMin));
+  h("plan.unpinBlock", (blockId: number) =>
+    planner.unpinBlock(db, doctrineDir, secrets, deps.llm(), blockId));
 
   // ── outcomes / learning ──
   h("outcomes.needed", (dateISO: string) => planner.outcomesNeeded(db, dateISO));

@@ -280,6 +280,14 @@ export async function generatePlan(
   const lockedRows = db
     .prepare("SELECT block_type, title, starts_at, ends_at FROM block WHERE is_locked = 1 AND date(starts_at) = ?")
     .all(dateISO) as { block_type: string; title: string; starts_at: string; ends_at: string }[];
+  // The spans the owner has PINNED, so the regenerated blocks can carry the pin forward.
+  // Without this a pin survives exactly one regeneration — lockedRows is read before the
+  // old plan is deleted, but the new blocks were inserted with is_locked = 0, so the next
+  // re-plan found nothing locked and moved the block back. A pin that silently expires is
+  // worse than no pin: the owner drags something, watches it stay, and finds it moved later.
+  const pinnedSpans = new Set(
+    lockedRows.map((b) => `${fromIso(b.starts_at)}|${fromIso(b.ends_at)}`)
+  );
   for (const b of lockedRows) {
     anchors.push({
       startMin: fromIso(b.starts_at),
@@ -411,8 +419,8 @@ export async function generatePlan(
     const planId = Number(lastInsertRowid);
     const ins = db.prepare(
       `INSERT INTO block (task_id, block_type, title, starts_at, ends_at, is_anchor, plan_id,
-         capacity_score_at_placement, flexibility, gcal_event_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         capacity_score_at_placement, flexibility, gcal_event_id, is_locked)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const reclaim = db.prepare("DELETE FROM gcal_tombstone WHERE event_id = ?");
     for (const b of result.blocks) {
@@ -426,7 +434,10 @@ export async function generatePlan(
         b.isAnchor ? 1 : 0, planId, b.capacityAtPlacement ?? null,
         // The solver stamps every block; the fallback only covers a hand-built PlacedBlock.
         b.flexibility ?? (b.isAnchor ? "fixed" : "flexible"),
-        inherited ?? null);
+        inherited ?? null,
+        // Carry the pin: a block landing on a span the owner pinned stays pinned, so the
+        // NEXT regeneration still sees it as fixed rather than quietly reclaiming the time.
+        pinnedSpans.has(`${b.startMin}|${b.endMin}`) ? 1 : 0);
     }
     // Move the deferred work off this day BEFORE the status sweep, so it lands on its new day
     // as `inbox` — it was not planned today, it was postponed. The guard clause is the pin: a
@@ -476,6 +487,106 @@ export async function generatePlan(
 
   const view = getPlan(db, dateISO, planId);
   return view ? { ...view, push } : null;
+}
+
+// ── dragging a block, and letting the day rebuild around it ──────────────────
+//
+// Owner ask 2026-08-06: "You should make it possible for me to move around different events
+// in the app. And when I move around the events, the breaks and whatever else can change
+// accordingly to the scheduling best practices."
+//
+// The mechanism already existed for GOOGLE: move a POS event in Google Calendar and
+// reconcileMovedEvents pins the block (is_locked = 1) so the planner treats it as immovable
+// and re-solves everything else around it. This is the same contract, driven from inside the
+// app — the drag PINS, and the day is then re-solved from scratch, so breaks, transitions and
+// recovery time are recomputed by doctrine rather than dragged along by hand.
+
+/** Drags snap to the solver's own slot size — a block off-grid could never be re-placed. */
+export const MOVE_SNAP_MIN = 15;
+
+/** Typed refusals, so the UI can explain rather than just fail. */
+export type MoveBlockError = "not_found" | "external_event" | "past_day";
+
+export interface MoveBlockResult {
+  moved: boolean;
+  error?: MoveBlockError;
+  /** The re-solved day, when the move went through. */
+  plan?: unknown;
+}
+
+const clampMin = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
+/**
+ * Move one block to a new start time, pin it there, and re-solve its day around the pin.
+ *
+ * External calendar events are refused: they belong to Google (or Apple), and moving them
+ * here would put the two copies out of step with no way to tell which is right. The owner
+ * moves those in the calendar they came from, and reconcileMovedEvents picks the change up.
+ */
+export async function moveBlock(
+  db: Db,
+  doctrineDir: string,
+  secrets: SecretStore,
+  llm: LlmClient | null,
+  blockId: number,
+  newStartMin: number,
+  deps?: ReplanDeps
+): Promise<MoveBlockResult> {
+  const row = db
+    .prepare(
+      `SELECT b.id, b.is_anchor, b.starts_at, b.ends_at, p.plan_date
+         FROM block b JOIN plan p ON p.id = b.plan_id
+        WHERE b.id = ?`
+    )
+    .get(blockId) as
+    | { id: number; is_anchor: number; starts_at: string; ends_at: string; plan_date: string }
+    | undefined;
+  if (!row) return { moved: false, error: "not_found" };
+  if (row.is_anchor === 1) return { moved: false, error: "external_event" };
+
+  const dateISO = row.plan_date;
+  const duration = Math.max(MOVE_SNAP_MIN, fromIso(row.ends_at) - fromIso(row.starts_at));
+  // Snap to the grid and keep the block inside the day it belongs to; the length is the
+  // owner's estimate and a drag never changes it.
+  // The latest start that keeps the whole block inside its OWN date, on the grid. A block
+  // ending at exactly 24:00 would be written as hour 24 — which Date reads as the next day at
+  // 00:00, so `fromIso` returns 0 and the block appears to have negative length. The last
+  // usable slot is therefore the last grid step that ends before midnight.
+  const latestStart = Math.max(0, Math.floor((24 * 60 - 1 - duration) / MOVE_SNAP_MIN) * MOVE_SNAP_MIN);
+  const snapped = Math.round(newStartMin / MOVE_SNAP_MIN) * MOVE_SNAP_MIN;
+  const start = clampMin(snapped, 0, latestStart);
+
+  db.prepare("UPDATE block SET starts_at = ?, ends_at = ?, is_locked = 1 WHERE id = ?").run(
+    toIso(dateISO, start),
+    toIso(dateISO, start + duration),
+    blockId
+  );
+
+  // Re-solve: generatePlan re-reads pinned blocks as FIXED anchors, so this placement is
+  // honoured exactly and everything else — breaks, transitions, recovery after deep work —
+  // is recomputed from doctrine rather than shuffled by hand. It also pushes to Google.
+  const plan = await generatePlan(db, doctrineDir, secrets, llm, dateISO, deps);
+  return { moved: true, plan };
+}
+
+/** Release a pin so the planner may site this work itself again. Re-solves the day. */
+export async function unpinBlock(
+  db: Db,
+  doctrineDir: string,
+  secrets: SecretStore,
+  llm: LlmClient | null,
+  blockId: number,
+  deps?: ReplanDeps
+): Promise<MoveBlockResult> {
+  const row = db
+    .prepare(
+      `SELECT b.id, b.starts_at, p.plan_date FROM block b JOIN plan p ON p.id = b.plan_id WHERE b.id = ?`
+    )
+    .get(blockId) as { id: number; starts_at: string; plan_date: string } | undefined;
+  if (!row) return { moved: false, error: "not_found" };
+  db.prepare("UPDATE block SET is_locked = 0 WHERE id = ?").run(blockId);
+  const plan = await generatePlan(db, doctrineDir, secrets, llm, row.plan_date, deps);
+  return { moved: true, plan };
 }
 
 export function getPlan(db: Db, dateISO: string, planId?: number) {

@@ -73,6 +73,11 @@ const LockGlyph = () => (
   </svg>
 );
 
+/** Solver slot size — a drag lands on the same grid the engine schedules on. */
+const MOVE_SNAP_MIN = 15;
+/** Movement only begins after this much travel, so a click still opens the popover. */
+const DRAG_THRESHOLD_PX = 4;
+
 const FLIP_FETCH_DEBOUNCE_MS = 250; // settle time before external-events IPC after day flips
 const PREFETCH_TTL_MS = 60_000; // a neighbor prefetched this recently is not refetched
 
@@ -194,6 +199,31 @@ export default function DayPlanner() {
     void refreshExternal(forDate); // never awaited — merges in when it lands
     prefetchNeighbors(forDate); // never awaited — previews fill in silently
   }, [date, refreshLocal, refreshExternal, prefetchNeighbors]);
+
+  // ── drag to move: pin, then let the day rebuild around the pin ──
+  //
+  // Owner ask 2026-08-06: "when I move around the events, the breaks and whatever else can
+  // change accordingly to the scheduling best practices." So the drag does NOT nudge
+  // neighbours by hand — it pins one block and re-solves the day, which is what recomputes
+  // recovery breaks, meeting transitions and everything else from doctrine.
+  const [moving, setMoving] = useState(false);
+  const [moveNote, setMoveNote] = useState<string | null>(null);
+  const moveBlock = useCallback(async (blockId: number, startMin: number) => {
+    setMoving(true);
+    setMoveNote(null);
+    try {
+      const r = await window.pos.plan.moveBlock(blockId, startMin);
+      const res = (r.ok ? r.data : null) as { moved?: boolean; error?: string } | null;
+      if (!r.ok) setMoveNote("Could not move that block.");
+      else if (res?.error === "external_event") {
+        setMoveNote("That event lives on your Google calendar — move it there and POS will follow.");
+      } else if (res?.error) setMoveNote("Could not move that block.");
+      await refresh();
+    } catch {
+      setMoveNote("Could not move that block.");
+    }
+    setMoving(false);
+  }, [refresh]);
 
   useEffect(() => {
     // Optimistic flip: paint the cached day immediately (or clear to a blank day),
@@ -393,12 +423,26 @@ export default function DayPlanner() {
                 dim={isPastDay || (isToday && g.endMin <= nowMin)} />
             ))}
 
+            {moveNote && (
+              <div className="absolute z-[70] left-1/2 -translate-x-1/2 rounded-full px-3 py-1 text-[11px] shadow-sm border"
+                style={{ top: 6, background: "white", borderColor: "var(--line)", color: "var(--danger)" }}>
+                {moveNote}
+              </div>
+            )}
+            {moving && (
+              <div className="absolute z-[70] left-1/2 -translate-x-1/2 rounded-full px-3 py-1 text-[11px] shadow-sm border"
+                style={{ top: 6, background: "white", borderColor: "var(--line)", color: "var(--muted)" }}>
+                Rebuilding the day around it…
+              </div>
+            )}
             {laid.map((it) => (
               <EventCard key={it.key} item={it} height={heights.get(it.key) ?? (it.endMin - it.startMin) * PX_PER_MIN}
                 status={status(it)} nowMin={nowMin}
                 open={openKey === it.key}
                 onToggle={() => setOpenKey((k) => (k === it.key ? null : it.key))}
                 onClose={closePopover}
+                onMove={moveBlock}
+                onDragStart={closePopover}
                 task={(it.taskId != null && tasksById.get(it.taskId)) || null} />
             ))}
 
@@ -492,14 +536,22 @@ function GapHint({ startMin, endMin, dim }: { startMin: number; endMin: number; 
  * own rect. Only one popover is open at a time — the open card's key lives in
  * DayPlanner, not here.
  */
-function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task }: {
+function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task, onMove, dragOffset, onDragStart }: {
   item: LaidOutItem; height: number; status: "past" | "current" | "future"; nowMin: number;
   open: boolean;
   onToggle: () => void;
   onClose: () => void;
   task: { title: string; status: string } | null;
+  /** Commit a drag: the block is pinned here and the day re-solves around it. */
+  onMove?: (blockId: number, startMin: number) => void;
+  /** Live px offset while this card is being dragged (0 when it is not). */
+  dragOffset?: number;
+  onDragStart?: (blockId: number, startMin: number) => void;
 }) {
   const cardRef = useRef<HTMLDivElement | null>(null);
+  // External events belong to the calendar they came from — moving them here would put the
+  // two copies out of step. Those are moved in Google/Apple, and the sync picks the change up.
+  const movable = !item.external && !item.anchor && item.blockId != null && !!onMove;
   const c = COLORS[item.type] ?? FALLBACK_COLOR;
   const dur = item.endMin - item.startMin;
   const progress = status === "current" ? Math.min(100, Math.max(0, ((nowMin - item.startMin) / Math.max(1, dur)) * 100)) : 0;
@@ -508,21 +560,60 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
   const tight = height < 44;   // no time row / meta pills
   const roomy = height >= 76;  // full card: icon circle, time row, progress bar
   const laneW = 100 / item.lanes;
+  // Pointer drag: the card follows the cursor, snapped to the solver's 15-minute grid, and
+  // commits on release. Movement only starts after a few px so a click still opens the popover.
+  const drag = useRef<{ id: number; y0: number; start0: number; live: boolean } | null>(null);
+  const onPointerDown = (e: React.PointerEvent) => {
+    if (!movable || open) return;
+    drag.current = { id: item.blockId!, y0: e.clientY, start0: item.startMin, live: false };
+  };
+  const onPointerMove = (e: React.PointerEvent) => {
+    const d = drag.current;
+    if (!d) return;
+    const dy = e.clientY - d.y0;
+    if (!d.live && Math.abs(dy) < DRAG_THRESHOLD_PX) return;
+    if (!d.live) {
+      d.live = true;
+      (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+      onDragStart?.(d.id, d.start0);
+    }
+    const snapped = Math.round(dy / PX_PER_MIN / MOVE_SNAP_MIN) * MOVE_SNAP_MIN;
+    setGhost(snapped * PX_PER_MIN);
+  };
+  const endDrag = (e: React.PointerEvent) => {
+    const d = drag.current;
+    drag.current = null;
+    if (!d?.live) return;
+    e.stopPropagation();
+    const dy = e.clientY - d.y0;
+    const deltaMin = Math.round(dy / PX_PER_MIN / MOVE_SNAP_MIN) * MOVE_SNAP_MIN;
+    setGhost(0);
+    if (deltaMin !== 0) onMove?.(d.id, Math.max(0, d.start0 + deltaMin));
+  };
+  const [ghost, setGhost] = useState(0);
+  const offset = ghost || dragOffset || 0;
+
   return (
     <div className="absolute"
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={() => { drag.current = null; setGhost(0); }}
       style={{
-        top: yOf(item.startMin), height,
+        top: yOf(item.startMin) + offset, height,
+        transition: offset ? "none" : "top 140ms ease",
+        cursor: movable ? (offset ? "grabbing" : "grab") : "default",
         left: `calc(${GUTTER_PX + 6}px + (100% - ${GUTTER_PX + 10}px) * ${item.lane * laneW / 100})`,
         width: `calc((100% - ${GUTTER_PX + 10}px) * ${item.span * laneW / 100} - 4px)`,
         opacity: dim ? 0.55 : 1,
-        zIndex: (open ? 40 : 2) + item.lane, // an open card rides above its neighbors
+        zIndex: (offset ? 60 : open ? 40 : 2) + item.lane, // dragged > open > neighbors
       }}>
       <div ref={cardRef}
         role="button"
         tabIndex={0}
         aria-haspopup="dialog"
         aria-expanded={open}
-        onClick={onToggle}
+        onClick={(e) => { if (ghost) { e.preventDefault(); return; } onToggle(); }}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onToggle(); }
         }}

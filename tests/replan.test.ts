@@ -415,11 +415,19 @@ describe("locked blocks", () => {
     expect(r.replanned).toBe(true);
 
     // the pin itself is untouched in the DB…
+    //
+    // The ACCEPTED plan keeps its row (it owns the day's outcome history) and the regenerated
+    // plan carries the pin forward onto its own block — since 2026-08-06 the pin is written on
+    // the new block too, so it survives the NEXT re-solve instead of silently expiring after
+    // one. Both rows describe the same reserved minutes, which is what actually matters here.
     const pin = db
       .prepare("SELECT starts_at, ends_at FROM block WHERE is_locked = 1 AND date(starts_at) = ?")
       .all(DATE) as { starts_at: string; ends_at: string }[];
-    expect(pin).toHaveLength(1);
-    expect(minutesOf(pin[0].starts_at)).toBe(20 * 60 + 45);
+    expect(pin.length).toBeGreaterThanOrEqual(1);
+    for (const p of pin) {
+      expect(minutesOf(p.starts_at)).toBe(20 * 60 + 45);
+      expect(minutesOf(p.ends_at)).toBe(21 * 60 + 30);
+    }
 
     // …and the regenerated day still reserves those minutes
     const kept = (getPlan(db, DATE)!.blocks as Record<string, unknown>[]).find(
