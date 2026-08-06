@@ -637,7 +637,7 @@ export async function generatePlan(
 export const MOVE_SNAP_MIN = 15;
 
 /** Typed refusals, so the UI can explain rather than just fail. */
-export type MoveBlockError = "not_found" | "external_event" | "past_day";
+export type MoveBlockError = "not_found" | "external_event" | "past_day" | "no_task" | "same_day";
 
 export interface MoveBlockResult {
   moved: boolean;
@@ -764,6 +764,63 @@ export async function resizeBlock(
   }
 
   const plan = await generatePlan(db, doctrineDir, secrets, llm, dateISO, { ...deps, fast: true });
+  return { moved: true, plan };
+}
+
+/**
+ * Move a block's WORK to another day.
+ *
+ * Owner ask 2026-08-06: "I should be able to drag calendar events into other days."
+ *
+ * What moves is the TASK, not the block. Dropping work on Thursday means "do this Thursday",
+ * and Thursday's own solve — with Thursday's anchors, energy curve and shutdown — is a better
+ * judge of when than the minute he happened to release the pointer over a 90px preview column.
+ * So the source block is removed (its Google event withdrawn by the tombstone trigger), the
+ * task's plan_date moves, and both days are re-solved.
+ *
+ * Blocks with no task behind them (breaks, meals, rituals) are refused: they are scaffolding
+ * doctrine regenerates per day, so "moving" one to another day means nothing.
+ */
+export async function moveBlockToDay(
+  db: Db,
+  doctrineDir: string,
+  secrets: SecretStore,
+  llm: LlmClient | null,
+  blockId: number,
+  targetDateISO: string,
+  deps?: ReplanDeps
+): Promise<MoveBlockResult> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDateISO)) return { moved: false, error: "not_found" };
+  const row = db
+    .prepare(
+      `SELECT b.id, b.task_id, b.is_anchor, b.is_locked, p.plan_date
+         FROM block b JOIN plan p ON p.id = b.plan_id
+        WHERE b.id = ?`
+    )
+    .get(blockId) as
+    | { id: number; task_id: number | null; is_anchor: number; is_locked: number; plan_date: string }
+    | undefined;
+  if (!row) return { moved: false, error: "not_found" };
+  if (row.is_anchor === 1 && row.is_locked !== 1) return { moved: false, error: "external_event" };
+  if (row.task_id == null) return { moved: false, error: "no_task" };
+  if (row.plan_date === targetDateISO) return { moved: false, error: "same_day" };
+  // The past cannot be scheduled into — the grid floor would refuse every slot anyway, and
+  // silently accepting the drop would look like it worked.
+  const today = (deps?.now ?? new Date()).toISOString().slice(0, 10);
+  if (targetDateISO < today) return { moved: false, error: "past_day" };
+
+  db.transaction(() => {
+    // Remove it from the day it left. The trigger tombstones its Google event, and the push
+    // withdraws it — otherwise the calendar would show the work on both days.
+    db.prepare("DELETE FROM block WHERE id = ?").run(blockId);
+    // A window would let the engine drift it back; an explicit drag is a decision about a day.
+    db.prepare("UPDATE task SET plan_date = ?, window_start = NULL, window_end = NULL WHERE id = ?")
+      .run(targetDateISO, row.task_id);
+  })();
+
+  // The day it left, then the day it joined. Both are re-solved on the fast path.
+  await generatePlan(db, doctrineDir, secrets, llm, row.plan_date, { ...deps, fast: true });
+  const plan = await generatePlan(db, doctrineDir, secrets, llm, targetDateISO, { ...deps, fast: true });
   return { moved: true, plan };
 }
 

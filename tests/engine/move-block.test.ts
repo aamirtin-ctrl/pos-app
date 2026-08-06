@@ -15,7 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { openDb, type Db } from "../../main/db/db.ts";
-import { moveBlock, resizeBlock, unpinBlock, MOVE_SNAP_MIN } from "../../main/planner.ts";
+import { moveBlock, resizeBlock, moveBlockToDay, unpinBlock, MOVE_SNAP_MIN } from "../../main/planner.ts";
 import { SecretStore } from "../../main/secrets.ts";
 
 const DATE = "2026-08-06";
@@ -253,6 +253,101 @@ describe("resizeBlock", () => {
     expect(await resizeBlock(db, dir, secrets, null, id, 16 * 60, 20 * 60, deps)).toMatchObject({
       moved: false,
       error: "external_event",
+    });
+  });
+});
+
+// ── dragging work into another day ───────────────────────────────────────────
+//
+// Owner ask 2026-08-06: "I should be able to drag calendar events into other days."
+//
+// What moves is the TASK, not the block. Dropping work on Thursday means "do this Thursday",
+// and Thursday's own solve — with its anchors, energy curve and shutdown — is a better judge
+// of WHEN than the minute he happened to release the pointer over a 90px preview column.
+describe("moveBlockToDay", () => {
+  const TOMORROW = "2026-08-07";
+  const withTask = (startMin: number, endMin: number) => {
+    const taskId = Number(
+      db.prepare(
+        `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, is_mit, status, plan_date)
+         VALUES ('Research for Liatris', 'deep_work', 4, ?, 0, 'planned', ?)`
+      ).run(endMin - startMin, DATE).lastInsertRowid
+    );
+    const planId = Number(
+      db.prepare(
+        `INSERT INTO plan (plan_date, engine_version, doctrine_snapshot, narration, unplaced_tasks)
+         VALUES (?, 'test', '{}', '', '[]')`
+      ).run(DATE).lastInsertRowid
+    );
+    const hhmm = (m: number) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+    const blockId = Number(
+      db.prepare(
+        `INSERT INTO block (task_id, block_type, title, starts_at, ends_at, is_anchor, plan_id)
+         VALUES (?, 'deep_work', 'Research for Liatris', ?, ?, 0, ?)`
+      ).run(taskId, `${DATE}T${hhmm(startMin)}:00`, `${DATE}T${hhmm(endMin)}:00`, planId).lastInsertRowid
+    );
+    return { taskId, blockId };
+  };
+  const planDateOf = (taskId: number) =>
+    (db.prepare("SELECT plan_date d FROM task WHERE id = ?").get(taskId) as { d: string }).d;
+  const early = { anchors: async () => [], now: new Date(`${DATE}T06:00:00`) };
+
+  it("moves the work to the day he dropped it on", async () => {
+    const { taskId, blockId } = withTask(10 * 60, 11 * 60);
+    const r = await moveBlockToDay(db, dir, secrets, null, blockId, TOMORROW, early);
+    expect(r.moved).toBe(true);
+    expect(planDateOf(taskId)).toBe(TOMORROW);
+  });
+
+  it("leaves the day it came from — the work is not on both", async () => {
+    const { blockId } = withTask(10 * 60, 11 * 60);
+    await moveBlockToDay(db, dir, secrets, null, blockId, TOMORROW, early);
+    const stillHere = db
+      .prepare(
+        `SELECT COUNT(*) n FROM block b JOIN plan p ON p.id = b.plan_id
+          WHERE p.plan_date = ? AND b.title = 'Research for Liatris'`
+      )
+      .get(DATE) as { n: number };
+    expect(stillHere.n).toBe(0);
+  });
+
+  it("clears any window, because a drag is a decision about a day", async () => {
+    const { taskId, blockId } = withTask(10 * 60, 11 * 60);
+    db.prepare("UPDATE task SET window_start = ?, window_end = '2026-08-09' WHERE id = ?").run(DATE, taskId);
+    await moveBlockToDay(db, dir, secrets, null, blockId, TOMORROW, early);
+    const row = db.prepare("SELECT window_end w FROM task WHERE id = ?").get(taskId) as { w: string | null };
+    expect(row.w).toBeNull(); // otherwise the engine could drift it straight back
+  });
+
+  it("refuses a block with no work behind it — scaffolding is per-day", async () => {
+    const id = addPlanWithBlock({ startMin: 13 * 60, endMin: 13 * 60 + 45, type: "meal" });
+    expect(await moveBlockToDay(db, dir, secrets, null, id, TOMORROW, early)).toMatchObject({
+      moved: false,
+      error: "no_task",
+    });
+  });
+
+  it("refuses an external calendar event", async () => {
+    const id = addPlanWithBlock({ startMin: 16 * 60, endMin: 19 * 60, isAnchor: true, type: "personal" });
+    expect(await moveBlockToDay(db, dir, secrets, null, id, TOMORROW, early)).toMatchObject({
+      moved: false,
+      error: "external_event",
+    });
+  });
+
+  it("refuses the past — a day that has been cannot be scheduled into", async () => {
+    const { blockId } = withTask(10 * 60, 11 * 60);
+    expect(await moveBlockToDay(db, dir, secrets, null, blockId, "2026-08-01", early)).toMatchObject({
+      moved: false,
+      error: "past_day",
+    });
+  });
+
+  it("is a no-op on the day it is already on", async () => {
+    const { blockId } = withTask(10 * 60, 11 * 60);
+    expect(await moveBlockToDay(db, dir, secrets, null, blockId, DATE, early)).toMatchObject({
+      moved: false,
+      error: "same_day",
     });
   });
 });

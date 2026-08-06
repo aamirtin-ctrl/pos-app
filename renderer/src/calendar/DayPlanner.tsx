@@ -78,6 +78,14 @@ const LockGlyph = () => (
 const MOVE_SNAP_MIN = 15;
 /** Movement only begins after this much travel, so a click still opens the popover. */
 const DRAG_THRESHOLD_PX = 4;
+/**
+ * Sideways travel that counts as ONE day (owner ask 2026-08-06: "I should be able to drag
+ * calendar events into other days"). Roughly the width of a neighbouring preview column, so
+ * dragging onto the column beside the day lands on that day.
+ */
+const DAY_DRAG_PX = 90;
+/** As far as a single drag may reach — the carousel only shows three days either side. */
+const MAX_DAY_DRAG = 3;
 
 type StripTask = {
   id: number; title: string; status: string;
@@ -223,6 +231,34 @@ export default function DayPlanner() {
   // recovery breaks, meeting transitions and everything else from doctrine.
   const [moving, setMoving] = useState(false);
   const [moveNote, setMoveNote] = useState<string | null>(null);
+  const moveToDay = useCallback(async (blockId: number, days: number) => {
+    setMoving(true);
+    setMoveNote(null);
+    const target = addDaysISO(date, days);
+    try {
+      const r = await window.pos.plan.moveBlockToDay(blockId, target);
+      const res = (r.ok ? r.data : null) as { moved?: boolean; error?: string } | null;
+      if (!r.ok || res?.error) {
+        setMoveNote(
+          res?.error === "no_task"
+            ? "That one is part of the day's structure — only real work moves between days."
+            : res?.error === "external_event"
+              ? "That event lives on your Google calendar — move it there."
+              : res?.error === "past_day"
+                ? "That day has already been."
+                : "Could not move that to another day."
+        );
+      } else {
+        const when = new Date(`${target}T12:00:00`).toLocaleDateString(undefined, { weekday: "long" });
+        setMoveNote(`Moved to ${when} — that day will place it.`);
+      }
+      await refresh();
+    } catch {
+      setMoveNote("Could not move that to another day.");
+    }
+    setMoving(false);
+  }, [refresh, date]);
+
   const resizeBlock = useCallback(async (blockId: number, startMin: number, endMin: number) => {
     setMoving(true);
     setMoveNote(null);
@@ -494,6 +530,7 @@ export default function DayPlanner() {
                 onClose={closePopover}
                 onMove={moveBlock}
                 onResize={resizeBlock}
+                onMoveToDay={moveToDay}
                 onDragStart={closePopover}
                 task={(it.taskId != null && tasksById.get(it.taskId)) || null} />
             ))}
@@ -588,7 +625,7 @@ function GapHint({ startMin, endMin, dim }: { startMin: number; endMin: number; 
  * own rect. Only one popover is open at a time — the open card's key lives in
  * DayPlanner, not here.
  */
-function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task, onMove, onResize, dragOffset, onDragStart }: {
+function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task, onMove, onResize, onMoveToDay, dragOffset, onDragStart }: {
   item: LaidOutItem; height: number; status: "past" | "current" | "future"; nowMin: number;
   open: boolean;
   onToggle: () => void;
@@ -598,6 +635,8 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
   onMove?: (blockId: number, startMin: number) => void;
   /** Commit an edge drag: the block keeps its other edge and the day re-solves. */
   onResize?: (blockId: number, startMin: number, endMin: number) => void;
+  /** Commit a sideways drag: the WORK moves to a day `days` away. */
+  onMoveToDay?: (blockId: number, days: number) => void | Promise<void>;
   /** Live px offset while this card is being dragged (0 when it is not). */
   dragOffset?: number;
   onDragStart?: (blockId: number, startMin: number) => void;
@@ -623,11 +662,11 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
   const laneW = 100 / item.lanes;
   // Pointer drag: the card follows the cursor, snapped to the solver's 15-minute grid, and
   // commits on release. Movement only starts after a few px so a click still opens the popover.
-  const drag = useRef<{ id: number; y0: number; start0: number; live: boolean } | null>(null);
+  const drag = useRef<{ id: number; x0: number; y0: number; start0: number; live: boolean } | null>(null);
   const onPointerDown = (e: React.PointerEvent) => {
     if (!movable) return; // NOT gated on `open`: an open popover used to make the card
                           // undraggable, so one stray click disabled dragging until it closed.
-    drag.current = { id: item.blockId!, y0: e.clientY, start0: item.startMin, live: false };
+    drag.current = { id: item.blockId!, x0: e.clientX, y0: e.clientY, start0: item.startMin, live: false };
     // Capture NOW, not once the threshold is crossed. A quick drag leaves a short card (a
     // 45-minute block is 54px tall) before the 4px is measured, and without capture the
     // pointermove events then go to whatever is underneath and the drag never starts.
@@ -637,13 +676,19 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
     const d = drag.current;
     if (!d) return;
     const dy = e.clientY - d.y0;
-    if (!d.live && Math.abs(dy) < DRAG_THRESHOLD_PX) return;
+    const dx = e.clientX - d.x0;
+    if (!d.live && Math.abs(dy) < DRAG_THRESHOLD_PX && Math.abs(dx) < DRAG_THRESHOLD_PX) return;
     if (!d.live) {
       d.live = true;
       onDragStart?.(d.id, d.start0); // closes the popover, so the card is not dragged under it
     }
+    const days = dayShiftOf(dx);
+    setDayShift(days);
+    // While it is being carried to another day the vertical offset is meaningless — that day
+    // will place it — so the card just follows the pointer sideways.
     const snapped = Math.round(dy / PX_PER_MIN / MOVE_SNAP_MIN) * MOVE_SNAP_MIN;
-    setGhost(snapped * PX_PER_MIN);
+    setGhost(days === 0 ? snapped * PX_PER_MIN : 0);
+    setGhostX(days === 0 ? 0 : dx);
   };
   const endDrag = (e: React.PointerEvent) => {
     const d = drag.current;
@@ -651,6 +696,16 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
     (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
     if (!d?.live) return;
     e.stopPropagation();
+    const days = dayShiftOf(e.clientX - d.x0);
+    if (days !== 0) {
+      // Sideways wins: he carried it to another day, and the time he released it at means
+      // nothing on a 90px preview column. That day's own solve decides when.
+      setGhost(0);
+      setGhostX(0);
+      setDayShift(0);
+      void onMoveToDay?.(d.id, days);
+      return;
+    }
     const dy = e.clientY - d.y0;
     const deltaMin = Math.round(dy / PX_PER_MIN / MOVE_SNAP_MIN) * MOVE_SNAP_MIN;
     if (deltaMin === 0) { setGhost(0); return; }
@@ -662,7 +717,12 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
     void onMove?.(d.id, Math.max(0, d.start0 + deltaMin));
   };
   const [ghost, setGhost] = useState(0);
+  const [ghostX, setGhostX] = useState(0);
+  const [dayShift, setDayShift] = useState(0);
   const offset = ghost || dragOffset || 0;
+  /** How many days sideways travel amounts to, clamped to what the carousel shows. */
+  const dayShiftOf = (dx: number) =>
+    Math.max(-MAX_DAY_DRAG, Math.min(MAX_DAY_DRAG, Math.trunc(dx / DAY_DRAG_PX)));
 
   // ── edge handles: extend or limit the time this takes ──
   //
@@ -712,6 +772,7 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
       onPointerCancel={() => { drag.current = null; setGhost(0); }}
       style={{
         top: yOf(item.startMin) + offset + topShift, height: shownHeight,
+        transform: ghostX ? `translateX(${ghostX}px)` : undefined,
         transition: offset ? "none" : "top 140ms ease",
         cursor: movable ? (offset ? "grabbing" : "grab") : "default",
         left: `calc(${GUTTER_PX + 6}px + (100% - ${GUTTER_PX + 10}px) * ${item.lane * laneW / 100})`,
@@ -742,6 +803,7 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
           outline: open || status === "current" ? "2px solid var(--accent)" : item.locked ? "2px dashed var(--accent-soft)" : "none",
           outlineOffset: "1px",
         }}
+        data-day-shift={dayShift || undefined}
         title={`${item.title} · ${fmtMin(item.startMin)} – ${fmtMin(item.endMin)}${
           item.locked ? " · pinned here — drag again to move it" : movable ? " · drag to move" : ""
         }`}>

@@ -512,6 +512,8 @@ export function registerIpc(deps: IpcDeps) {
     planner.moveBlock(db, doctrineDir, secrets, deps.llm(), blockId, startMin));
   h("plan.resizeBlock", (blockId: number, startMin: number, endMin: number) =>
     planner.resizeBlock(db, doctrineDir, secrets, deps.llm(), blockId, startMin, endMin));
+  h("plan.moveBlockToDay", (blockId: number, dateISO: string) =>
+    planner.moveBlockToDay(db, doctrineDir, secrets, deps.llm(), blockId, dateISO));
   h("plan.unpinBlock", (blockId: number) =>
     planner.unpinBlock(db, doctrineDir, secrets, deps.llm(), blockId));
 
