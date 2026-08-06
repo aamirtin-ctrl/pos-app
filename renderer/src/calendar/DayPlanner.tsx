@@ -555,7 +555,14 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
   const cardRef = useRef<HTMLDivElement | null>(null);
   // External events belong to the calendar they came from — moving them here would put the
   // two copies out of step. Those are moved in Google/Apple, and the sync picks the change up.
-  const movable = !item.external && !item.anchor && item.blockId != null && !!onMove;
+  // What may be dragged.
+  //
+  // `anchor` alone is NOT the test, and using it was a bug: since past blocks are carried
+  // forward and pins are re-read as fixed anchors, most of his day became is_anchor=1 and
+  // therefore undraggable — including the blocks he had just moved. An anchor he PINNED is his
+  // own placement and must stay draggable; an anchor that is an external calendar event (or
+  // already behind him) is not ours to move.
+  const movable = !item.external && item.blockId != null && !!onMove && (!item.anchor || item.locked);
   const c = COLORS[item.type] ?? FALLBACK_COLOR;
   const dur = item.endMin - item.startMin;
   const progress = status === "current" ? Math.min(100, Math.max(0, ((nowMin - item.startMin) / Math.max(1, dur)) * 100)) : 0;
@@ -568,8 +575,13 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
   // commits on release. Movement only starts after a few px so a click still opens the popover.
   const drag = useRef<{ id: number; y0: number; start0: number; live: boolean } | null>(null);
   const onPointerDown = (e: React.PointerEvent) => {
-    if (!movable || open) return;
+    if (!movable) return; // NOT gated on `open`: an open popover used to make the card
+                          // undraggable, so one stray click disabled dragging until it closed.
     drag.current = { id: item.blockId!, y0: e.clientY, start0: item.startMin, live: false };
+    // Capture NOW, not once the threshold is crossed. A quick drag leaves a short card (a
+    // 45-minute block is 54px tall) before the 4px is measured, and without capture the
+    // pointermove events then go to whatever is underneath and the drag never starts.
+    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
   };
   const onPointerMove = (e: React.PointerEvent) => {
     const d = drag.current;
@@ -578,8 +590,7 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
     if (!d.live && Math.abs(dy) < DRAG_THRESHOLD_PX) return;
     if (!d.live) {
       d.live = true;
-      (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
-      onDragStart?.(d.id, d.start0);
+      onDragStart?.(d.id, d.start0); // closes the popover, so the card is not dragged under it
     }
     const snapped = Math.round(dy / PX_PER_MIN / MOVE_SNAP_MIN) * MOVE_SNAP_MIN;
     setGhost(snapped * PX_PER_MIN);
@@ -587,6 +598,7 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
   const endDrag = (e: React.PointerEvent) => {
     const d = drag.current;
     drag.current = null;
+    (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
     if (!d?.live) return;
     e.stopPropagation();
     const dy = e.clientY - d.y0;

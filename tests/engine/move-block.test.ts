@@ -138,6 +138,30 @@ describe("moveBlock", () => {
     expect(pinnedSpans()).toContainEqual([14 * 60, 15 * 60]);
   });
 
+  // Owner report 2026-08-06: "i still cant click and drag the events on my calendar."
+  //
+  // `is_anchor` was the movability test, and by then most of his day was an anchor: past
+  // blocks are carried forward as anchors and a pin is re-read as one. So the first drag
+  // worked and then the block — and everything already behind him — became immovable. A block
+  // he pinned himself has to stay draggable, or a drag is a one-way door.
+  it("lets a pinned block be dragged again", async () => {
+    const id = addPlanWithBlock({ startMin: 10 * 60, endMin: 11 * 60 });
+    await moveBlock(db, dir, secrets, null, id, 14 * 60, deps);
+    const pinned = db.prepare("SELECT id FROM block WHERE is_locked = 1").get() as { id: number };
+
+    const again = await moveBlock(db, dir, secrets, null, pinned.id, 16 * 60, deps);
+    expect(again.moved).toBe(true);
+    expect(pinnedSpans()).toContainEqual([16 * 60, 17 * 60]);
+  });
+
+  it("still refuses an anchor he did NOT pin — that is the calendar's, not his", async () => {
+    const id = addPlanWithBlock({ startMin: 16 * 60, endMin: 19 * 60, isAnchor: true, type: "personal" });
+    expect(await moveBlock(db, dir, secrets, null, id, 12 * 60, deps)).toMatchObject({
+      moved: false,
+      error: "external_event",
+    });
+  });
+
   it("unpinBlock releases the placement so the planner may site it again", async () => {
     const id = addPlanWithBlock({ startMin: 10 * 60, endMin: 11 * 60 });
     await moveBlock(db, dir, secrets, null, id, 14 * 60, deps);

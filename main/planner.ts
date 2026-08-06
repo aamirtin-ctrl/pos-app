@@ -619,15 +619,20 @@ export async function moveBlock(
 ): Promise<MoveBlockResult> {
   const row = db
     .prepare(
-      `SELECT b.id, b.is_anchor, b.starts_at, b.ends_at, p.plan_date
+      `SELECT b.id, b.is_anchor, b.is_locked, b.starts_at, b.ends_at, p.plan_date
          FROM block b JOIN plan p ON p.id = b.plan_id
         WHERE b.id = ?`
     )
     .get(blockId) as
-    | { id: number; is_anchor: number; starts_at: string; ends_at: string; plan_date: string }
+    | { id: number; is_anchor: number; is_locked: number; starts_at: string; ends_at: string; plan_date: string }
     | undefined;
   if (!row) return { moved: false, error: "not_found" };
-  if (row.is_anchor === 1) return { moved: false, error: "external_event" };
+  // `is_anchor` alone is the wrong test, and using it locked him out of his own blocks: past
+  // blocks are carried forward as anchors and pins are re-read as anchors, so after one drag
+  // most of the day was is_anchor=1 and nothing could be moved again. An anchor he PINNED is
+  // his own placement. An anchor he did not is an external calendar event (or already behind
+  // him), and that is the one this refuses.
+  if (row.is_anchor === 1 && row.is_locked !== 1) return { moved: false, error: "external_event" };
 
   const dateISO = row.plan_date;
   const duration = Math.max(MOVE_SNAP_MIN, fromIso(row.ends_at) - fromIso(row.starts_at));
