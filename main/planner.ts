@@ -91,14 +91,45 @@ export async function braindump(db: Db, doctrineDir: string, llm: LlmClient | nu
  */
 export const SCHEDULABLE_TASK_STATUSES = ["inbox", "planned", "in_progress"] as const;
 
+/**
+ * Everything that may legitimately be scheduled on `dateISO`.
+ *
+ * Two pools, and the second one is the point (owner ask 2026-08-06: "I want the system to be
+ * completely adaptable to a bunch of calendar changes and still fit stuff in free spaces as
+ * they pop up or move stuff around. Right now for today I initially had, like, a three hour
+ * hangout block that I deleted, so now there's a bunch of free space where I can do stuff"):
+ *
+ *   1. plan_date == dateISO — the day's own work, as always.
+ *   2. WINDOWED work parked on a LATER day whose window still covers this one.
+ *
+ * Without (2) deferral is a one-way door. His advising task moved to Friday while the day was
+ * tight; he then deleted a three-hour hangout, today reopened with nearly six hours free, and
+ * the task could not come back because the solve only ever looked at `plan_date = today`. The
+ * engine was re-solving a day it could no longer see the work for.
+ *
+ * A window means "any day in here", so it has to mean that in BOTH directions. Same-day work
+ * still outranks it (solver.windowRank), so pulling back can never cost today's own work its
+ * place — it only ever spends time that would otherwise sit empty.
+ */
 export function listTasks(db: Db, dateISO: string) {
+  const status = SCHEDULABLE_TASK_STATUSES.map(() => "?").join(",");
   return db
     .prepare(
-      `SELECT * FROM task WHERE plan_date = ?
-         AND status IN (${SCHEDULABLE_TASK_STATUSES.map(() => "?").join(",")})
-       ORDER BY id`
+      `SELECT * FROM task
+        WHERE status IN (${status})
+          AND (
+            plan_date = ?
+            OR (
+              -- parked later, but this day is inside its window: eligible to come back
+              window_end IS NOT NULL
+              AND plan_date > ?
+              AND window_end >= ?
+              AND COALESCE(window_start, '0000-01-01') <= ?
+            )
+          )
+        ORDER BY id`
     )
-    .all(dateISO, ...SCHEDULABLE_TASK_STATUSES) as Record<string, unknown>[];
+    .all(...SCHEDULABLE_TASK_STATUSES, dateISO, dateISO, dateISO, dateISO) as Record<string, unknown>[];
 }
 
 /**
@@ -262,6 +293,15 @@ export async function generatePlan(
   }
 
   const taskRows = listTasks(db, dateISO);
+  // Windowed work parked on a LATER day that this solve is allowed to reclaim. Tracked so the
+  // deferral bookkeeping below can tell "this day's own work slipped" from "another day's work
+  // was offered this day's leftovers and didn't take them" — the second is not a deferral and
+  // must never move the date the task is already parked on.
+  const pulledBack = new Map<number, string>(
+    taskRows
+      .filter((r: any) => r.plan_date && r.plan_date !== dateISO)
+      .map((r: any) => [r.id as number, r.plan_date as string])
+  );
   const tasks: PlannerTask[] = taskRows.map((r: any) => ({
     id: r.id,
     title: r.title,
@@ -275,10 +315,22 @@ export async function generatePlan(
     // A window makes plan_date a CHOICE rather than a commitment — the solver may hand this
     // task back as `deferred_within_window` and it is moved below.
     windowEnd: (r.window_end as string | null) ?? null,
-    planDate: (r.plan_date as string | null) ?? dateISO,
+    // Every task is offered to the solver AS THIS DAY'S candidate, including one reclaimed
+    // from later: `planDate` is what the solver ranks and defers against, and the question it
+    // is answering is "does this belong today?". The real parked date lives in `pulledBack`.
+    planDate: dateISO,
   }));
 
   const result = solve(tasks, doctrine, anchors);
+
+  // Work reclaimed from a later day and actually seated here — its date follows the block.
+  const reclaimed = result.blocks
+    .filter((b) => b.taskId != null && pulledBack.has(b.taskId))
+    .map((b) => b.taskId as number);
+  // The days those tasks came FROM are now wrong: they still hold a plan built around work
+  // that has moved here. Their un-accepted plans are dropped so the sweep re-solves them
+  // (blocks cascade, so their Google events are withdrawn by the tombstone trigger).
+  const releasedDates = [...new Set(reclaimed.map((id) => pulledBack.get(id)!))];
 
   // ── deadline windows: the task that has all week actually moves ─────────────
   //
@@ -389,6 +441,15 @@ export async function generatePlan(
           )`
     );
     for (const d of deferrals) defer.run(d.movedTo, dateISO, d.task.id, dateISO, dateISO);
+    // Work reclaimed from a later day moves ONTO this one, so the day that was holding it
+    // stops holding it and the next solve of that day no longer sees it. Without this the
+    // task would be scheduled twice — here, and again where it was parked.
+    const moveTaskHere = db.prepare("UPDATE task SET plan_date = ? WHERE id = ?");
+    for (const id of reclaimed) moveTaskHere.run(dateISO, id);
+    // …and the day it left is re-opened. Only un-accepted plans: a day the owner locked is
+    // his, and a task cannot be quietly pulled out from under a schedule he committed to.
+    const release = db.prepare("DELETE FROM plan WHERE plan_date = ? AND accepted_at IS NULL");
+    for (const d of releasedDates) release.run(d);
     db.prepare("UPDATE task SET status = 'planned' WHERE plan_date = ? AND status = 'inbox'").run(dateISO);
     persistDayCache(db, ANCHOR_FINGERPRINT_PREFIX, dateISO, JSON.stringify(externalFingerprint));
     return planId;
