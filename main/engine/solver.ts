@@ -191,6 +191,8 @@ interface ReleasedAnchor {
 }
 
 interface PassOptions {
+  /** Minutes-since-midnight before which nothing may be placed (today's "now"). */
+  floorMin?: number;
   /** Anchors whose minutes are occupied from the start of the pass. */
   occupying: Anchor[];
   /** Anchors re-placed by the scoring pass at the end, after every task has had its turn. */
@@ -213,18 +215,28 @@ interface PassOptions {
  * block released and re-placed last, and the better of the two is returned. Two full
  * deterministic passes and an explicit comparison — same input twice, same output.
  */
-export function solve(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[]): SolveResult {
+/** Solve-wide options. `floorMin` is "now" when the day being solved is today. */
+export interface SolveOptions {
+  floorMin?: number;
+}
+
+export function solve(
+  tasks: PlannerTask[],
+  doctrine: Doctrine,
+  anchors: Anchor[],
+  opts: SolveOptions = {}
+): SolveResult {
   const deferrable = new Set(tasks.filter(isDeferrable).map((t) => t.id));
 
   // No windows in play → the old function, unchanged, not one branch different.
-  if (deferrable.size === 0) return solveTiered(tasks, doctrine, anchors);
+  if (deferrable.size === 0) return solveTiered(tasks, doctrine, anchors, opts);
 
   /** Work that MUST happen today and the day could not seat. The only thing worth deferring for. */
   const stranded = (r: SolveResult) =>
     r.unplaced.filter((u) => !deferrable.has(u.task.id) && PRESSURE_REASONS.has(u.reason)).length;
 
   let active = tasks;
-  let result = solveTiered(active, doctrine, anchors);
+  let result = solveTiered(active, doctrine, anchors, opts);
   const withheld: PlannerTask[] = [];
 
   // ── withhold windowed work that is costing same-day work its place ──
@@ -250,7 +262,7 @@ export function solve(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[
       );
     if (victims.length === 0) break;
     const victim = victims[0];
-    const next = solveTiered(active.filter((t) => t.id !== victim.id), doctrine, anchors);
+    const next = solveTiered(active.filter((t) => t.id !== victim.id), doctrine, anchors, opts);
     if (stranded(next) >= stranded(result)) break; // the sacrifice bought nothing — keep the day as is
     active = active.filter((t) => t.id !== victim.id);
     withheld.push(victim);
@@ -269,7 +281,12 @@ export function solve(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[
 }
 
 /** The three-tier anchor logic. `solve` above wraps it with deadline-window deferral. */
-function solveTiered(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[]): SolveResult {
+function solveTiered(
+  tasks: PlannerTask[],
+  doctrine: Doctrine,
+  anchors: Anchor[],
+  opts: SolveOptions = {}
+): SolveResult {
   const byStart = (a: Anchor, b: Anchor) => a.startMin - b.startMin || a.title.localeCompare(b.title);
   const immovable = anchors.filter((a) => !a.movable);
   const fixedAnchors = immovable.filter((a) => flexibilityOf(a) === "fixed");
@@ -291,6 +308,7 @@ function solveTiered(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[]
   }
 
   const first = solvePass(tasks, doctrine, anchors, {
+    floorMin: opts.floorMin,
     occupying: [...fixedAnchors, ...keptPreferred],
     released,
   });
@@ -312,6 +330,7 @@ function solveTiered(tasks: PlannerTask[], doctrine: Doctrine, anchors: Anchor[]
   if (pressured.length === 0) return first;
 
   const second = solvePass(tasks, doctrine, anchors, {
+    floorMin: opts.floorMin,
     occupying: fixedAnchors,
     released: [
       ...released,
@@ -335,7 +354,7 @@ function solvePass(
     .filter((a) => a.movable && a.blockType === "meeting")
     .sort((a, b) => a.startMin - b.startMin || a.title.localeCompare(b.title));
 
-  const grid = buildGrid(doctrine, fixed);
+  const grid = buildGrid(doctrine, fixed, { floorMin: opts.floorMin });
   const { slots, wakeMin, sleepMin } = grid;
   const occ: (BlockType | null)[] = slots.map((s) => (s.free ? null : s.anchor!.blockType));
 

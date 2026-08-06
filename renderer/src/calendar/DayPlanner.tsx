@@ -587,8 +587,13 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
     e.stopPropagation();
     const dy = e.clientY - d.y0;
     const deltaMin = Math.round(dy / PX_PER_MIN / MOVE_SNAP_MIN) * MOVE_SNAP_MIN;
-    setGhost(0);
-    if (deltaMin !== 0) onMove?.(d.id, Math.max(0, d.start0 + deltaMin));
+    if (deltaMin === 0) { setGhost(0); return; }
+    // HOLD the dragged position while the day re-solves. Clearing it here is what made the
+    // move feel broken (owner report 2026-08-06: "it didn't update in real time, it went back
+    // to how it was then a minute later updated") — the card snapped home the instant the
+    // pointer lifted and only jumped once a full re-solve, narration and Google push had
+    // finished. The offset now survives until the new plan arrives and this card unmounts.
+    void onMove?.(d.id, Math.max(0, d.start0 + deltaMin));
   };
   const [ghost, setGhost] = useState(0);
   const offset = ghost || dragOffset || 0;
@@ -626,10 +631,14 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
             : `color-mix(in srgb, ${c.bg} 22%, white)`,
           borderColor: item.external ? "var(--accent-soft)" : "color-mix(in srgb, var(--line) 65%, transparent)",
           borderStyle: item.external ? "dashed" : "solid",
-          outline: open || status === "current" ? "2px solid var(--accent)" : item.locked ? "2px solid var(--danger)" : "none",
+          // A pin is a choice the owner made, not a problem: danger-red read as an error
+          // ("it duplicated the math test and then locked it"). Same weight, calmer colour.
+          outline: open || status === "current" ? "2px solid var(--accent)" : item.locked ? "2px dashed var(--accent-soft)" : "none",
           outlineOffset: "1px",
         }}
-        title={`${item.title} · ${fmtMin(item.startMin)} – ${fmtMin(item.endMin)}`}>
+        title={`${item.title} · ${fmtMin(item.startMin)} – ${fmtMin(item.endMin)}${
+          item.locked ? " · pinned here — drag again to move it" : movable ? " · drag to move" : ""
+        }`}>
         {/* tinted type circle, shrinking with the card */}
         <span className="shrink-0 rounded-full flex items-center justify-center shadow-sm"
           style={{

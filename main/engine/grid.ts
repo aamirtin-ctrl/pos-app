@@ -70,7 +70,27 @@ export interface Grid {
   slots: Slot[];
 }
 
-export function buildGrid(doctrine: Doctrine, anchors: Anchor[]): Grid {
+export interface GridOptions {
+  /**
+   * Minutes-since-midnight before which NOTHING may be scheduled — "now", when the day being
+   * solved is today.
+   *
+   * Owner report 2026-08-06 at 11:40: "when I move stuff in my schedule around, it can't add
+   * or change events into times that have already passed. When I was trying to switch those
+   * two, I think it added unpack travel bag from nine AM to nine thirty. But it's eleven forty
+   * right now, that already passed."
+   *
+   * The grid had no concept of the current time at all: every re-solve treated the whole day
+   * as available, so the morning kept being handed out again hours after it was gone. Every
+   * re-plan today — and there have been many — was quietly doing this.
+   *
+   * Absent (the default) means "solve the whole day", which is correct for tomorrow and for
+   * every existing caller and test.
+   */
+  floorMin?: number;
+}
+
+export function buildGrid(doctrine: Doctrine, anchors: Anchor[], opts: GridOptions = {}): Grid {
   const { wakeMin, sleepMin } = dayBounds(doctrine);
   const shutdownMin = shutdownStartMin(doctrine);
 
@@ -135,6 +155,10 @@ export function buildGrid(doctrine: Doctrine, anchors: Anchor[]): Grid {
       if (t === "gym" && s.hoursToSleep < hc.min_gym_end_before_sleep_hours) ok = false;
       // Comms must end >= latest_comms_window_before_sleep_hours before sleep.
       if (t === "comms" && s.hoursToSleep < hc.latest_comms_window_before_sleep_hours) ok = false;
+      // Time that has already gone is not schedulable, whatever it is. This is a floor on
+      // the WHOLE grid rather than a per-type rule: a break or a meal in the past is exactly
+      // as wrong as a work block there.
+      if (opts.floorMin != null && s.startMin < opts.floorMin) ok = false;
       // The shutdown ritual CLOSES THE DAY — for anything the owner put on a to-do list.
       //
       // It used to close the day only for WORK_TYPES, on the theory that the evening is his

@@ -14,7 +14,7 @@ import {
   type PlannerTask,
 } from "./engine/solver.ts";
 import type { Anchor } from "./engine/grid.ts";
-import { narrate } from "./engine/narrate.ts";
+import { narrate, deterministicNarration } from "./engine/narrate.ts";
 import { withPreferences } from "./preferences.ts";
 import {
   readAnchors,
@@ -278,8 +278,28 @@ export async function generatePlan(
   const externalFingerprint = anchorFingerprint(anchors);
 
   const lockedRows = db
-    .prepare("SELECT block_type, title, starts_at, ends_at FROM block WHERE is_locked = 1 AND date(starts_at) = ?")
-    .all(dateISO) as { block_type: string; title: string; starts_at: string; ends_at: string }[];
+    .prepare("SELECT task_id, block_type, title, starts_at, ends_at FROM block WHERE is_locked = 1 AND date(starts_at) = ?")
+    .all(dateISO) as {
+    task_id: number | null; block_type: string; title: string; starts_at: string; ends_at: string;
+  }[];
+  // ── a pinned block IS that task's placement ────────────────────────────────
+  //
+  // Owner report 2026-08-06: "it duplicated the stanford math test and then locked it."
+  //
+  // A pin becomes a fixed ANCHOR, and anchors carry no task_id — so the task behind it stayed
+  // in the pool and the solver dutifully scheduled it a second time. His day ended up with the
+  // pinned "Take Stanford math test" at 13:45 AND a fresh one at 16:45. The pin has to remove
+  // the task from the pool, not just reserve the minutes.
+  const pinnedTaskIds = new Set(
+    lockedRows.map((b) => b.task_id).filter((id): id is number => id != null)
+  );
+  // …and the block the regeneration inserts for that anchor has to get the task link back,
+  // or the popover loses it and the Google event identity changes on every re-solve.
+  const pinnedTaskBySpan = new Map(
+    lockedRows
+      .filter((b) => b.task_id != null)
+      .map((b) => [`${fromIso(b.starts_at)}|${fromIso(b.ends_at)}`, b.task_id as number])
+  );
   // The spans the owner has PINNED, so the regenerated blocks can carry the pin forward.
   // Without this a pin survives exactly one regeneration — lockedRows is read before the
   // old plan is deleted, but the new blocks were inserted with is_locked = 0, so the next
@@ -300,7 +320,55 @@ export async function generatePlan(
     });
   }
 
-  const taskRows = listTasks(db, dateISO);
+  // ── the past is not schedulable ────────────────────────────────────────────
+  //
+  // Owner report 2026-08-06 at 11:40: "when I move stuff in my schedule around, it can't add
+  // or change events into times that have already passed. I think it added unpack travel bag
+  // from nine AM to nine thirty. But it's eleven forty right now, that already passed."
+  //
+  // Nothing in the engine knew what time it was. Every re-solve treated the whole day as
+  // available, so the morning was handed out again hours after it was gone — and today has
+  // been re-solved many times. Two halves: a FLOOR so nothing new lands in the past, and the
+  // blocks that already happened carried forward as fixed anchors so his morning does not
+  // simply vanish from the plan (and from Google) the first time the day is re-solved.
+  const nowFloor = floorFor(dateISO, deps?.now ?? new Date());
+  if (nowFloor !== null) {
+    const pastRows = db
+      .prepare(
+        `SELECT b.task_id, b.block_type, b.title, b.starts_at, b.ends_at
+           FROM block b JOIN plan p ON p.id = b.plan_id
+          WHERE p.plan_date = ? AND b.starts_at < ?
+          ORDER BY b.starts_at`
+      )
+      .all(dateISO, toIso(dateISO, nowFloor)) as {
+      task_id: number | null; block_type: string; title: string; starts_at: string; ends_at: string;
+    }[];
+    for (const b of pastRows) {
+      const startMin = fromIso(b.starts_at);
+      const endMin = fromIso(b.ends_at);
+      if (endMin <= startMin) continue; // malformed row — never anchor on it
+      const span = `${startMin}|${endMin}`;
+      if (pinnedTaskBySpan.has(span) || anchors.some((a) => a.startMin === startMin && a.endMin === endMin)) continue;
+      anchors.push({
+        startMin,
+        endMin,
+        blockType: b.block_type as Anchor["blockType"],
+        title: b.title ?? "(earlier today)",
+        // It already happened. Nothing outranks that.
+        flexibility: "fixed",
+      });
+      if (b.task_id != null) {
+        pinnedTaskIds.add(b.task_id);
+        pinnedTaskBySpan.set(span, b.task_id);
+      }
+    }
+  }
+
+  // A task already placed — pinned by a drag, or sitting in a block that has already begun —
+  // must not be offered to the solver again. Offering it is what duplicated his math test.
+  const allTaskRows = listTasks(db, dateISO);
+  const taskRows = allTaskRows.filter((r: any) => !pinnedTaskIds.has(r.id as number));
+
   // Windowed work parked on a LATER day that this solve is allowed to reclaim. Tracked so the
   // deferral bookkeeping below can tell "this day's own work slipped" from "another day's work
   // was offered this day's leftovers and didn't take them" — the second is not a deferral and
@@ -329,7 +397,7 @@ export async function generatePlan(
     planDate: dateISO,
   }));
 
-  const result = solve(tasks, doctrine, anchors);
+  const result = solve(tasks, doctrine, anchors, { floorMin: nowFloor ?? undefined });
 
   // Work reclaimed from a later day and actually seated here — its date follows the block.
   const reclaimed = result.blocks
@@ -360,7 +428,9 @@ export async function generatePlan(
     .filter((d): d is { task: PlannerTask; movedTo: string } => d.movedTo !== null);
   // Same injection for the narration: a chief of staff explaining the day should know the
   // owner's standing preferences, not just the blocks that came out of the solver.
-  const narration = await narrate(result, doctrine, withPreferences(llm, doctrineDir, ["narration"]));
+  const narration = deps?.fast
+    ? deterministicNarration(result, doctrine)
+    : await narrate(result, doctrine, withPreferences(llm, doctrineDir, ["narration"]));
 
   // persist: replace any prior un-accepted plan for the date
   const persist = db.transaction(() => {
@@ -430,7 +500,10 @@ export async function generatePlan(
       const key = blockIdentity({ task_id: b.taskId ?? null, block_type: b.blockType, title: b.title });
       const inherited = b.isAnchor ? undefined : carry.get(key);
       if (inherited) { carry.delete(key); reclaim.run(inherited); }
-      ins.run(b.taskId ?? null, b.blockType, b.title, toIso(dateISO, b.startMin), toIso(dateISO, b.endMin),
+      const span = `${b.startMin}|${b.endMin}`;
+      // An anchor sitting on a pinned span is that task's block — give it its task back.
+      const taskId = b.taskId ?? (b.isAnchor ? pinnedTaskBySpan.get(span) ?? null : null);
+      ins.run(taskId, b.blockType, b.title, toIso(dateISO, b.startMin), toIso(dateISO, b.endMin),
         b.isAnchor ? 1 : 0, planId, b.capacityAtPlacement ?? null,
         // The solver stamps every block; the fallback only covers a hand-built PlacedBlock.
         b.flexibility ?? (b.isAnchor ? "fixed" : "flexible"),
@@ -477,6 +550,18 @@ export async function generatePlan(
   // Best-effort and time-boxed: a slow or unreachable Google delays the answer by at most
   // GENERATE_PUSH_TIMEOUT_MS and never costs him the plan itself, because `pushed_at` stays
   // NULL and workers.sweepAutoPush retries on the next tick.
+  if (deps?.fast) {
+    // Fire and forget: the owner's day is already correct on screen, and sweepAutoPush
+    // retries anything that does not land.
+    if (autoPushEnabled(db)) {
+      void pushPlanToGoogle(db, secrets, planId, deps?.push).catch((e: Error) =>
+        console.warn(`planner: background push failed (${e.message})`)
+      );
+    }
+    const quick = getPlan(db, dateISO, planId);
+    return quick ? { ...quick, push: { pushed: 0, tasks: 0, withdrawn: 0 } } : null;
+  }
+
   const push: PlanPushResult = autoPushEnabled(db)
     ? await withTimeout(
         pushPlanToGoogle(db, secrets, planId, deps?.push),
@@ -565,7 +650,7 @@ export async function moveBlock(
   // Re-solve: generatePlan re-reads pinned blocks as FIXED anchors, so this placement is
   // honoured exactly and everything else — breaks, transitions, recovery after deep work —
   // is recomputed from doctrine rather than shuffled by hand. It also pushes to Google.
-  const plan = await generatePlan(db, doctrineDir, secrets, llm, dateISO, deps);
+  const plan = await generatePlan(db, doctrineDir, secrets, llm, dateISO, { ...deps, fast: true });
   return { moved: true, plan };
 }
 
@@ -585,7 +670,7 @@ export async function unpinBlock(
     .get(blockId) as { id: number; starts_at: string; plan_date: string } | undefined;
   if (!row) return { moved: false, error: "not_found" };
   db.prepare("UPDATE block SET is_locked = 0 WHERE id = ?").run(blockId);
-  const plan = await generatePlan(db, doctrineDir, secrets, llm, row.plan_date, deps);
+  const plan = await generatePlan(db, doctrineDir, secrets, llm, row.plan_date, { ...deps, fast: true });
   return { moved: true, plan };
 }
 
@@ -639,8 +724,30 @@ export const ANCHOR_FINGERPRINT_PREFIX = "plan_anchors_fp:";
  * what makes every decision below testable without a network — and, in production, what
  * makes the check and the regeneration it triggers agree on one view of the day.
  */
+/**
+ * "Now" as minutes-since-midnight, but ONLY when `dateISO` is the day `now` falls on.
+ * Null for any other date — tomorrow has no past, and yesterday is not re-solved.
+ */
+export function floorFor(dateISO: string, now: Date): number | null {
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  if (dateISO !== today) return null;
+  return now.getHours() * 60 + now.getMinutes();
+}
+
 export interface ReplanDeps {
   anchors?: (dateISO: string) => Promise<Anchor[]>;
+  /** Injectable clock, so "the past is not schedulable" is testable without waiting. */
+  now?: Date;
+  /**
+   * Interactive path: skip the LLM narration and do not WAIT on the Google push.
+   *
+   * A drag re-solves the whole day, and awaiting a model call plus a push made the move take
+   * the better part of a minute (owner report 2026-08-06: "it didn't update in real time… a
+   * minute later updated"). The re-solve itself is deterministic and instant; only the two
+   * network round-trips were slow, and neither has to happen before the owner sees his day.
+   * The push still goes out — it is just not blocking, and the 15-minute sweep is its net.
+   */
+  fast?: boolean;
   /** The Google write surface, injected so the generate-time push is testable offline. */
   push?: Partial<GcalPushDeps>;
 }
