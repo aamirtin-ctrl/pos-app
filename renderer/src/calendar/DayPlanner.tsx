@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import PreviewColumn from "./PreviewColumn.tsx";
 import EventPopover from "./EventPopover.tsx";
 import NotionTab from "./NotionTab.tsx";
@@ -78,14 +79,7 @@ const LockGlyph = () => (
 const MOVE_SNAP_MIN = 15;
 /** Movement only begins after this much travel, so a click still opens the popover. */
 const DRAG_THRESHOLD_PX = 4;
-/**
- * Sideways travel that counts as ONE day (owner ask 2026-08-06: "I should be able to drag
- * calendar events into other days"). Roughly the width of a neighbouring preview column, so
- * dragging onto the column beside the day lands on that day.
- */
-const DAY_DRAG_PX = 90;
-/** As far as a single drag may reach — the carousel only shows three days either side. */
-const MAX_DAY_DRAG = 3;
+
 
 type StripTask = {
   id: number; title: string; status: string;
@@ -231,10 +225,11 @@ export default function DayPlanner() {
   // recovery breaks, meeting transitions and everything else from doctrine.
   const [moving, setMoving] = useState(false);
   const [moveNote, setMoveNote] = useState<string | null>(null);
-  const moveToDay = useCallback(async (blockId: number, days: number) => {
+  // The date cell being hovered while a card is carried — drives the strip highlight.
+  const [carryTarget, setCarryTarget] = useState<string | null>(null);
+  const moveToDate = useCallback(async (blockId: number, target: string) => {
     setMoving(true);
     setMoveNote(null);
-    const target = addDaysISO(date, days);
     try {
       const r = await window.pos.plan.moveBlockToDay(blockId, target);
       const res = (r.ok ? r.data : null) as { moved?: boolean; error?: string } | null;
@@ -257,7 +252,7 @@ export default function DayPlanner() {
       setMoveNote("Could not move that to another day.");
     }
     setMoving(false);
-  }, [refresh, date]);
+  }, [refresh]);
 
   const resizeBlock = useCallback(async (blockId: number, startMin: number, endMin: number) => {
     setMoving(true);
@@ -462,11 +457,14 @@ export default function DayPlanner() {
               const selected = d.iso === date;
               const today = d.iso === todayISO();
               return (
-                <button key={d.iso} onClick={() => setDateAnimated(d.iso)}
+                <button key={d.iso} data-day-iso={d.iso} onClick={() => setDateAnimated(d.iso)}
                   className="flex flex-col items-center gap-0.5 rounded-2xl py-1.5 transition-[background-color,transform] duration-[120ms] hover:scale-105 active:scale-95"
-                  style={selected
-                    ? { background: "var(--accent)", color: "white", boxShadow: "0 2px 8px rgba(214,138,164,0.4)" }
-                    : { background: "color-mix(in srgb, white 55%, transparent)", color: "var(--ink)" }}>
+                  style={carryTarget === d.iso
+                    // The cell under a carried card: unmistakably "drop it here".
+                    ? { background: "var(--accent)", color: "white", boxShadow: "0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent)", transform: "scale(1.12)" }
+                    : selected
+                      ? { background: "var(--accent)", color: "white", boxShadow: "0 2px 8px rgba(214,138,164,0.4)" }
+                      : { background: "color-mix(in srgb, white 55%, transparent)", color: "var(--ink)" }}>
                   <span className="text-[10px] uppercase tracking-wide" style={{ opacity: selected ? 0.9 : 0.55 }}>
                     {d.letter}
                   </span>
@@ -530,7 +528,8 @@ export default function DayPlanner() {
                 onClose={closePopover}
                 onMove={moveBlock}
                 onResize={resizeBlock}
-                onMoveToDay={moveToDay}
+                onDropOnDate={moveToDate}
+                onCarryHover={setCarryTarget}
                 onDragStart={closePopover}
                 task={(it.taskId != null && tasksById.get(it.taskId)) || null} />
             ))}
@@ -625,7 +624,7 @@ function GapHint({ startMin, endMin, dim }: { startMin: number; endMin: number; 
  * own rect. Only one popover is open at a time — the open card's key lives in
  * DayPlanner, not here.
  */
-function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task, onMove, onResize, onMoveToDay, dragOffset, onDragStart }: {
+function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task, onMove, onResize, onDropOnDate, onCarryHover, dragOffset, onDragStart }: {
   item: LaidOutItem; height: number; status: "past" | "current" | "future"; nowMin: number;
   open: boolean;
   onToggle: () => void;
@@ -635,8 +634,10 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
   onMove?: (blockId: number, startMin: number) => void;
   /** Commit an edge drag: the block keeps its other edge and the day re-solves. */
   onResize?: (blockId: number, startMin: number, endMin: number) => void;
-  /** Commit a sideways drag: the WORK moves to a day `days` away. */
-  onMoveToDay?: (blockId: number, days: number) => void | Promise<void>;
+  /** Commit a drop on the week strip: the WORK moves to that date. */
+  onDropOnDate?: (blockId: number, iso: string) => void | Promise<void>;
+  /** The date cell currently hovered while carrying, or null — drives the strip highlight. */
+  onCarryHover?: (iso: string | null) => void;
   /** Live px offset while this card is being dragged (0 when it is not). */
   dragOffset?: number;
   onDragStart?: (blockId: number, startMin: number) => void;
@@ -672,6 +673,22 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
     // pointermove events then go to whatever is underneath and the drag never starts.
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
   };
+  // ── carrying a card to another day (owner spec 2026-08-06, second pass) ──
+  //
+  // His words, correcting the first version: "when you click on it to drag it, it should kind
+  // of minimize it into a smaller card, and then you drag it into another day from the top bar
+  // where you can see the actual dates." So: the moment the pointer reaches the week strip,
+  // the card is PICKED UP — it shrinks to a chip that rides the pointer — and the date cells
+  // become the drop targets. Releasing over one moves the work to that date; releasing
+  // anywhere else cancels the carry and nothing changes.
+  //
+  // Hit-testing is elementFromPoint against [data-day-iso], because pointer capture routes
+  // every pointer event to the card itself — the strip never sees a pointerenter of its own.
+  const [carry, setCarry] = useState<{ x: number; y: number; iso: string | null } | null>(null);
+  const cellUnder = (x: number, y: number): string | null => {
+    const el = document.elementFromPoint(x, y) as HTMLElement | null;
+    return el?.closest?.("[data-day-iso]")?.getAttribute("data-day-iso") ?? null;
+  };
   const onPointerMove = (e: React.PointerEvent) => {
     const d = drag.current;
     if (!d) return;
@@ -682,28 +699,36 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
       d.live = true;
       onDragStart?.(d.id, d.start0); // closes the popover, so the card is not dragged under it
     }
-    const days = dayShiftOf(dx);
-    setDayShift(days);
-    // While it is being carried to another day the vertical offset is meaningless — that day
-    // will place it — so the card just follows the pointer sideways.
+    const iso = cellUnder(e.clientX, e.clientY);
+    if (iso !== null || carry !== null) {
+      // Over the strip (or returning from it): the card is a chip in the hand, not a block on
+      // the grid. Vertical position is meaningless while carried.
+      setCarry(iso !== null || Math.abs(dx) > 40 ? { x: e.clientX, y: e.clientY, iso } : null);
+      onCarryHover?.(iso);
+      setGhost(0);
+      return;
+    }
     const snapped = Math.round(dy / PX_PER_MIN / MOVE_SNAP_MIN) * MOVE_SNAP_MIN;
-    setGhost(days === 0 ? snapped * PX_PER_MIN : 0);
-    setGhostX(days === 0 ? 0 : dx);
+    setGhost(snapped * PX_PER_MIN);
   };
   const endDrag = (e: React.PointerEvent) => {
     const d = drag.current;
     drag.current = null;
     (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+    const wasCarrying = carry;
+    setCarry(null);
+    onCarryHover?.(null);
     if (!d?.live) return;
     e.stopPropagation();
-    const days = dayShiftOf(e.clientX - d.x0);
-    if (days !== 0) {
-      // Sideways wins: he carried it to another day, and the time he released it at means
-      // nothing on a 90px preview column. That day's own solve decides when.
+    const iso = cellUnder(e.clientX, e.clientY);
+    if (iso) {
       setGhost(0);
-      setGhostX(0);
-      setDayShift(0);
-      void onMoveToDay?.(d.id, days);
+      void onDropOnDate?.(d.id, iso);
+      return;
+    }
+    if (wasCarrying) {
+      // Picked up and put back down nowhere — a cancel, not a move.
+      setGhost(0);
       return;
     }
     const dy = e.clientY - d.y0;
@@ -717,12 +742,7 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
     void onMove?.(d.id, Math.max(0, d.start0 + deltaMin));
   };
   const [ghost, setGhost] = useState(0);
-  const [ghostX, setGhostX] = useState(0);
-  const [dayShift, setDayShift] = useState(0);
   const offset = ghost || dragOffset || 0;
-  /** How many days sideways travel amounts to, clamped to what the carousel shows. */
-  const dayShiftOf = (dx: number) =>
-    Math.max(-MAX_DAY_DRAG, Math.min(MAX_DAY_DRAG, Math.trunc(dx / DAY_DRAG_PX)));
 
   // ── edge handles: extend or limit the time this takes ──
   //
@@ -769,16 +789,16 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={endDrag}
-      onPointerCancel={() => { drag.current = null; setGhost(0); }}
+      onPointerCancel={() => { drag.current = null; setGhost(0); setCarry(null); onCarryHover?.(null); }}
       style={{
         top: yOf(item.startMin) + offset + topShift, height: shownHeight,
-        transform: ghostX ? `translateX(${ghostX}px)` : undefined,
         transition: offset ? "none" : "top 140ms ease",
         cursor: movable ? (offset ? "grabbing" : "grab") : "default",
         left: `calc(${GUTTER_PX + 6}px + (100% - ${GUTTER_PX + 10}px) * ${item.lane * laneW / 100})`,
         width: `calc((100% - ${GUTTER_PX + 10}px) * ${item.span * laneW / 100} - 4px)`,
-        opacity: dim ? 0.55 : 1,
-        zIndex: (offset ? 60 : open ? 40 : 2) + item.lane, // dragged > open > neighbors
+        // While carried, the real card stays home but fades — the chip in the hand IS the card.
+        opacity: carry ? 0.35 : dim ? 0.55 : 1,
+        zIndex: (offset || carry ? 60 : open ? 40 : 2) + item.lane, // dragged > open > neighbors
       }}>
       <div ref={cardRef}
         role="button"
@@ -803,7 +823,6 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
           outline: open || status === "current" ? "2px solid var(--accent)" : item.locked ? "2px dashed var(--accent-soft)" : "none",
           outlineOffset: "1px",
         }}
-        data-day-shift={dayShift || undefined}
         title={`${item.title} · ${fmtMin(item.startMin)} – ${fmtMin(item.endMin)}${
           item.locked ? " · pinned here — drag again to move it" : movable ? " · drag to move" : ""
         }`}>
@@ -877,6 +896,21 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
           </div>
         </>
       )}
+      {carry &&
+        createPortal(
+          <div
+            className="fixed z-[90] rounded-xl border shadow-lg px-2.5 py-1.5 flex items-center gap-1.5 pointer-events-none"
+            style={{
+              left: carry.x + 10, top: carry.y + 10, maxWidth: 200,
+              background: `color-mix(in srgb, ${c.bg} 30%, white)`,
+              borderColor: carry.iso ? "var(--accent)" : "var(--line)",
+            }}
+          >
+            <span style={{ color: c.fg === "white" ? "var(--ink)" : c.fg }}><TypeIcon type={item.type} size={12} /></span>
+            <span className="text-[11px] truncate" style={{ color: "var(--ink)" }}>{item.title}</span>
+          </div>,
+          document.body
+        )}
       {open && <EventPopover item={item} anchorRef={cardRef} task={task} onClose={onClose} />}
     </div>
   );
