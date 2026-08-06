@@ -5,13 +5,22 @@
 export type Block = {
   id: number; block_type: string; title: string; starts_at: string; ends_at: string;
   is_anchor: number; is_locked: number;
+  /** Nullable: breaks, meals and gym have no task behind them. */
+  task_id?: number | null;
+  /** 0-100 energy-curve capacity at the minute the solver placed this block. */
+  capacity_score_at_placement?: number | null;
 };
 export type PlanView = { plan: any; blocks: Block[]; unplaced: { title: string; reason: string }[] };
-export type ExternalEvent = { startMin: number; endMin: number; title: string; blockType: string };
+/** `source` is absent for Google anchors, "ics" for subscribed feeds, "apple" for Calendar.app. */
+export type ExternalEvent = { startMin: number; endMin: number; title: string; blockType: string; source?: string };
 
 export type Item = {
   key: string; startMin: number; endMin: number; title: string; type: string;
   external: boolean; anchor: boolean; locked: boolean;
+  /** Detail-popover extras — absent on preview columns, which never open one. */
+  taskId?: number | null;
+  capacityScore?: number | null;
+  source?: string;
 };
 
 /** Everything one day's view needs — cached per date so flips render instantly. */
@@ -186,6 +195,140 @@ export function freeGaps(items: Item[], minMinutes = 25): { startMin: number; en
   return gaps;
 }
 
+/* ── block guidance: what the doctrine put here, and what to actually do in it ──
+   Most of a generated day is blocks the owner never typed — a break after deep
+   work, two comms windows, transitions around a meeting cluster, a shutdown
+   ritual. The detail popover exists to explain those: not "this is a break" but
+   what a break is for and how to spend it. Copy is owner-facing and plain, and
+   lives here (not in the component) so it stays pure and editable. */
+
+export type BlockGuidance = { what: string; how: string };
+
+export const BLOCK_GUIDANCE: Record<string, BlockGuidance> = {
+  break: {
+    what: "Recovery after focused work, not a smaller work block.",
+    how: "Get off the screen. Stand, walk, look out a window, get water. Under ten minutes only restores vigor, not performance — this one is twenty because it follows deep work.",
+  },
+  deep_work: {
+    what: "Your highest-value cognitive block, sized to one attention cycle.",
+    how: "One task, no inbox, phone in another room. Ninety minutes is the ceiling because alertness measurably decays past it — stop even if it is going well, and write down where you stopped.",
+  },
+  focused_work: {
+    what: "Real work that does not need peak capacity.",
+    how: "Single task, but interruptions cost less here than in deep work. Good place for second-pass edits, reviews, and anything with a clear finish line.",
+  },
+  comms: {
+    what: "A fixed window for email, messages and replies.",
+    how: "Batch everything here rather than reacting all day. Two windows exist so nothing waits more than half a day, and so the rest of the day stays uninterrupted.",
+  },
+  admin: {
+    what: "Low-cognitive chores, deliberately placed in your afternoon dip.",
+    how: "Forms, bookings, expenses, filing. These are here because they survive low capacity — do not spend a peak hour on them.",
+  },
+  meeting: {
+    what: "Clustered with your other meetings on purpose.",
+    how: "Meetings are grouped so they carve one hole in the day instead of five. Full refocus after an interruption averages about twenty-three minutes.",
+  },
+  transition: {
+    what: "A seam around a meeting cluster.",
+    how: "Write down what came out of the last conversation and what the next action is. Explicit closure is what stops the previous task bleeding into the next one.",
+  },
+  shutdown: {
+    what: "The end of the work day, not the end of the evening.",
+    how: "Close open loops: capture anything unfinished, note tomorrow's first task, then stop. Nothing work-shaped is scheduled after this — the rest of the night is yours.",
+  },
+  meal: {
+    what: "A real break with food in it.",
+    how: "Eating away from the desk is part of why the afternoon dip is survivable. The dip is partly postprandial — expect it and plan around it rather than fighting it.",
+  },
+  gym: {
+    what: "Placed in your late-afternoon physical peak.",
+    how: "Strength, coordination and reaction time track core body temperature, which peaks late afternoon. It also ends well before sleep — sessions finishing under about four hours before bed measurably disturb it.",
+  },
+  personal: {
+    what: "Your time, protected on purpose.",
+    how: "Blocked so the planner cannot schedule over it.",
+  },
+};
+
+/** Anything the doctrine did not generate — a raw calendar event, an unknown type. */
+export const FALLBACK_GUIDANCE: BlockGuidance = {
+  what: "From your calendar.",
+  how: "The planner treats this as fixed and schedules around it.",
+};
+
+export const guidanceFor = (blockType: string): BlockGuidance =>
+  BLOCK_GUIDANCE[blockType] ?? FALLBACK_GUIDANCE;
+
+/** Human label for a block type; unknown types are humanized rather than dropped. */
+export const BLOCK_TYPE_LABEL: Record<string, string> = {
+  deep_work: "Deep work",
+  focused_work: "Focused work",
+  comms: "Comms window",
+  admin: "Admin",
+  meeting: "Meeting",
+  transition: "Transition",
+  shutdown: "Shutdown ritual",
+  meal: "Meal",
+  gym: "Gym",
+  break: "Break",
+  personal: "Personal",
+  event: "Calendar event",
+};
+export function blockTypeLabel(blockType: string): string {
+  const known = BLOCK_TYPE_LABEL[blockType];
+  if (known) return known;
+  const words = String(blockType ?? "").replace(/_/g, " ").trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : "Block";
+}
+
+/** Where a card on the grid came from. A pinned placement outranks its origin. */
+export type SourceLabel = "Plan" | "Google" | "Apple" | "Subscribed" | "Locked by you";
+export function sourceLabel(item: Pick<Item, "external" | "locked" | "source">): SourceLabel {
+  if (item.locked) return "Locked by you";
+  if (!item.external) return "Plan";
+  const s = String(item.source ?? "").toLowerCase();
+  if (s === "apple") return "Apple";
+  if (s === "ics" || s === "subscribed") return "Subscribed";
+  return "Google"; // Google anchors arrive without a source tag
+}
+
+/** "Placed at 92% capacity", or null when the block carries no score. */
+export function capacityCopy(score: number | null | undefined): string | null {
+  if (typeof score !== "number" || !Number.isFinite(score)) return null;
+  return `Placed at ${Math.round(Math.min(100, Math.max(0, score)))}% capacity`;
+}
+
+/* ── popover placement ──
+   The detail popover is portaled to the body and positioned `fixed` against the
+   card's viewport rect, so the scrolling grid can never clip it. It prefers to
+   sit below the card, flips above when the space below cannot hold it (and above
+   is roomier), and is finally clamped into the viewport on both axes — a card at
+   23:30 or in the rightmost lane still gets a fully visible popover. */
+export type AnchorRect = { top: number; left: number; width: number; height: number };
+export type PopoverPlacement = { top: number; left: number; side: "above" | "below" };
+
+export function placePopover(
+  anchor: AnchorRect,
+  size: { width: number; height: number },
+  viewport: { width: number; height: number },
+  gap = 8,
+  margin = 8
+): PopoverPlacement {
+  const below = anchor.top + anchor.height + gap;
+  const above = anchor.top - gap - size.height;
+  const roomBelow = viewport.height - margin - (anchor.top + anchor.height + gap);
+  const roomAbove = anchor.top - gap - margin;
+  const side: "above" | "below" = roomBelow >= size.height || roomBelow >= roomAbove ? "below" : "above";
+
+  const clamp = (v: number, max: number) => Math.max(margin, Math.min(v, max));
+  return {
+    side,
+    top: clamp(side === "below" ? below : above, Math.max(margin, viewport.height - size.height - margin)),
+    left: clamp(anchor.left, Math.max(margin, viewport.width - size.width - margin)),
+  };
+}
+
 export const todayISO = () => new Date().toISOString().slice(0, 10);
 export const addDaysISO = (iso: string, n: number) =>
   new Date(new Date(`${iso}T12:00:00`).getTime() + n * 86400000).toISOString().slice(0, 10);
@@ -239,10 +382,12 @@ export function buildItems(plan: PlanView | null, external: ExternalEvent[]): It
     key: `b${b.id}`, startMin: minOf(b.starts_at), endMin: minOf(b.ends_at),
     title: b.title || b.block_type.replace(/_/g, " "), type: b.block_type,
     external: false, anchor: !!b.is_anchor, locked: !!b.is_locked,
+    taskId: b.task_id ?? null, capacityScore: b.capacity_score_at_placement ?? null,
   }));
   const fromGcal: Item[] = externalsToShow.map((e, i) => ({
     key: `x${i}`, startMin: e.startMin, endMin: e.endMin, title: e.title,
     type: e.blockType || "event", external: true, anchor: false, locked: false,
+    source: e.source,
   }));
   return [...fromPlan, ...fromGcal].sort((a, b) => a.startMin - b.startMin || a.endMin - b.endMin);
 }

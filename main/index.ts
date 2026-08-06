@@ -1,16 +1,28 @@
 // Electron main: window lifecycle, macOS menu, DB, workers, IPC registration.
 
-import { app, BrowserWindow, Menu, shell } from "electron";
+import { app, BrowserWindow, Menu, session, shell } from "electron";
 import path from "node:path";
 import { openDb, type Db } from "./db/db.ts";
 import { SecretStore } from "./secrets.ts";
 import { LlmClient } from "./llm/provider.ts";
 import { registerIpc } from "./ipc.ts";
 import { startWorkers, cleanupTentativeTasksV2, cleanupTentativeTasksV3 } from "./workers.ts";
+import { purgeBulkContactsOnce } from "./crm/review.ts";
 import { loadDoctrine } from "./engine/doctrine.ts";
 
 let db: Db | null = null;
 let win: BrowserWindow | null = null;
+
+// Our own UI: the Vite dev server in dev, a file:// bundle in the packaged app.
+// (A file:// page reports its origin as "file://" or the opaque "null".)
+function isOwnOrigin(url: string): boolean {
+  if (!url) return false;
+  return (
+    url.startsWith("file://") ||
+    url === "null" ||
+    (!!process.env.VITE_DEV && url.startsWith("http://localhost:5183"))
+  );
+}
 
 function createWindow() {
   win = new BrowserWindow({
@@ -81,6 +93,16 @@ app.whenReady().then(() => {
       }
     });
 
+  // One-shot: remove the newsletter/notification contacts the pre-header-filter
+  // ingest created. Conservative — only unverified people whose every interaction
+  // is inbound bulk mail. Never throws; the setting flag makes reruns a no-op.
+  try {
+    const { ran, purged } = purgeBulkContactsOnce(db);
+    if (ran) console.log(`cleanup_bulk_v1 purged ${purged} bulk contact(s)`);
+  } catch (e) {
+    console.warn(`cleanup_bulk_v1 failed: ${(e as Error).message}`);
+  }
+
   const isMac = process.platform === "darwin";
   Menu.setApplicationMenu(
     Menu.buildFromTemplate([
@@ -89,6 +111,20 @@ app.whenReady().then(() => {
       { role: "viewMenu" as const },
       { role: "windowMenu" as const },
     ])
+  );
+
+  // Microphone for the command-bar dictation. Electron's default handler is permissive,
+  // but that default is exactly the kind of thing that changes between versions and
+  // configurations — and when it denies, getUserMedia rejects with a bare NotAllowedError
+  // that looks identical to the user denying at the OS prompt. Be explicit: grant `media`
+  // to our own page only, deny everything else. macOS TCC still gates real device access.
+  // Our own page keeps the permissive default it already had (clipboard writes in the
+  // inbox and contact views depend on it); anything else is denied outright.
+  session.defaultSession.setPermissionRequestHandler((wc, _permission, callback, details) => {
+    callback(isOwnOrigin(details?.requestingUrl || wc.getURL()));
+  });
+  session.defaultSession.setPermissionCheckHandler((wc, _permission, requestingOrigin) =>
+    isOwnOrigin(requestingOrigin || wc?.getURL() || "")
   );
 
   createWindow();

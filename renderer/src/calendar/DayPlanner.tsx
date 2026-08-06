@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import PreviewColumn from "./PreviewColumn.tsx";
+import EventPopover from "./EventPopover.tsx";
 import {
   COLORS, DOCTRINE_NARRATION, FALLBACK_COLOR, GRID_END_MIN, GRID_START_MIN, GUTTER_PX,
   PX_PER_MIN, WINDOW_START_MIN, addDaysISO, buildItems, cardHeights, firstSentences, fmtDur,
@@ -105,6 +106,13 @@ export default function DayPlanner() {
   const [external, setExternal] = useState<ExternalEvent[]>([]);
   const [outcomes, setOutcomes] = useState<any[]>([]);
   const [now, setNow] = useState(new Date());
+  // Detail popover: the key of the ONE card currently open (null = none).
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  const closePopover = useCallback(() => setOpenKey(null), []);
+  // Task title/status per task_id for this day, so a plan block that came from a
+  // braindumped task can name it in the popover. Best-effort: the popover just
+  // omits the line when the lookup misses (e.g. the task is already done).
+  const [tasksById, setTasksById] = useState<Map<number, { title: string; status: string }>>(() => new Map());
 
   // Per-date client cache: flipping to a seen day renders instantly from here while
   // the (debounced) fetch revalidates in the background.
@@ -192,6 +200,7 @@ export default function DayPlanner() {
     // then refresh the cheap DB-only data right away — first paint never waits on
     // Google/ICS. The external fetch + neighbor prefetch still debounce so rapid
     // flips don't fan out network IPC.
+    setOpenKey(null); // a popover must never survive a day flip
     const cached = dayCache.current.get(date);
     if (cached) applyDay(cached);
     else { setPlan(null); setExternal([]); setOutcomes([]); }
@@ -206,6 +215,22 @@ export default function DayPlanner() {
     const t = setInterval(() => setNow(new Date()), 60000);
     return () => clearInterval(t);
   }, []);
+  // Task lookup for the popover — purely additive detail, so failures stay silent.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const r = await window.pos.tasks.list(date);
+        if (cancelled || !r.ok || !Array.isArray(r.data)) return;
+        const m = new Map<number, { title: string; status: string }>();
+        for (const t of r.data as Record<string, unknown>[]) {
+          if (typeof t?.id === "number") m.set(t.id, { title: String(t.title ?? ""), status: String(t.status ?? "") });
+        }
+        setTasksById(m);
+      } catch { /* the popover simply omits the task line */ }
+    })();
+    return () => { cancelled = true; };
+  }, [date]);
 
   const nowMin = now.getHours() * 60 + now.getMinutes();
   const isToday = date === todayISO();
@@ -370,7 +395,11 @@ export default function DayPlanner() {
 
             {laid.map((it) => (
               <EventCard key={it.key} item={it} height={heights.get(it.key) ?? (it.endMin - it.startMin) * PX_PER_MIN}
-                status={status(it)} nowMin={nowMin} />
+                status={status(it)} nowMin={nowMin}
+                open={openKey === it.key}
+                onToggle={() => setOpenKey((k) => (k === it.key ? null : it.key))}
+                onClose={closePopover}
+                task={(it.taskId != null && tasksById.get(it.taskId)) || null} />
             ))}
 
             {isToday && <NowLine nowMin={nowMin} />}
@@ -457,10 +486,20 @@ function GapHint({ startMin, endMin, dim }: { startMin: number; endMin: number; 
  * block. Horizontally it occupies its packed lane span, so overlapping events sit
  * side by side. The card sheds detail as it gets shorter: first the time row and
  * meta pills, then padding and the icon shrink to a single compact line.
+ *
+ * The card is also the trigger for the detail popover: it carries button
+ * semantics (click, Enter/Space, aria-expanded) and anchors EventPopover to its
+ * own rect. Only one popover is open at a time — the open card's key lives in
+ * DayPlanner, not here.
  */
-function EventCard({ item, height, status, nowMin }: {
+function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task }: {
   item: LaidOutItem; height: number; status: "past" | "current" | "future"; nowMin: number;
+  open: boolean;
+  onToggle: () => void;
+  onClose: () => void;
+  task: { title: string; status: string } | null;
 }) {
+  const cardRef = useRef<HTMLDivElement | null>(null);
   const c = COLORS[item.type] ?? FALLBACK_COLOR;
   const dur = item.endMin - item.startMin;
   const progress = status === "current" ? Math.min(100, Math.max(0, ((nowMin - item.startMin) / Math.max(1, dur)) * 100)) : 0;
@@ -476,9 +515,18 @@ function EventCard({ item, height, status, nowMin }: {
         left: `calc(${GUTTER_PX + 6}px + (100% - ${GUTTER_PX + 10}px) * ${item.lane * laneW / 100})`,
         width: `calc((100% - ${GUTTER_PX + 10}px) * ${item.span * laneW / 100} - 4px)`,
         opacity: dim ? 0.55 : 1,
-        zIndex: 2 + item.lane,
+        zIndex: (open ? 40 : 2) + item.lane, // an open card rides above its neighbors
       }}>
-      <div className={`h-full w-full rounded-2xl border shadow-sm overflow-hidden flex ${micro ? "gap-1.5 items-center" : tight ? "gap-2 items-center" : "gap-2 items-start"}`}
+      <div ref={cardRef}
+        role="button"
+        tabIndex={0}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        onClick={onToggle}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onToggle(); }
+        }}
+        className={`no-drag cursor-pointer h-full w-full rounded-2xl border shadow-sm overflow-hidden flex transition-transform duration-[120ms] hover:scale-[1.01] active:scale-[0.99] ${micro ? "gap-1.5 items-center" : tight ? "gap-2 items-center" : "gap-2 items-start"}`}
         style={{
           padding: micro ? "0 6px" : tight ? "3px 8px" : "7px 10px",
           borderRadius: micro ? 8 : tight ? 10 : 14,
@@ -487,7 +535,7 @@ function EventCard({ item, height, status, nowMin }: {
             : `color-mix(in srgb, ${c.bg} 22%, white)`,
           borderColor: item.external ? "var(--accent-soft)" : "color-mix(in srgb, var(--line) 65%, transparent)",
           borderStyle: item.external ? "dashed" : "solid",
-          outline: status === "current" ? "2px solid var(--accent)" : item.locked ? "2px solid var(--danger)" : "none",
+          outline: open || status === "current" ? "2px solid var(--accent)" : item.locked ? "2px solid var(--danger)" : "none",
           outlineOffset: "1px",
         }}
         title={`${item.title} · ${fmtMin(item.startMin)} – ${fmtMin(item.endMin)}`}>
@@ -539,6 +587,7 @@ function EventCard({ item, height, status, nowMin }: {
           )}
         </div>
       </div>
+      {open && <EventPopover item={item} anchorRef={cardRef} task={task} onClose={onClose} />}
     </div>
   );
 }

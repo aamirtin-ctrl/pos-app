@@ -85,21 +85,47 @@ function Branch({ blooms }: { blooms: number }) {
   );
 }
 
+// Maps main/stt.ts's typed error codes ("whisper_missing", "no_audio: …", …) to
+// something the user can act on. Anything unrecognised falls through verbatim.
+export function sttMessage(error: string, hint?: string): string {
+  const code = error.split(":")[0].trim();
+  const detail = error.slice(code.length + 1).trim();
+  if (code === "whisper_missing")
+    return "Speech-to-text needs whisper.cpp. Install with: brew install whisper-cpp";
+  if (code === "model_download_failed")
+    return `Couldn't download the speech model${detail ? ` (${detail})` : ""}. Check your connection and try again.`;
+  if (code === "no_audio")
+    return `Nothing was recorded${detail ? ` — ${detail}` : ""}. ${hint ?? ""}`.trim();
+  if (code === "transcribe_failed")
+    return `Transcription failed${detail ? `: ${detail}` : ""}`;
+  return error;
+}
+
 // 16kHz mono WAV recorder for whisper.cpp
 function makeRecorder() {
-  let ctx: AudioContext, stream: MediaStream, proc: ScriptProcessorNode, chunks: Float32Array[] = [];
+  let ctx: AudioContext, stream: MediaStream, proc: ScriptProcessorNode;
+  // `src` and `sink` are held in the closure on purpose: an unreferenced
+  // MediaStreamAudioSourceNode can be collected mid-recording and capture goes silent.
+  let src: MediaStreamAudioSourceNode, sink: GainNode;
+  let chunks: Float32Array[] = [];
   return {
     async start() {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       ctx = new AudioContext({ sampleRate: 16000 });
-      const src = ctx.createMediaStreamSource(stream);
+      src = ctx.createMediaStreamSource(stream);
       proc = ctx.createScriptProcessor(4096, 1, 1);
       chunks = [];
       proc.onaudioprocess = (e) => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-      src.connect(proc); proc.connect(ctx.destination);
+      // A ScriptProcessorNode only runs while it reaches the destination, but routing the
+      // mic straight to the speakers is a feedback loop — go through a muted gain node.
+      sink = ctx.createGain();
+      sink.gain.value = 0;
+      src.connect(proc); proc.connect(sink); sink.connect(ctx.destination);
     },
     stop(): Uint8Array {
-      proc.disconnect(); stream.getTracks().forEach((t) => t.stop()); ctx.close();
+      proc.onaudioprocess = null;
+      src.disconnect(); proc.disconnect(); sink.disconnect();
+      stream.getTracks().forEach((t) => t.stop()); ctx.close();
       const len = chunks.reduce((a, c) => a + c.length, 0);
       const pcm = new Int16Array(len);
       let o = 0;
@@ -125,6 +151,18 @@ function CommandBar() {
   const [busy, setBusy] = useState(false);
   const [reply, setReply] = useState<null | { kind: string; reply: string; results?: { id: number; name: string }[]; hits?: { type: string; label: string; sub: string; href: string }[] }>(null);
   const [rec, setRec] = useState<ReturnType<typeof makeRecorder> | null>(null);
+  // getUserMedia takes ~2s on macOS even once granted, and blocks indefinitely on the
+  // first-run permission prompt. Without a "starting" state the button looks dead and
+  // the user clicks again, opening a second recorder.
+  const [starting, setStarting] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!rec) return;
+    setElapsed(0);
+    const t0 = Date.now();
+    const id = setInterval(() => setElapsed((Date.now() - t0) / 1000), 200);
+    return () => clearInterval(id);
+  }, [rec]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = e.target as HTMLElement;
@@ -139,18 +177,43 @@ function CommandBar() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
   const mic = async () => {
+    if (starting) return; // ignore clicks while the OS is still handing us the mic
     if (rec) {
       const wav = rec.stop();
       setRec(null);
       setBusy(true);
+      setReply({ kind: "info", reply: "Transcribing…" });
       const r = await window.pos.stt.transcribe(wav);
-      const d = r.data as { text?: string; error?: string } | undefined;
-      if (d?.text) setText((t) => (t ? t + " " : "") + d.text);
-      else setReply({ kind: "error", reply: d?.error ?? r.error ?? "transcription failed" });
+      const d = r.data as { text?: string; error?: string; hint?: string } | undefined;
+      if (d?.text) {
+        setText((t) => (t ? t + " " : "") + d.text);
+        setReply(null);
+      } else {
+        setReply({
+          kind: "error",
+          reply: sttMessage(d?.error ?? r.error ?? "transcribe_failed", d?.hint),
+        });
+      }
       setBusy(false);
     } else {
       const rc = makeRecorder();
-      try { await rc.start(); setRec(rc); } catch { setReply({ kind: "error", reply: "Microphone access denied." }); }
+      setStarting(true);
+      setReply({ kind: "info", reply: "Starting microphone… (macOS may ask for permission)" });
+      try {
+        await rc.start();
+        setRec(rc);
+        setReply(null);
+      } catch (e) {
+        setReply({
+          kind: "error",
+          reply:
+            (e as Error)?.name === "NotAllowedError"
+              ? "Microphone access denied — allow POS in System Settings → Privacy & Security → Microphone."
+              : `Couldn't open the microphone: ${(e as Error)?.message ?? "unknown error"}`,
+        });
+      } finally {
+        setStarting(false);
+      }
     }
   };
   const submit = async () => {
@@ -188,10 +251,20 @@ function CommandBar() {
               className="flex-1 border rounded-lg px-3 py-1.5 text-sm"
               style={{ borderColor: "var(--line)" }}
             />
-            <button onClick={mic} title={rec ? "Stop and transcribe" : "Dictate (whisper.cpp)"}
-              className="px-2.5 py-1.5 rounded-lg text-sm border bg-white"
+            <button onClick={mic} disabled={starting}
+              title={rec ? "Stop and transcribe" : starting ? "Waiting for the microphone…" : "Dictate (whisper.cpp)"}
+              className="px-2.5 py-1.5 rounded-lg text-sm border bg-white disabled:opacity-60 flex items-center gap-1.5 whitespace-nowrap"
               style={{ borderColor: rec ? "var(--danger)" : "var(--line)", color: rec ? "var(--danger)" : "var(--ink)" }}>
-              {rec ? "◼" : (
+              {rec ? (
+                <>
+                  {/* live indicator: pulsing dot + elapsed seconds, so "is it on?" is never a question */}
+                  <span className="inline-block w-2 h-2 rounded-full animate-pulse" style={{ background: "var(--danger)" }} />
+                  <span className="tabular-nums text-[12px]">{elapsed.toFixed(1)}s</span>
+                  <span className="text-[11px]">◼</span>
+                </>
+              ) : starting ? (
+                <span className="text-[12px]">…</span>
+              ) : (
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
                   <rect x="9" y="3" width="6" height="11" rx="3" />
                   <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
