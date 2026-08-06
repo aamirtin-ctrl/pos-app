@@ -331,6 +331,10 @@ export async function generatePlan(
   // been re-solved many times. Two halves: a FLOOR so nothing new lands in the past, and the
   // blocks that already happened carried forward as fixed anchors so his morning does not
   // simply vanish from the plan (and from Google) the first time the day is re-solved.
+  // Titles already covered by a block carried forward from earlier today. A ritual whose work
+  // is already on the day must NOT be placed again — that is what put two Lunches on his
+  // calendar (one carried forward from 13:15, one freshly placed at 14:00).
+  const carriedLabels = new Set<string>();
   const nowFloor = floorFor(dateISO, deps?.now ?? new Date());
   if (nowFloor !== null) {
     const pastRows = db
@@ -357,10 +361,15 @@ export async function generatePlan(
         // It already happened. Nothing outranks that.
         flexibility: "fixed",
       });
+      // Pinned by reality: it already happened. Recording the span here makes the regenerated
+      // block carry is_locked=1, which is what gets it PUSHED — pushPlan skips plain anchors,
+      // so without this his morning stayed local while stale copies lingered in Google.
+      pinnedSpans.add(span);
       if (b.task_id != null) {
         pinnedTaskIds.add(b.task_id);
         pinnedTaskBySpan.set(span, b.task_id);
       }
+      carriedLabels.add((b.title ?? "").trim());
     }
   }
 
@@ -397,7 +406,14 @@ export async function generatePlan(
     planDate: dateISO,
   }));
 
-  const result = solve(tasks, doctrine, anchors, { floorMin: nowFloor ?? undefined });
+  // Drop the rituals a carried-forward block already satisfies, so the day is not given a
+  // second Lunch (or a second morning routine) on top of the one he already had.
+  const doctrineForSolve: Doctrine =
+    carriedLabels.size === 0
+      ? doctrine
+      : { ...doctrine, fixed_rituals: doctrine.fixed_rituals.filter((r) => !carriedLabels.has(r.label)) };
+
+  const result = solve(tasks, doctrineForSolve, anchors, { floorMin: nowFloor ?? undefined });
 
   // Work reclaimed from a later day and actually seated here — its date follows the block.
   const reclaimed = result.blocks

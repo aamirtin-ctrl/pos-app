@@ -20,7 +20,7 @@ import {
   googleScopeStatus,
   RECONSENT_REQUIRED,
 } from "../main/gcal/auth.ts";
-import { pushPlan, pushTasks, type GcalPushDeps, type PushCalendarApi, type PushTasksApi } from "../main/gcal/sync.ts";
+import { pushPlan, pushTasks, reconcileDayEvents, type GcalPushDeps, type PushCalendarApi, type PushTasksApi } from "../main/gcal/sync.ts";
 import { acceptPlan, pushPlanToGoogle, autoPushEnabled, AUTO_PUSH_KEY } from "../main/planner.ts";
 import { plansNeedingPush, sweepAutoPush } from "../main/workers.ts";
 import type { SecretStore } from "../main/secrets.ts";
@@ -95,12 +95,14 @@ interface FakeCalls {
  */
 function fakeDeps(
   opts: { throwOn?: keyof FakeCalls; error?: () => Error } = {}
-): GcalPushDeps & { calls: FakeCalls; deleted: string[] } {
+): GcalPushDeps & { calls: FakeCalls; deleted: string[]; listed: { id: string; summary: string }[] } {
   const calls: FakeCalls = {
     calendarsGet: 0, calendarsInsert: 0, eventsInsert: 0, eventsUpdate: 0, eventsDelete: 0, tasksInsert: 0,
   };
   /** Event ids the fake Google has been asked to delete, in order. */
   const deleted: string[] = [];
+  /** What the fake calendar currently holds, for the orphan reconcile. */
+  const listed: { id: string; summary: string }[] = [];
   const boom = opts.error ?? insufficientPermission;
   const guard = (k: keyof FakeCalls) => {
     calls[k]++;
@@ -137,6 +139,9 @@ function fakeDeps(
         deleted.push(args.eventId);
         return {};
       },
+      async list() {
+        return { data: { items: listed } };
+      },
     },
   };
   const tasks: PushTasksApi = {
@@ -164,7 +169,7 @@ function fakeDeps(
       },
     },
   };
-  return { calls, deleted, calendar: () => calendar, tasks: () => tasks };
+  return { calls, deleted, listed, calendar: () => calendar, tasks: () => tasks };
 }
 
 let dir: string;
@@ -549,5 +554,49 @@ describe("stale event withdrawal", () => {
     expect(await sweepAutoPush(db, connected, deps)).toEqual({ plans: 0, pushed: 0, withdrawn: 1 });
     expect(deps.deleted).toEqual(["stale"]);
     expect(tombstones()).toEqual([]);
+  });
+});
+
+
+// ── the calendar must match the plan, not accumulate it ──────────────────────
+//
+// Owner report 2026-08-06, with a screenshot of his real calendar: two Lunches, two Comms
+// window 2s, two math tests, two Breaks, two Shutdown rituals — each pair fifteen minutes
+// apart. The tombstone drain withdraws what a re-plan removed, but nothing could clean up an
+// event whose block vanished WITHOUT being tombstoned (a plan row deleted outside the app, a
+// push that half-landed). This is the backstop that needs no bookkeeping to be right.
+describe("reconcileDayEvents", () => {
+  it("removes events on the POS calendar that no block claims", async () => {
+    const planId = addPlan({ blocks: 2 });
+    setSetting(db, "pos_calendar_id", "POS_CAL");
+    db.prepare("UPDATE block SET gcal_event_id = 'keep-' || id WHERE plan_id = ?").run(planId);
+    const kept = (db.prepare("SELECT gcal_event_id AS e FROM block WHERE plan_id = ?").all(planId) as { e: string }[])
+      .map((r) => r.e);
+
+    const deps = fakeDeps();
+    deps.listed.push(...kept.map((id) => ({ id, summary: "live" })));
+    deps.listed.push({ id: "orphan-1", summary: "Lunch" }, { id: "orphan-2", summary: "Lunch" });
+
+    const res = await reconcileDayEvents(db, connected, new Date().toISOString().slice(0, 10), deps);
+    expect(res.seen).toBe(4);
+    expect(res.removed).toBe(2);
+    expect(deps.deleted.sort()).toEqual(["orphan-1", "orphan-2"]);
+  });
+
+  it("never deletes an event a block still points at", async () => {
+    const planId = addPlan({ blocks: 1 });
+    setSetting(db, "pos_calendar_id", "POS_CAL");
+    db.prepare("UPDATE block SET gcal_event_id = 'mine' WHERE plan_id = ?").run(planId);
+    const deps = fakeDeps();
+    deps.listed.push({ id: "mine", summary: "Deep work" });
+    const res = await reconcileDayEvents(db, connected, new Date().toISOString().slice(0, 10), deps);
+    expect(res.removed).toBe(0);
+    expect(deps.deleted).toEqual([]);
+  });
+
+  it("does nothing at all when no POS calendar has ever been created", async () => {
+    const deps = fakeDeps();
+    expect(await reconcileDayEvents(db, connected, "2026-08-06", deps)).toEqual({ seen: 0, removed: 0 });
+    expect(deps.calls.eventsDelete).toBe(0);
   });
 });

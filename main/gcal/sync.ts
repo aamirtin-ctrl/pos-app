@@ -50,6 +50,9 @@ export interface PushCalendarApi {
     insert(args: { calendarId: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
     update(args: { calendarId: string; eventId: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
     delete(args: { calendarId: string; eventId: string }): Promise<unknown>;
+    list(args: {
+      calendarId: string; timeMin: string; timeMax: string; maxResults: number; singleEvents: boolean;
+    }): Promise<{ data: { items?: { id?: string | null; summary?: string | null }[] } }>;
   };
 }
 
@@ -821,7 +824,13 @@ export async function pushPlan(
     // sitting on top of each other, even for the length of one push.
     const { deleted: withdrawn } = await drainTombstones(db, secrets, deps);
     const blocks = db
-      .prepare("SELECT id, block_type, title, starts_at, ends_at, gcal_event_id FROM block WHERE plan_id = ? AND is_anchor = 0")
+      // is_anchor = 0 means "the solver placed it". is_locked = 1 means "he pinned it, or it
+      // already happened" — both are HIS blocks and belong on his calendar. Only an anchor he
+      // did not pin is an external event, and that one is already on the calendar it came from.
+      .prepare(
+        `SELECT id, block_type, title, starts_at, ends_at, gcal_event_id FROM block
+          WHERE plan_id = ? AND (is_anchor = 0 OR is_locked = 1)`
+      )
       .all(planId) as { id: number; block_type: string; title: string; starts_at: string; ends_at: string; gcal_event_id: string | null }[];
     let pushed = 0;
     for (const b of blocks) {
@@ -840,6 +849,15 @@ export async function pushPlan(
       pushed++;
     }
     db.prepare("UPDATE plan SET pushed_at = datetime('now') WHERE id = ?").run(planId);
+    // Every block now carries its event, so anything else on this day's POS calendar is an
+    // orphan no bookkeeping accounted for. Sweeping here is what keeps the calendar equal to
+    // the plan rather than an accumulation of every plan the day ever had.
+    try {
+      const orphans = await reconcileDayEvents(db, secrets, plan.plan_date, deps);
+      if (orphans.removed > 0) console.log(`gcal: removed ${orphans.removed} orphaned event(s) on ${plan.plan_date}`);
+    } catch (e) {
+      console.warn(`gcal: orphan sweep failed for ${plan.plan_date}: ${(e as Error).message}`);
+    }
     clearAnchorsCache(); // the day just changed in Google — next read must be live
     return { pushed, withdrawn };
   });
@@ -1219,4 +1237,74 @@ export function commitmentToEvent(db: Db, id: number, dateISO?: string, hhmm?: s
   ).run(c.description.slice(0, 120), startsAt, endsAt);
   db.prepare("UPDATE commitment SET status = 'scheduled' WHERE id = ?").run(id);
   return { event: true, starts_at: startsAt, block_id: Number(r.lastInsertRowid) };
+}
+
+
+// ── the calendar must match the plan, not accumulate it ──────────────────────
+//
+// Owner report 2026-08-06, with a screenshot: two Lunches, two Comms window 2s, two math
+// tests, two Breaks, two Shutdown rituals — each pair fifteen minutes apart. Local blocks
+// carry the event they own, and the tombstone drain withdraws what a re-plan removed, but
+// neither can clean up an event whose block is gone WITHOUT having been tombstoned: a plan
+// row deleted outside the app, a push that half-landed, a crash between insert and stamp.
+//
+// So this is the backstop that needs no bookkeeping to be correct: ask Google what it has on
+// the POS calendar for a date, and delete anything no live block claims. It cannot touch
+// another calendar (it only ever reads and deletes within the POS calendar id) and it cannot
+// touch an event a block still points at.
+
+export interface ReconcileDayResult {
+  /** Events on the POS calendar for that date. */
+  seen: number;
+  /** Orphans deleted — on the calendar, claimed by no block. */
+  removed: number;
+}
+
+/** Delete POS-calendar events for `dateISO` that no live block references. */
+export async function reconcileDayEvents(
+  db: Db,
+  secrets: SecretStore,
+  dateISO: string,
+  deps?: Partial<GcalPushDeps>
+): Promise<ReconcileDayResult> {
+  const out: ReconcileDayResult = { seen: 0, removed: 0 };
+  const calId = getSetting(db, "pos_calendar_id");
+  if (!calId) return out;
+  return withReconsentMapping(async () => {
+    const cal = pushDeps(secrets, deps).calendar();
+    const res = await cal.events.list({
+      calendarId: calId,
+      timeMin: new Date(`${dateISO}T00:00:00`).toISOString(),
+      timeMax: new Date(`${dateISO}T23:59:59`).toISOString(),
+      maxResults: 250,
+      singleEvents: true,
+    });
+    const items = (res.data.items ?? []).filter((e) => e.id);
+    out.seen = items.length;
+
+    const claimed = new Set(
+      (
+        db
+          .prepare(
+            `SELECT b.gcal_event_id AS id FROM block b JOIN plan p ON p.id = b.plan_id
+              WHERE p.plan_date = ? AND b.gcal_event_id IS NOT NULL`
+          )
+          .all(dateISO) as { id: string }[]
+      ).map((r) => r.id)
+    );
+
+    for (const e of items) {
+      if (claimed.has(e.id!)) continue;
+      try {
+        await cal.events.delete({ calendarId: calId, eventId: e.id! });
+        out.removed++;
+      } catch (err) {
+        const status = (err as { code?: number; status?: number })?.code ?? (err as { status?: number })?.status;
+        if (status === 404 || status === 410) continue; // already gone is the goal
+        console.warn(`gcal: could not remove orphan ${e.id}: ${(err as Error).message}`);
+      }
+    }
+    if (out.removed > 0) clearAnchorsCache();
+    return out;
+  });
 }
