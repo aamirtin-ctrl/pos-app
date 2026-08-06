@@ -36,6 +36,12 @@ type CommitmentRow = {
   status: string;
   confidence: number;
   confirmed_by_user: number;
+  /** When this obligation was last evidenced (source message, else creation). */
+  evidence_at?: string | null;
+  /** No source message in POS — inherited from the PersonalCRM2 migration. */
+  inherited?: boolean;
+  /** Undated and unevidenced recently: real, but not something to raise today. */
+  stale?: boolean;
 };
 
 type PersonLite = { id: number; display_name: string; freshness_days: number | null };
@@ -187,10 +193,21 @@ export default function Home() {
 
   const act = async (fn: () => Promise<unknown>) => { await fn(); await refetch(); };
 
+  // ── stale commitments are set aside, not deleted (owner report 2026-08-06) ──
+  //
+  // "It was suggesting commitments from messages that are weeks old… better to have a false
+  // positive than stuff I'm not sure about, but it's kind of annoying." Both halves of that
+  // are honoured: nothing is dropped, but an undated commitment with no recent evidence
+  // stops sitting in the live list. `stale` is computed in main/crm/commitments.ts — it is
+  // undated AND (inherited from the old CRM, or unevidenced for a month).
+  const fresh = commitments.filter((c) => !c.stale);
+  const stale = commitments.filter((c) => c.stale);
+
   // Anything the autonomy layer did NOT convert stays unconfirmed — that whole set is
   // the review queue, regardless of confidence. Confirmed rows are the solid list.
-  const needsReview = commitments.filter((c) => c.confirmed_by_user === 0);
-  const solid = commitments.filter((c) => c.confirmed_by_user !== 0);
+  const needsReview = fresh.filter((c) => c.confirmed_by_user === 0);
+  const solid = fresh.filter((c) => c.confirmed_by_user !== 0);
+  const [showStale, setShowStale] = useState(false);
 
   // Approve all: confirm + convert each review row through the same toTask flow the
   // per-row button uses (no date picker in batch — toTask falls back to due date/today).
@@ -347,11 +364,16 @@ export default function Home() {
 
         {/* ── Commitments ── */}
         <section>
-          <SectionHead title="Commitments" count={commitments.length} />
+          <SectionHead title="Commitments" count={fresh.length} />
           {commitments.length === 0 ? (
             <p className="text-sm py-2" style={{ color: "var(--muted)" }}>No open commitments.</p>
           ) : (
             <>
+              {fresh.length === 0 && (
+                <p className="text-sm py-2" style={{ color: "var(--muted)" }}>
+                  Nothing live — everything open is older, below.
+                </p>
+              )}
               <CommitmentList rows={solid} peopleById={peopleById} act={act} />
               {needsReview.length > 0 && (
                 <>
@@ -378,6 +400,34 @@ export default function Home() {
                     </button>
                   </div>
                   <CommitmentList rows={needsReview} peopleById={peopleById} act={act} />
+                </>
+              )}
+              {stale.length > 0 && (
+                <>
+                  <button
+                    onClick={() => setShowStale((v) => !v)}
+                    className="flex items-center gap-2 mt-3 pt-2 border-t w-full text-left"
+                    style={{ borderColor: "var(--line)" }}
+                  >
+                    <span className="text-xs font-medium" style={{ color: "var(--muted)" }}>
+                      {showStale ? "Hide" : "Show"} older, undated
+                    </span>
+                    <span
+                      className="text-[11px] tabular-nums px-1.5 py-0.5 rounded-full border"
+                      style={{ borderColor: "var(--line)", color: "var(--muted)" }}
+                    >
+                      {stale.length}
+                    </span>
+                  </button>
+                  {showStale && (
+                    <>
+                      <p className="text-[11px] mt-1 mb-1" style={{ color: "var(--muted)" }}>
+                        No date and nothing recent pointing at them — give one a date and it moves
+                        back up. Nothing here has been deleted.
+                      </p>
+                      <CommitmentList rows={stale} peopleById={peopleById} act={act} />
+                    </>
+                  )}
                 </>
               )}
             </>

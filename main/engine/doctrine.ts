@@ -110,6 +110,12 @@ const doctrineSchema = z.object({
       before_sleep_hours: z.number().optional(),
       duration: z.number(),
       label: z.string(),
+      /**
+       * Ceiling this ritual may EXPAND to on a light day; `duration` stays the floor.
+       * Optional, and absent from most rituals — a comms window has no reason to grow.
+       * See MORNING_SLOW_START_MAX in solver.ts for the wake-anchored default.
+       */
+      expand_to: z.number().optional(),
     })
   ),
   estimation: z.object({

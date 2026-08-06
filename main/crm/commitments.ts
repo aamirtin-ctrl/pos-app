@@ -1105,14 +1105,140 @@ export function dropCommitment(db: Db, id: number): void {
   ).run(id);
 }
 
-/** Commitments, optionally filtered by status; due-dated first (soonest), then undated. */
-export function listCommitments(db: Db, status?: string): CommitmentRow[] {
-  const where = status ? "WHERE status = ?" : "";
+// ── recency: why undated commitments nag forever ─────────────────────────────
+//
+// Owner report 2026-08-06: "I was looking through the commitments on the relationships page,
+// and it was suggesting commitments that are from messages that are weeks old… obviously it's
+// better to have a false positive than stuff I'm not sure about, but it's kind of annoying."
+//
+// Looking at his actual table explained it better than the complaint did: EVERY open
+// commitment had `due_at` NULL. Nine of the fourteen were inherited from the PersonalCRM2
+// migration and have no source message in POS at all — nothing has ever evidenced them here,
+// and the migration did not preserve their original dates, so `created_at` is the migration
+// timestamp and says nothing about their age.
+//
+// An undated commitment can never become a calendar block. It has no day to be scheduled on,
+// so it cannot be done, cannot age out, and cannot do anything except appear on the list
+// again tomorrow. That is the whole mechanism of the annoyance, and it is a missing DATE, not
+// a missing filter.
+//
+// Two answers, in this order:
+//   1. rehydrateCommitmentDates — many of them state their own timing ("Reconnect in
+//      September", "Meet up at start of school"). Read it and write it down; the commitment
+//      then surfaces when it is actually relevant instead of every morning until then.
+//   2. Everything still undated is separated rather than deleted. `stale` marks the ones with
+//      no recent evidence, so a surface can keep them one disclosure away instead of mixed in
+//      with live work. Nothing is dropped — he was explicit that he would rather see a false
+//      positive than lose something real.
+
+/** Undated with no evidence for this long → not worth raising unprompted. */
+export const COMMITMENT_STALE_DAYS = 30;
+
+/**
+ * When a message was actually sent, from whatever `interaction.occurred_at` happens to hold.
+ *
+ * That column carries TWO shapes: SQLite's own `datetime()` output ("2026-08-05 07:33:09",
+ * UTC, no zone marker) and full ISO from the connectors ("2026-08-05T02:05:58.617Z"). A first
+ * pass here normalised the first shape by appending "Z" and corrupted the second into
+ * "…617ZZ" — an invalid Date that silently fell back to "now", which is precisely the bug
+ * this anchor exists to prevent. Caught on his live data: a commitment from a message sent on
+ * the 5th was dated the 7th.
+ *
+ * Null for anything unparseable, so the caller decides the fallback rather than inheriting a
+ * silently wrong instant.
+ */
+export function messageInstant(raw: string | null | undefined): Date | null {
+  const s = (raw ?? "").trim();
+  if (!s) return null;
+  // Already zoned (ISO with Z or ±hh:mm) → trust it verbatim.
+  const direct = new Date(s);
+  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(s) && !Number.isNaN(direct.getTime())) return direct;
+  // Bare "YYYY-MM-DD HH:MM:SS" (or with a T): SQLite writes these in UTC.
+  const utc = new Date(`${s.replace(" ", "T")}Z`);
+  if (!Number.isNaN(utc.getTime())) return utc;
+  return Number.isNaN(direct.getTime()) ? null : direct;
+}
+
+export interface CommitmentRowWithAge extends CommitmentRow {
+  /** When this obligation was last evidenced: its source message, else its creation. */
+  evidence_at: string | null;
+  /** No source interaction — inherited from the PersonalCRM2 migration, unevidenced in POS. */
+  inherited: boolean;
+  /** Undated AND unevidenced recently. Real, but not something to raise today. */
+  stale: boolean;
+}
+
+/**
+ * Commitments, optionally filtered by status; due-dated first (soonest), then undated.
+ * Each row carries its freshness so a surface can group rather than filter — see above.
+ */
+export function listCommitments(db: Db, status?: string, now: Date = new Date()): CommitmentRowWithAge[] {
+  const where = status ? "WHERE c.status = ?" : "";
   const args = status ? [status] : [];
-  return db
+  const rows = db
     .prepare(
-      `SELECT * FROM commitment ${where}
-       ORDER BY due_at IS NULL, due_at ASC, created_at DESC`
+      `SELECT c.*, i.occurred_at AS source_occurred_at
+         FROM commitment c
+         LEFT JOIN interaction i ON i.id = c.source_interaction_id
+         ${where}
+        ORDER BY c.due_at IS NULL, c.due_at ASC, c.created_at DESC`
     )
-    .all(...args) as CommitmentRow[];
+    .all(...args) as (CommitmentRow & { source_occurred_at: string | null })[];
+
+  const cutoff = new Date(now.getTime() - COMMITMENT_STALE_DAYS * DAY_MS).toISOString().slice(0, 10);
+  return rows.map(({ source_occurred_at, ...c }) => {
+    const inherited = c.source_interaction_id == null;
+    const evidence_at = source_occurred_at ?? c.created_at ?? null;
+    // A dated commitment is never stale: it has a day, so it will surface on its own terms.
+    // An inherited one is stale on sight — nothing in POS has ever evidenced it.
+    const stale =
+      !c.due_at && (inherited || (evidence_at ?? "").slice(0, 10) < cutoff);
+    return { ...c, evidence_at, inherited, stale };
+  });
+}
+
+/**
+ * Give undated open commitments the date their own text already states.
+ *
+ * "Reconnect in September" and "Meet up at start of school" are not vague — they name a time,
+ * and POS can resolve both (parseWhen for calendar language, resolveNamedDate for the
+ * personal anchors like his school term). Writing the date down is what moves a commitment
+ * out of the permanent-nag state into something that surfaces once, when it matters.
+ *
+ * Deliberately conservative: only fills a NULL due_at, never overwrites one, and never
+ * invents a date for text that names none. Returns how many were dated.
+ */
+export function rehydrateCommitmentDates(db: Db, now: Date = new Date()): number {
+  const rows = db
+    .prepare(
+      `SELECT c.id, c.description, i.occurred_at AS source_occurred_at
+         FROM commitment c
+         LEFT JOIN interaction i ON i.id = c.source_interaction_id
+        WHERE c.status = 'open' AND c.due_at IS NULL`
+    )
+    .all() as { id: number; description: string; source_occurred_at: string | null }[];
+  if (rows.length === 0) return 0;
+
+  const set = db.prepare("UPDATE commitment SET due_at = ? WHERE id = ? AND due_at IS NULL");
+  const today = now.toISOString().slice(0, 10);
+  let dated = 0;
+  for (const r of rows) {
+    // ANCHOR ON THE MESSAGE, not on today. "Tomorrow" in a text sent on the 5th means the
+    // 6th, forever — resolving it against the current date silently walks the deadline
+    // forward one day for every day it stays open, which is the exact opposite of a deadline.
+    // (Caught by a dry run over his live data: a commitment from a message sent 2026-08-05
+    // was being dated 2026-08-07.) crm/when.ts is built for this: its whole contract is
+    // "resolve relative language against the moment it was written".
+    const base = messageInstant(r.source_occurred_at) ?? now;
+    // The personal anchors first: "start of school" is a date POS knows and parseWhen does not.
+    const named = resolveNamedDate(db, r.description, base);
+    const when = named ?? (parseWhen(r.description, base)?.toISOString().slice(0, 10) ?? null);
+    // A resolved date in the past means the text named a moment that has already gone by;
+    // dating it backwards would make it instantly overdue rather than answered.
+    if (!when || when < today) continue;
+    set.run(when, r.id);
+    dated++;
+  }
+  if (dated > 0) console.log(`commitments: dated ${dated} undated commitment(s) from their own text`);
+  return dated;
 }

@@ -122,6 +122,64 @@ const fmtDur = (minutes: number) => {
   return m === 0 ? `${h}h` : `${h}h${String(m).padStart(2, "0")}`;
 };
 
+// ── a slower start on a lighter day ──────────────────────────────────────────
+//
+// Owner ask 2026-08-06: "when possible, it should let me have a slower start to the morning
+// versus when I'm more to do that day. And it should be able to determine which is best. like
+// a smart assistant."
+//
+// The morning routine was a flat 30 minutes because that is what he asked for on 2026-08-05
+// ("half an hour to shower and read"). But he asked for that as a FLOOR — the least he needs
+// to start the day like a person — and a fixed floor spends a wide-open Saturday exactly like
+// a day with a test in it. Nothing else in the doctrine reads the shape of the day either:
+// every ritual is a constant.
+//
+// So the stated duration stays the floor and becomes the answer only when the day is full.
+// The room left over is what buys the difference.
+
+/** The longest a wake-anchored ritual may stretch to when the day is genuinely empty. */
+export const MORNING_SLOW_START_MAX = 75;
+
+/**
+ * How much room the day has left, 0 (packed or over-committed) → 1 (nothing on it).
+ *
+ * Demand is what the owner actually asked for — the buffered estimate of every task. Capacity
+ * is the eligible working minutes the grid offers before the shutdown boundary, which already
+ * has external anchors subtracted from it: a day with a four-hour hangout on it is not a light
+ * day, and this sees that without being told.
+ */
+export function dayRoomFactor(tasks: PlannerTask[], grid: { slots: Slot[]; shutdownMin: number | null }): number {
+  const end = grid.shutdownMin;
+  const capacity = grid.slots.filter(
+    (s) => s.free && (end === null || s.startMin < end) && WORK_TYPES_ARR.some((t) => s.eligible[t])
+  ).length * SLOT_MIN;
+  if (capacity <= 0) return 0;
+  const demand = tasks.reduce((sum, t) => sum + t.estimatedMinutes, 0);
+  return Math.max(0, Math.min(1, 1 - demand / capacity));
+}
+
+const WORK_TYPES_ARR = [...WORK_TYPES];
+
+/**
+ * A ritual's length for THIS day. Unchanged for every ritual that declares no ceiling, which
+ * is all of them except the morning routine — a comms window has no reason to grow.
+ *
+ * The wake-anchored personal ritual gets MORNING_SLOW_START_MAX by default rather than
+ * requiring a doctrine edit, because the owner's file was written before this existed and
+ * reconcileRituals only ever ADDS rituals; it does not rewrite the ones he already has.
+ */
+export function ritualDuration(
+  r: { type: BlockType; duration: number; at_hours_after_wake?: number; expand_to?: number },
+  roomFactor: number
+): number {
+  const isMorning = r.at_hours_after_wake === 0 && r.type === "personal";
+  const ceiling = r.expand_to ?? (isMorning ? MORNING_SLOW_START_MAX : r.duration);
+  if (ceiling <= r.duration) return r.duration;
+  // Round to the grid so the extra minutes are actually placeable rather than rounded away.
+  const raw = r.duration + roomFactor * (ceiling - r.duration);
+  return Math.round(raw / SLOT_MIN) * SLOT_MIN;
+}
+
 /**
  * One anchor the pass must NOT occupy up front, and must re-place after everything else.
  * `displacedBy` names whatever took its minutes, for the note; null means nobody did (a
@@ -382,12 +440,13 @@ function solvePass(
   const rituals = [...doctrine.fixed_rituals].sort(
     (a, b) => (a.type === "shutdown" ? 0 : 1) - (b.type === "shutdown" ? 0 : 1)
   );
+  const room = dayRoomFactor(tasks, grid);
   for (const r of rituals) {
     const target =
       r.at_hours_after_wake !== undefined
         ? wakeMin + r.at_hours_after_wake * 60
         : sleepMin - (r.before_sleep_hours ?? 0) * 60;
-    const len = slotsFor(r.duration);
+    const len = slotsFor(ritualDuration(r, room));
     const t0 = idx(target);
     // Rituals bend around anchors, but only so far — a comms window 10 hours off
     // its target is not that ritual anymore. Beyond ±2h it drops with a note.

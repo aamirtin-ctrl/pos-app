@@ -18,6 +18,7 @@ import {
   isExpiredSameDay,
   threadResolves,
   dedupeKeyFor,
+  rehydrateCommitmentDates,
 } from "./crm/commitments.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { runEnrichment } from "./crm/enrich.ts";
@@ -931,6 +932,16 @@ export function startWorkers(
         }
       } catch (e) {
         console.warn(`workers: degraded backfill failed: ${(e as Error).message}`);
+      }
+
+      // An undated commitment can never be scheduled, so it just reappears every morning
+      // forever (owner report 2026-08-06). Many of them state their own timing — read it and
+      // write it down, so they surface when they matter instead of continuously. Deterministic
+      // and local: no LLM call, so this is free to run on every tick.
+      try {
+        rehydrateCommitmentDates(db);
+      } catch (e) {
+        console.warn(`workers: commitment date rehydrate failed: ${(e as Error).message}`);
       }
 
       // Skip silently only when ZERO mail accounts are configured.
