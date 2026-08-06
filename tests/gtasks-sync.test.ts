@@ -12,6 +12,7 @@ import {
   dueDateOf,
   pushedDueDateOf,
   commitmentIdFromNotes,
+  remoteIsNewer,
   type GoogleTaskLite,
   type GoogleTasksDeps,
 } from "../main/gtasks-sync.ts";
@@ -342,5 +343,61 @@ describe("pagination and push", () => {
     });
     expect(res.error).toBe("google tasks reconcile timed out");
     expect(res.pushed).toBe(0);
+  });
+});
+
+// ── who wins when both sides changed (owner-visible bug, 2026-08-06) ─────────
+//
+// The title rule was unconditional — Google's title replaced ours whenever they differed —
+// and reconcile runs BEFORE the push on every tick. Together that made a local rename
+// impossible to keep: it was reverted from the remote before it had ever been sent there.
+// Found when a task renamed locally silently reverted to the raw transcript fragment Google
+// still held. Two-way sync is right; "the remote always wins" makes one side read-only
+// without saying so.
+
+describe("remoteIsNewer", () => {
+  it("lets Google win when we have never edited locally", () => {
+    // Every task predating migration 11 has updated_at NULL, so behaviour is unchanged.
+    expect(remoteIsNewer("2026-08-06T10:00:00.000Z", null)).toBe(true);
+  });
+
+  it("lets Google win when Google's edit is the more recent one", () => {
+    expect(remoteIsNewer("2026-08-06T12:00:00.000Z", "2026-08-06T10:00:00.000Z")).toBe(true);
+  });
+
+  it("keeps the local edit when ours is newer — the case that was silently lost", () => {
+    expect(remoteIsNewer("2026-08-06T10:00:00.000Z", "2026-08-06T12:00:00.000Z")).toBe(false);
+  });
+
+  it("treats an identical stamp as no reason to overwrite", () => {
+    const t = "2026-08-06T12:00:00.000Z";
+    expect(remoteIsNewer(t, t)).toBe(false);
+  });
+
+  it("falls back to the old rule rather than dropping a phone edit on a bad local stamp", () => {
+    expect(remoteIsNewer("2026-08-06T12:00:00.000Z", "not a date")).toBe(true);
+  });
+
+  it("keeps our edit when Google reports no clock at all", () => {
+    expect(remoteIsNewer(null, "2026-08-06T12:00:00.000Z")).toBe(false);
+    expect(remoteIsNewer(undefined, "2026-08-06T12:00:00.000Z")).toBe(false);
+  });
+});
+
+describe("task.updated_at trigger", () => {
+  it("stamps any local UPDATE without the caller remembering to", () => {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), "pos-touch-"));
+    const t = openDb(path.join(d, "pos.db"));
+    const id = Number(
+      t.prepare("INSERT INTO task (title, block_type, status) VALUES ('x', 'admin', 'inbox')").run()
+        .lastInsertRowid
+    );
+    expect((t.prepare("SELECT updated_at u FROM task WHERE id = ?").get(id) as any).u).toBeNull();
+    t.prepare("UPDATE task SET title = 'renamed' WHERE id = ?").run(id);
+    const after = (t.prepare("SELECT title, updated_at u FROM task WHERE id = ?").get(id) as any);
+    expect(after.title).toBe("renamed");
+    expect(after.u).toBeTruthy();
+    t.close();
+    fs.rmSync(d, { recursive: true, force: true });
   });
 });

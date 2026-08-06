@@ -4,6 +4,7 @@
 // no deep right after a meeting cluster; zero free slots → no crash; determinism.
 
 import { describe, it, expect } from "vitest";
+import { SCHEDULABLE_TASK_STATUSES } from "../../main/planner.ts";
 import { parseDoctrine, DEFAULT_DOCTRINE_YAML, shutdownStartMin } from "../../main/engine/doctrine.ts";
 import { solve, type PlannerTask } from "../../main/engine/solver.ts";
 import type { Anchor } from "../../main/engine/grid.ts";
@@ -407,6 +408,22 @@ describe("solver — shutdown is a hard end-of-work boundary", () => {
     const r = solve(ts, late, []);
     for (const b of r.blocks.filter((x) => WORK.includes(x.blockType))) {
       expect(b.endMin).toBeLessThanOrEqual(19 * 60);
+    }
+  });
+});
+
+// A typo should cost a row, not resurrect work (owner-visible, 2026-08-06).
+//
+// listTasks used to select `status != 'done'`, which quietly means "anything unexpected is
+// schedulable". Merging his two duplicate Stanford tasks, the redundant one was retired with
+// status 'dropped' — a COMMITMENT status; a task's are inbox/planned/in_progress/done/
+// deferred. It did not match 'done', so the solver put "Set time later this week" straight
+// back on his calendar after he had been told it was merged away.
+describe("listTasks status whitelist", () => {
+  it("schedules only the statuses that mean 'still to do'", () => {
+    expect([...SCHEDULABLE_TASK_STATUSES].sort()).toEqual(["in_progress", "inbox", "planned"]);
+    for (const retired of ["done", "deferred", "dropped", "", "archived"]) {
+      expect((SCHEDULABLE_TASK_STATUSES as readonly string[]).includes(retired)).toBe(false);
     }
   });
 });

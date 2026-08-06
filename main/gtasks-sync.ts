@@ -55,6 +55,8 @@ export interface GoogleTaskLite {
   completed?: string | null;
   deleted?: boolean | null;
   hidden?: boolean | null;
+  /** RFC 3339 last-modified stamp Google maintains. The remote half of the conflict clock. */
+  updated?: string | null;
 }
 
 export interface GoogleTasksPage {
@@ -188,6 +190,26 @@ interface LocalTaskRow {
   hard_deadline_at: string | null;
   commitment_id: number | null;
   gtasks_id: string;
+  /** Local half of the conflict clock (migration 11). NULL = never edited here. */
+  updated_at: string | null;
+}
+
+/**
+ * Should Google's version of a field replace ours?
+ *
+ * Only when Google's edit is genuinely newer. A local task with no `updated_at` has not been
+ * touched here since the column existed, so Google wins by default — which keeps every
+ * pre-migration task behaving exactly as before. An unparseable stamp on either side is
+ * treated the same way: fall back to the old "remote wins" rule rather than silently
+ * dropping the owner's phone edit.
+ */
+export function remoteIsNewer(remoteUpdated: string | null | undefined, localUpdated: string | null): boolean {
+  if (!localUpdated) return true;
+  const local = Date.parse(localUpdated);
+  if (Number.isNaN(local)) return true;
+  const remote = Date.parse(remoteUpdated ?? "");
+  if (Number.isNaN(remote)) return false; // no remote clock, but we know ours changed
+  return remote > local;
 }
 
 /**
@@ -253,7 +275,7 @@ function pullFromGoogle(
 
   const locals = db
     .prepare(
-      `SELECT id, title, hard_deadline_at, commitment_id, gtasks_id
+      `SELECT id, title, hard_deadline_at, commitment_id, gtasks_id, updated_at
          FROM task
         WHERE gtasks_id IS NOT NULL AND status IN (${LIVE_STATUSES.map(() => "?").join(",")})`
     )
@@ -286,15 +308,22 @@ function pullFromGoogle(
     }
 
     // ── edited in Google ────────────────────────────────────────────────────
+    //
+    // Google wins only when Google is NEWER. The rule used to be "Google always wins", which
+    // made a local edit impossible to keep: reconcile runs before the push on every tick, so
+    // a rename here was reverted from the remote before it had ever been sent there. Caught
+    // when a task renamed locally silently reverted to the raw transcript fragment Google
+    // still held (owner-visible, 2026-08-06).
+    const remoteWins = remoteIsNewer(g.updated, t.updated_at);
     const gTitle = (g.title ?? "").trim();
     const gDue = dueDateOf(g.due);
     const localDue = dueDateOf(t.hard_deadline_at);
     let changed = false;
-    if (gTitle && gTitle !== t.title) {
+    if (remoteWins && gTitle && gTitle !== t.title) {
       db.prepare("UPDATE task SET title = ? WHERE id = ?").run(gTitle, t.id);
       changed = true;
     }
-    if (gDue !== localDue && gDue !== pushedDueDateOf(t.hard_deadline_at)) {
+    if (remoteWins && gDue !== localDue && gDue !== pushedDueDateOf(t.hard_deadline_at)) {
       db.prepare("UPDATE task SET hard_deadline_at = ? WHERE id = ?").run(gDue ? `${gDue}T00:00:00` : null, t.id);
       changed = true;
     }

@@ -438,4 +438,34 @@ BEGIN
 END;
 `,
   },
+  {
+    version: 11,
+    name: "task_updated_at",
+    sql: `
+-- Who wins when a task changed on BOTH sides (owner-visible bug, 2026-08-06).
+--
+-- reconcileGoogleTasks pulls phone-side edits, and its title rule was unconditional: if
+-- Google's title differs from ours, Google's replaces ours. It also runs BEFORE the push on
+-- every tick. Together that makes a local rename impossible to keep — it is reverted from
+-- Google on the next tick, before it has ever been pushed there.
+--
+-- Found while merging his two duplicate Stanford tasks: the rename to "Go through my Stanford
+-- academic advising stuff" was silently restored to the raw transcript fragment Google still
+-- held. Two-way sync is right; "the remote always wins" is not, because it makes one side
+-- read-only without saying so.
+--
+-- So both sides need a clock. Google Tasks already returns an "updated" stamp on every task;
+-- this is the local half. The trigger stamps any UPDATE, so nothing has to remember to, and with
+-- SQLite's default recursive_triggers=OFF the trigger's own write does not re-fire it.
+--
+-- NULL means "never edited locally since this column existed", which correctly lets Google
+-- win for every task that predates the migration.
+ALTER TABLE task ADD COLUMN updated_at TEXT;
+
+CREATE TRIGGER task_touch_updated_at AFTER UPDATE ON task
+BEGIN
+  UPDATE task SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = NEW.id;
+END;
+`,
+  },
 ];

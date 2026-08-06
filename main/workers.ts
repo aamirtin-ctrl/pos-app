@@ -32,7 +32,8 @@ import { syncAllMail, gmailConfigured } from "./connectors/gmail.ts";
 import { reconcileGoogleTasks } from "./gtasks-sync.ts";
 import { runNudgeCheck } from "./nudge.ts";
 import { screenTimeAvailable, autoCaptureOutcomes } from "./screentime.ts";
-import { replanUpcoming } from "./planner.ts";
+import { generatePlan, replanUpcoming } from "./planner.ts";
+import { ENGINE_VERSION } from "./engine/solver.ts";
 import { syncImessage, imessageAvailable } from "./connectors/imessage.ts";
 import { syncLinkedin } from "./connectors/linkedin.ts";
 import { syncLinkedinEmail } from "./connectors/linkedin-email.ts";
@@ -817,6 +818,110 @@ export function tombstonesPending(db: Db): number {
   return (db.prepare("SELECT COUNT(*) AS n FROM gcal_tombstone").get() as { n: number }).n;
 }
 
+// ── an engine fix has to reach the day that already has a plan ───────────────
+//
+// Owner report 2026-08-06, after the fixes shipped: "I talked about the bug in today's
+// schedule where it scheduled unpacking my travel bag almost two hours after my shutdown
+// ritual and it not taking into account the Stanford math test. Why didn't it do that?"
+//
+// Because a plan is SOLVED ONCE AND STORED. Fixing the solver changes what the next solve
+// produces; it does nothing to a row that already exists. His plan was generated at 12:01
+// and nothing re-solved it: replanIfConflicted only fires when the EXTERNAL calendar moves
+// (the anchor fingerprint), and the calendar had not moved — the engine had.
+//
+// So a fix could pass every test, ship, and leave his actual day showing the bug it fixed.
+// `plan.engine_version` was already written on every row for exactly this and nothing ever
+// read it. Now a version bump is what invalidates a stale day.
+//
+// Accepted plans are deliberately left alone: acceptance means he read that day and locked
+// it, and silently re-solving it would be a worse bug than the one being fixed. They are
+// reported instead, so the surface can offer a re-plan rather than perform one.
+
+/** How far ahead a stale-engine sweep looks. Yesterday is history; it is not re-solved. */
+export const STALE_ENGINE_WINDOW_DAYS = 7;
+
+export interface StaleEnginePlan {
+  planId: number;
+  planDate: string;
+  engineVersion: string;
+  /** The owner locked this day — re-solve is offered, never performed. */
+  accepted: boolean;
+}
+
+/**
+ * Upcoming days whose newest plan was solved by an older engine. Today counts: the day is
+ * still being lived, and that is precisely when a scheduling bug still matters.
+ */
+export function plansOnStaleEngine(
+  db: Db,
+  now: Date = new Date(),
+  windowDays = STALE_ENGINE_WINDOW_DAYS
+): StaleEnginePlan[] {
+  const today = now.toISOString().slice(0, 10);
+  const until = new Date(now.getTime() + windowDays * 86_400_000).toISOString().slice(0, 10);
+  return (
+    db
+      .prepare(
+        `WITH newest AS (
+           SELECT p.id, p.plan_date, p.engine_version, p.accepted_at,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY p.plan_date ORDER BY p.generated_at DESC, p.id DESC
+                  ) AS rn
+             FROM plan p
+            WHERE p.plan_date >= ? AND p.plan_date <= ?
+         )
+         SELECT id, plan_date, engine_version, accepted_at FROM newest
+          WHERE rn = 1 AND engine_version <> ?
+          ORDER BY plan_date`
+      )
+      .all(today, until, ENGINE_VERSION) as {
+      id: number;
+      plan_date: string;
+      engine_version: string;
+      accepted_at: string | null;
+    }[]
+  ).map((r) => ({
+    planId: r.id,
+    planDate: r.plan_date,
+    engineVersion: r.engine_version,
+    accepted: r.accepted_at != null,
+  }));
+}
+
+export interface StaleEngineSweepResult {
+  /** Days re-solved on the current engine. */
+  replanned: string[];
+  /** Days left alone because the owner had locked them. */
+  lockedSkipped: string[];
+  error?: string;
+}
+
+/** Re-solve every upcoming un-accepted day still carrying an older engine version. */
+export async function replanStaleEngine(
+  db: Db,
+  doctrineDir: string,
+  secrets: SecretStore,
+  llm: LlmClient | null,
+  now: Date = new Date()
+): Promise<StaleEngineSweepResult> {
+  const out: StaleEngineSweepResult = { replanned: [], lockedSkipped: [] };
+  for (const p of plansOnStaleEngine(db, now)) {
+    if (p.accepted) {
+      out.lockedSkipped.push(p.planDate);
+      continue;
+    }
+    try {
+      await generatePlan(db, doctrineDir, secrets, llm, p.planDate);
+      out.replanned.push(p.planDate);
+      console.log(`workers: re-solved ${p.planDate} (was engine ${p.engineVersion}, now ${ENGINE_VERSION})`);
+    } catch (e) {
+      out.error ??= (e as Error).message;
+      console.warn(`workers: stale-engine replan of ${p.planDate} failed: ${(e as Error).message}`);
+    }
+  }
+  return out;
+}
+
 /**
  * Push every accepted-but-unpushed plan. Silent no-op when auto-push is off, Google is not
  * connected, or the stored grant predates the calendar-write scope widening — that last
@@ -1005,6 +1110,22 @@ export function startWorkers(
         console.warn(`replan sweep failed: ${(e as Error).message}`);
       }
 
+      // An engine FIX is the other reason a stored plan is wrong, and the fingerprint check
+      // above cannot see it — the calendar has not moved, the solver has. Without this a
+      // corrected bug stays on his screen until something unrelated happens to re-plan.
+      try {
+        const se = await replanStaleEngine(db, resolveDoctrineDir(), secrets, llm);
+        for (const d of se.replanned) notify?.(`Re-solved ${d} on the updated planner`);
+        if (se.lockedSkipped.length > 0) {
+          notify?.(
+            `${se.lockedSkipped.join(", ")} ${se.lockedSkipped.length === 1 ? "was" : "were"} planned by an older ` +
+              `version — unlock to re-solve`
+          );
+        }
+      } catch (e) {
+        console.warn(`stale-engine sweep failed: ${(e as Error).message}`);
+      }
+
       if (gmailConfigured({ secrets })) {
         announce(await runSync(db, secrets, llm, "gmail"));
         // Same accounts, LinkedIn notification mail only (invites/accepts → people).
@@ -1074,6 +1195,20 @@ export function startWorkers(
       running = false;
     }
   };
+
+  // A newly-installed build is exactly when a stale plan is most likely and least excusable
+  // — the owner has just been told a scheduling bug is fixed. Waiting up to fifteen minutes
+  // for the first tick means opening the app and seeing the bug anyway, which is how this
+  // whole class of failure gets reported twice. Cheap and local: a version comparison that
+  // costs one indexed query when nothing is stale.
+  void (async () => {
+    try {
+      const se = await replanStaleEngine(db, resolveDoctrineDir(), secrets, llm);
+      for (const d of se.replanned) notify?.(`Re-solved ${d} on the updated planner`);
+    } catch (e) {
+      console.warn(`workers: startup stale-engine sweep failed: ${(e as Error).message}`);
+    }
+  })();
 
   const task = cron.schedule("*/15 * * * *", tick);
   // Nudges run on their own 5-minute cadence: the reality window is 10 minutes, so a

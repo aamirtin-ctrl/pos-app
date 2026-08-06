@@ -801,6 +801,17 @@ function solvePass(
 }
 
 /** Engine version stamped onto plans — bump when solver behavior changes. */
-export const ENGINE_VERSION = "1.1.0"; // 1.1.0: deadline windows (deferred_within_window)
+/**
+ * Bumped whenever the SOLVER'S ANSWER to the same day would change. It is not decoration:
+ * workers.replanStaleEngine re-solves any upcoming un-accepted day whose stored plan carries
+ * an older version, which is the only reason an engine fix reaches a day that was already
+ * planned. Forget to bump it and the fix ships, the tests pass, and the owner's calendar
+ * keeps showing yesterday's bug — which is exactly what happened on 2026-08-06.
+ */
+export const ENGINE_VERSION = "1.2.0";
+// 1.1.0: deadline windows (deferred_within_window)
+// 1.2.0: shutdown closes the day for assigned `personal` work too; unsplittable deep work
+//        over the block cap is placed whole instead of dropped; the morning routine expands
+//        on a lighter day.
 
 export { hhmmToMin };

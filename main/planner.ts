@@ -79,10 +79,26 @@ export async function braindump(db: Db, doctrineDir: string, llm: LlmClient | nu
   return { tasks: listTasks(db, dateISO), usedLlm };
 }
 
+/**
+ * Statuses a task can be scheduled from. A WHITELIST on purpose: the old rule was
+ * `status != 'done'`, which quietly means "anything unexpected is schedulable".
+ *
+ * That bit on 2026-08-06. Merging the owner's two duplicate Stanford tasks, the redundant one
+ * was retired with status 'dropped' — which is a COMMITMENT status; a task's are
+ * inbox/planned/in_progress/done/deferred. It did not match 'done', so the solver happily
+ * put "Set time later this week" back on his calendar. A typo should cost a row, not
+ * resurrect work he was told had been merged away.
+ */
+export const SCHEDULABLE_TASK_STATUSES = ["inbox", "planned", "in_progress"] as const;
+
 export function listTasks(db: Db, dateISO: string) {
   return db
-    .prepare("SELECT * FROM task WHERE plan_date = ? AND status != 'done' ORDER BY id")
-    .all(dateISO) as Record<string, unknown>[];
+    .prepare(
+      `SELECT * FROM task WHERE plan_date = ?
+         AND status IN (${SCHEDULABLE_TASK_STATUSES.map(() => "?").join(",")})
+       ORDER BY id`
+    )
+    .all(dateISO, ...SCHEDULABLE_TASK_STATUSES) as Record<string, unknown>[];
 }
 
 /**
