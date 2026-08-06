@@ -342,6 +342,11 @@ export async function generatePlan(
         `SELECT b.task_id, b.block_type, b.title, b.starts_at, b.ends_at
            FROM block b JOIN plan p ON p.id = b.plan_id
           WHERE p.plan_date = ? AND b.starts_at < ?
+            -- Only what is OURS. An external calendar anchor must not be carried forward:
+            -- readExternal re-reads it if it still exists, and if it does not, carrying it
+            -- would resurrect an appointment he CANCELLED. (Caught by the freed-window test:
+            -- a cancelled dentist appointment came back from the morning's plan.)
+            AND (b.is_anchor = 0 OR b.is_locked = 1)
           ORDER BY b.starts_at`
       )
       .all(dateISO, toIso(dateISO, nowFloor)) as {
@@ -509,7 +514,26 @@ export async function generatePlan(
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const reclaim = db.prepare("DELETE FROM gcal_tombstone WHERE event_id = ?");
+    // ── one day, one Lunch ────────────────────────────────────────────────────
+    //
+    // Owner report 2026-08-06, with a screenshot: two Lunches, and after the first fix still
+    // two. A carried-forward block reserves the minutes it already occupied, and the doctrine
+    // ritual is then solved on top; filtering the ritual by label ahead of the solve was
+    // supposed to prevent that and demonstrably did not on his real data.
+    //
+    // Rather than keep chasing which path emits the second one, this is the invariant itself:
+    // a plan may not contain the same ritual twice. Task-backed blocks are exempt — splittable
+    // deep work is legitimately two blocks with one title — so this only collapses the
+    // scaffolding, which is the only thing that was ever duplicated.
+    const seenRitual = new Set<string>();
+    const ritualKey = (b: { taskId?: number; blockType: string; title: string }) =>
+      b.taskId != null ? null : `${b.blockType}|${(b.title ?? "").trim().toLowerCase()}`;
     for (const b of result.blocks) {
+      const rk = ritualKey(b);
+      if (rk !== null) {
+        if (seenRitual.has(rk)) continue; // the earlier placement wins; this one is a repeat
+        seenRitual.add(rk);
+      }
       // A block that survived the re-plan takes its predecessor's event back — and with it,
       // the deletion that was just queued against it. `delete` first, `take` once: the map
       // entry is consumed so two same-titled blocks can never claim one event.
