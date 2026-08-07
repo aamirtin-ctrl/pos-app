@@ -481,7 +481,7 @@ describe("due-date echo and date-only semantics", () => {
     const deps = fakeDeps([[
       // exactly what pushTasks sent: plan_date at UTC midnight, remote clock newer
       { id: "g1", title: "Film & edit Instagram content", status: "needsAction",
-        due: "2026-08-07T00:00:00.000Z", updated: "2026-08-07T14:25:00.000Z" },
+        due: "2026-08-07T00:00:00.000Z", updated: "2030-01-01T00:00:00.000Z" },
     ]]);
     await reconcileGoogleTasks(db, connected, deps);
     const row = task(id);
@@ -493,8 +493,10 @@ describe("due-date echo and date-only semantics", () => {
     const id = addTask({ title: "Errand", gtasksId: "g2" });
     db.prepare("UPDATE task SET plan_date = '2026-08-07' WHERE id = ?").run(id);
     const deps = fakeDeps([[
+      // updated is far-future so "remote is newer" holds whatever the wall clock says —
+      // a real timestamp here went stale within the hour it was written.
       { id: "g2", title: "Errand", status: "needsAction",
-        due: "2026-08-09T00:00:00.000Z", updated: "2026-08-07T15:00:00.000Z" },
+        due: "2026-08-09T00:00:00.000Z", updated: "2030-01-01T00:00:00.000Z" },
     ]]);
     const res = await reconcileGoogleTasks(db, connected, deps);
     expect(res.pulled).toBe(1);

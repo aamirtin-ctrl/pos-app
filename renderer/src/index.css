@@ -60,14 +60,19 @@ body {
 .watercolor-blob { border-radius: 55% 45% 60% 40% / 50% 60% 40% 55%; }
 
 @keyframes blobFloat { 0%,100% { translate: 0 0; } 50% { translate: 0 -6px; } }
-@keyframes blobMorph {
-  0%,100% { border-radius: 55% 45% 60% 40% / 50% 60% 40% 55%; }
-  33%     { border-radius: 45% 55% 42% 58% / 60% 44% 56% 42%; }
-  66%     { border-radius: 60% 40% 55% 45% / 42% 56% 46% 60%; }
-}
-.watercolor-blob { animation: blobMorph 9s ease-in-out infinite, blobFloat 5s ease-in-out infinite; }
-.watercolor-blob:nth-of-type(2) { animation-delay: -3s, -1.6s; }
-.watercolor-blob:nth-of-type(3) { animation-delay: -6s, -3.2s; }
+/* blobMorph (an infinite border-radius animation) is gone: border-radius cannot be
+   composited, so morphing it forced a full repaint EVERY FRAME, forever — the GPU
+   process sat at ~70% while the app idled in the background (owner report 2026-08-07:
+   "my computer is very slow right now"). The float is translate-only (composited). */
+.watercolor-blob { animation: blobFloat 5s ease-in-out infinite; }
+.watercolor-blob:nth-of-type(2) { animation-delay: -1.6s; }
+.watercolor-blob:nth-of-type(3) { animation-delay: -3.2s; }
+
+/* Decorative motion earns nothing when the window is not the one being looked at.
+   App.tsx stamps this class on blur and removes it on focus. */
+body.decor-idle .watercolor-blob,
+body.decor-idle .petal,
+body.decor-idle .now-dot { animation-play-state: paused; }
 
 /* ── view + day transitions ──
    Gentle fade+rise when switching sections; subtle slide+fade when the planner

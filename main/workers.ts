@@ -1074,7 +1074,14 @@ export function startWorkers(
     notify?.(`Synced ${r.source}: ${r.ingested} new interaction${r.ingested === 1 ? "" : "s"}${people}`);
   };
 
+  // Calendar.app scans cost 30-90 seconds of CPU each, and the replan + mirror sweeps
+  // both walk the full horizon. Scanning THREE days every 15 minutes kept the owner's
+  // machine audibly busy (2026-08-07: "my computer is very slow right now"). Today is
+  // checked on every tick; the future days alternate ticks — a 30-minute latency on
+  // tomorrow's calendar moving is invisible, the saved scans are not.
+  let tickNo = 0;
   const tick = async () => {
+    const sweepDays = tickNo++ % 2 === 0 ? REPLAN_HORIZON_DAYS : 1;
     if (running) return; // never overlap
     running = true;
     try {
@@ -1190,7 +1197,7 @@ export function startWorkers(
       // he plans ahead (local only; the regenerated plan is un-accepted, so nothing reaches
       // Google until he says so).
       try {
-        const r = await replanUpcoming(db, resolveDoctrineDir(), secrets, llm);
+        const r = await replanUpcoming(db, resolveDoctrineDir(), secrets, llm, { days: sweepDays });
         for (const d of r.replanned) {
           const hit = r.displaced[d];
           notify?.(
@@ -1222,7 +1229,7 @@ export function startWorkers(
       // Apple → Google mirror, no button (owner ask 2026-08-07). Runs after the replan
       // sweep so it reuses the scan cache those anchor reads just warmed.
       try {
-        const m = await mirrorAppleSweep(db, secrets);
+        const m = await mirrorAppleSweep(db, secrets, { days: sweepDays });
         const moved = m.created + m.updated + m.deleted;
         if (moved > 0) {
           notify?.(`Mirrored Apple Calendar to Google: ${m.created} new, ${m.updated} updated, ${m.deleted} removed`);

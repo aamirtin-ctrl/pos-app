@@ -435,6 +435,20 @@ export const OVERLAY_ROUTE = "#/overlay";
  */
 export default function App() {
   const route = useRoute();
+  // Decorative animation runs only while the window is actually the focused one — an
+  // unfocused window animating blobs kept the GPU compositing frames forever
+  // (owner report 2026-08-07: "my computer is very slow right now").
+  useEffect(() => {
+    const idle = () => document.body.classList.add("decor-idle");
+    const active = () => document.body.classList.remove("decor-idle");
+    if (!document.hasFocus()) idle();
+    window.addEventListener("blur", idle);
+    window.addEventListener("focus", active);
+    return () => {
+      window.removeEventListener("blur", idle);
+      window.removeEventListener("focus", active);
+    };
+  }, []);
   if (route.startsWith(OVERLAY_ROUTE)) return <VoiceHud />;
   return <Shell route={route} />;
 }
