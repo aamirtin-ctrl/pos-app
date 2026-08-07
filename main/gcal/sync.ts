@@ -319,10 +319,24 @@ export const APPOINTMENT_PATTERNS: readonly RegExp[] = [
  */
 export const SOCIAL_COMMITMENT_PATTERNS: readonly RegExp[] = [
   /\bhang ?outs?\b/i,
-  /\bdinner with\b/i,
+  // A dinner/brunch EVENT is a commitment however it is phrased. "Dinner with Sam" was the
+  // original pattern; "Dinner at our home- Mahimwala and frisco tins" (owner's real event,
+  // 2026-08-07) matched nothing, classified `preferred`, and the solver relocated a family
+  // dinner to 11 AM. A calendar event whose title is built on "dinner" is never a solo
+  // reading block, whoever's name follows.
+  /\bdinner\b/i,
+  /\bbrunch(es)?\b/i,
   /\blunch with\b/i,
   /\bcoffee with\b/i,
   /\bdrinks\b/i,
+  /\b(?:bbq|barbecues?|cookouts?|potlucks?)\b/i,
+  /\bget[- ]?togethers?\b/i,
+  /\bgatherings?\b/i,
+  /\breunions?\b/i,
+  /\bsleepovers?\b/i,
+  /\biftars?\b/i,
+  // Hosting or visiting: "at our home", "at the Khans' house" — someone is expecting him.
+  /\bat (?:our|my|their|\w+'s'?) (?:home|house|place)\b/i,
   // "third-party integration" is not a party — the lookbehind rejects a preceding hyphen.
   /(?<![\w-])part(y|ies)\b/i,
   /\bbirthdays?\b/i,
@@ -389,6 +403,11 @@ export function inferFlexibility(ev: FlexibilityEvent): Flexibility {
   if (calendar === POS_CALENDAR_NAME || calendar.startsWith(POS_AUTHORED_CALENDAR_PREFIX)) {
     return "flexible";
   }
+  // A shared family/household calendar is other people's plans BY DEFINITION — nothing on
+  // it is a solo block the planner may shuffle, whatever the title says. (The Apple path
+  // has no attendee list; the calendar's own name is the best "others are involved" signal
+  // it will ever carry. Owner case 2026-08-07: "HYT Fam".)
+  if (/\b(fam(ily)?|home|house(hold)?|parents|kids)\b/i.test(calendar)) return "fixed";
   const others = (ev.attendees ?? []).filter((a) => a?.self !== true);
   if (others.length > 0) return "fixed";
   if ((ev.responseStatus ?? "").toLowerCase() === "accepted") return "fixed";

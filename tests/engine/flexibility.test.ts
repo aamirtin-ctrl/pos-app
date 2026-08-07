@@ -300,7 +300,11 @@ describe("solver — determinism with preferred blocks present", () => {
     expect(JSON.stringify(r3)).toBe(JSON.stringify(r1));
   });
 
-  it("the day is still a partition — displacement never double-books a minute", () => {
+  it("planner-placed work never double-books a minute (anchors may share an edge)", () => {
+    // Reading (preferred) and Doctor (fixed) partially overlap. Since 2026-08-07 a partial
+    // overlap KEEPS the preferred block in place — two real events brushing each other is
+    // how calendars look (the family-dinner case). The invariant that must hold instead:
+    // nothing the PLANNER placed overlaps anything at all.
     const anchors: Anchor[] = [
       { startMin: 13 * 60, endMin: 14 * 60, blockType: "personal", title: "Reading", flexibility: "preferred" },
       { startMin: 13 * 60 + 30, endMin: 14 * 60 + 30, blockType: "personal", title: "Doctor", flexibility: "fixed" },
@@ -311,14 +315,19 @@ describe("solver — determinism with preferred blocks present", () => {
       mkTask({ blockType: "gym", estimatedMinutes: 60, title: "Gym" }),
     ];
     const r = solve(ts, doctrine, anchors);
-    const sorted = [...r.blocks].sort((a, b) => a.startMin - b.startMin || a.endMin - b.endMin);
-    for (let i = 1; i < sorted.length; i++) {
-      const prev = sorted[i - 1];
-      const cur = sorted[i];
-      expect(
-        cur.startMin,
-        `"${cur.title}" (${cur.startMin}-${cur.endMin}) overlaps "${prev.title}" (${prev.startMin}-${prev.endMin})`
-      ).toBeGreaterThanOrEqual(prev.endMin);
+    // Both anchors keep their real minutes…
+    const reading = r.blocks.find((b) => b.title === "Reading")!;
+    expect(reading.startMin).toBe(13 * 60);
+    // …and every planner-placed block avoids every other block entirely.
+    const placed = r.blocks.filter((b) => !b.isAnchor);
+    for (const p of placed) {
+      for (const other of r.blocks) {
+        if (other === p) continue;
+        expect(
+          overlaps(p, other),
+          `"${p.title}" (${p.startMin}-${p.endMin}) overlaps "${other.title}" (${other.startMin}-${other.endMin})`
+        ).toBe(false);
+      }
     }
   });
 
@@ -508,5 +517,56 @@ describe("solver — tiers on every block (regression guard)", () => {
       expect(b.flexibility, b.title).toBeTruthy();
       if (!b.isAnchor) expect(b.flexibility, b.title).toBe("flexible");
     }
+  });
+});
+
+
+// ── the family-dinner regression (owner report 2026-08-07) ──────────────────
+//
+// "Dinner at our home- Mahimwala and frisco tins" (19:00–22:00, shared iCloud calendar
+// "HYT Fam") brushed a fixed school event for 30 minutes and was relocated to 11 AM.
+// Three layers had to fail at once; each is pinned here.
+describe("family dinner stays a dinner", () => {
+  it("his exact title is an obligation, with or without 'with'", () => {
+    expect(inferFlexibility({ title: "Dinner at our home- Mahimwala and frisco tins " })).toBe("fixed");
+    expect(inferFlexibility({ title: "Dinner" })).toBe("fixed");
+    expect(inferFlexibility({ title: "Brunch at the Khans' place" })).toBe("fixed");
+  });
+
+  it("anything on a family/household calendar is fixed, whatever the title", () => {
+    expect(inferFlexibility({ title: "thing", calendarName: "HYT Fam" })).toBe("fixed");
+    expect(inferFlexibility({ title: "reading", calendarName: "Family" })).toBe("fixed");
+    expect(inferFlexibility({ title: "reading", calendarName: "Household stuff" })).toBe("fixed");
+    // a plain personal calendar changes nothing
+    expect(inferFlexibility({ title: "reading", calendarName: "Personal" })).toBe("preferred");
+  });
+
+  it("a preferred block PARTIALLY overlapped by a fixed anchor stays put", () => {
+    // Even if classification got it wrong again: dinner 19:00–22:00 vs standoff 18:00–19:30.
+    // Sharing an edge with a fixed event must not eject a block from its evening.
+    const dinner: Anchor = {
+      startMin: 19 * 60, endMin: 22 * 60, blockType: "personal",
+      title: "Dinner (misread as preferred)", flexibility: "preferred",
+    };
+    const standoff: Anchor = {
+      startMin: 18 * 60, endMin: 19 * 60 + 30, blockType: "meeting",
+      title: "Graduate St. Mark's standoff", flexibility: "fixed",
+    };
+    const r = solve([], doctrine, [dinner, standoff]);
+    const d = r.blocks.find((b) => b.title.startsWith("Dinner"))!;
+    expect(d.startMin).toBe(19 * 60);
+    expect(d.endMin).toBe(22 * 60);
+  });
+
+  it("full coverage still releases — the dentist-on-reading case is unchanged", () => {
+    const readingBlock: Anchor = {
+      startMin: 14 * 60, endMin: 15 * 60, blockType: "personal", title: "Reading", flexibility: "preferred",
+    };
+    const dentist: Anchor = {
+      startMin: 13 * 60 + 30, endMin: 15 * 60 + 30, blockType: "personal", title: "Dentist", flexibility: "fixed",
+    };
+    const r = solve([], doctrine, [readingBlock, dentist]);
+    const b = r.blocks.find((x) => x.title === "Reading")!;
+    expect(overlaps(b, dentist)).toBe(false); // fully covered → moved out entirely
   });
 });

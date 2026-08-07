@@ -583,13 +583,25 @@ export interface MirrorResult {
  * it back into Google would create a genuine duplicate there. Apple UIDs are RFC 5545
  * UIDs and survive that sync unchanged, so they match Google's iCalUID exactly.
  */
-export async function mirrorToGoogle(db: Db, secrets: SecretStore, dateISO: string): Promise<MirrorResult> {
+export async function mirrorToGoogle(
+  db: Db,
+  secrets: SecretStore,
+  dateISO: string,
+  opts: { force?: boolean } = {}
+): Promise<MirrorResult> {
   if (!DATE_ISO_RE.test(dateISO)) throw new AppleCalError("script", `bad date: ${dateISO}`);
   if (!isGoogleConnected(secrets)) {
     throw new AppleCalError("unavailable", "Connect Google Calendar first — the mirror needs somewhere to write.");
   }
 
-  const appleEvents = await readAppleEvents(dateISO, { force: true, exclude: excludedCalendarNames(db) });
+  // The manual button forces a fresh scan (the user is standing there, staleness is the
+  // point of clicking). The 15-minute auto-sweep passes force:false — a ≤5-minute-old view
+  // is plenty, and three forced 30-90s scans per tick would starve everything else.
+  const appleEvents = await readAppleEvents(dateISO, {
+    force: opts.force ?? true,
+    exclude: excludedCalendarNames(db),
+    db,
+  });
   const knownToGoogle = await googleICalUids(db, secrets, dateISO);
   const calId = await ensureAppleMirrorCalendar(db, secrets);
 

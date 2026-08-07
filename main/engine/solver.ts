@@ -323,13 +323,21 @@ function solveTiered(
   // slot hostage; they are simply re-placed.
   const released: ReleasedAnchor[] = flexibleAnchors.map((a) => ({ anchor: a, displacedBy: null }));
 
-  // A `preferred` block whose minutes a `fixed` anchor claims cannot stay where it is —
-  // the two would paint on top of each other. It loses, unconditionally, in pass 1. This is
-  // the owner's literal case: the dentist appointment lands on top of the reading block.
+  // A `preferred` block a `fixed` anchor fully COVERS cannot stay where it is — the two
+  // would paint on top of each other with nothing left over. It loses, unconditionally, in
+  // pass 1. This is the owner's literal case: the dentist appointment lands on top of the
+  // reading block.
+  //
+  // A PARTIAL overlap is different, and the distinction cost a real evening (2026-08-07): a
+  // three-hour family dinner (19:00–22:00, misclassified `preferred` at the time) brushed a
+  // fixed school event (18:00–19:30) for thirty minutes, was released as if it were a
+  // 30-minute reading block, and got re-seated at 11 AM. Two real events sharing an edge is
+  // how calendars actually look — he arrives late, the world does not move. The block stays
+  // put; only the non-overlapping minutes read as genuinely occupied either way.
   const keptPreferred: Anchor[] = [];
   for (const p of preferredAnchors) {
-    const clash = fixedAnchors.find((f) => f.startMin < p.endMin && f.endMin > p.startMin);
-    if (clash) released.push({ anchor: p, displacedBy: clash.title });
+    const covered = fixedAnchors.find((f) => f.startMin <= p.startMin && f.endMin >= p.endMin);
+    if (covered) released.push({ anchor: p, displacedBy: covered.title });
     else keptPreferred.push(p);
   }
 

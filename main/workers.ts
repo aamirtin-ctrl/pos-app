@@ -33,13 +33,14 @@ import { syncAllMail, gmailConfigured } from "./connectors/gmail.ts";
 import { reconcileGoogleTasks } from "./gtasks-sync.ts";
 import { runNudgeCheck } from "./nudge.ts";
 import { screenTimeAvailable, autoCaptureOutcomes } from "./screentime.ts";
-import { generatePlan, replanUpcoming } from "./planner.ts";
+import { generatePlan, replanUpcoming, upcomingDates, REPLAN_HORIZON_DAYS } from "./planner.ts";
 import { ENGINE_VERSION } from "./engine/solver.ts";
 import { syncImessage, imessageAvailable } from "./connectors/imessage.ts";
 import { syncLinkedin } from "./connectors/linkedin.ts";
 import { syncLinkedinEmail } from "./connectors/linkedin-email.ts";
 import { syncMailfile } from "./connectors/mailfile.ts";
 import { runCapture, resolveDoctrineDir } from "./capture.ts";
+import { mirrorToGoogle, appleCalendarAvailable } from "./applecal.ts";
 import { drainCaptures } from "./capture-inbox.ts";
 import { handleCommand } from "./assistant.ts";
 import { sendMorningDigest, shouldSendDigest } from "./digest.ts";
@@ -821,6 +822,61 @@ export function tombstonesPending(db: Db): number {
   return (db.prepare("SELECT COUNT(*) AS n FROM gcal_tombstone").get() as { n: number }).n;
 }
 
+// ── Apple → Google mirror, automatically ─────────────────────────────────────
+//
+// Owner ask 2026-08-07: "If I add an event on my icloud calendar that gets sent to POS.
+// But POS should also have that reflect in the google calendar which doesnt have it yet."
+//
+// mirrorToGoogle has existed since the Apple bridge shipped — but only behind a manual
+// per-day button, so in practice it never ran (the "POS — Apple" calendar did not even
+// exist on his Google account). Same standing rule as plan pushing (owner directive
+// 2026-08-06): reaching Google must not require pressing anything.
+
+export interface MirrorSweepResult {
+  days: string[];
+  created: number;
+  updated: number;
+  deleted: number;
+  skipped?: "not_connected" | "apple_unavailable";
+}
+
+/**
+ * Mirror today + the replan horizon into "POS — Apple". Per-day failures are logged and
+ * skipped — one bad day must not stop the rest. Uses the tick's warm scan cache
+ * (force:false); the mirror itself is idempotent, so re-running every 15 minutes is
+ * cheap on Google's side too.
+ */
+export async function mirrorAppleSweep(
+  db: Db,
+  secrets: SecretStore,
+  opts: {
+    today?: string;
+    days?: number;
+    mirror?: (db: Db, secrets: SecretStore, dateISO: string, o: { force: boolean }) => Promise<{ created: number; updated: number; deleted: number }>;
+    available?: () => Promise<{ ok: boolean }>;
+  } = {}
+): Promise<MirrorSweepResult> {
+  const out: MirrorSweepResult = { days: [], created: 0, updated: 0, deleted: 0 };
+  if (!isGoogleConnected(secrets)) return { ...out, skipped: "not_connected" };
+  const avail = await (opts.available ?? appleCalendarAvailable)();
+  if (!avail.ok) return { ...out, skipped: "apple_unavailable" };
+
+  const today = opts.today ?? new Date().toISOString().slice(0, 10);
+  const mirror = opts.mirror ?? mirrorToGoogle;
+  for (const dateISO of upcomingDates(today, opts.days ?? REPLAN_HORIZON_DAYS)) {
+    try {
+      const r = await mirror(db, secrets, dateISO, { force: false });
+      out.days.push(dateISO);
+      out.created += r.created;
+      out.updated += r.updated;
+      out.deleted += r.deleted;
+    } catch (e) {
+      console.warn(`apple mirror failed for ${dateISO}: ${(e as Error).message}`);
+    }
+  }
+  return out;
+}
+
 // ── an engine fix has to reach the day that already has a plan ───────────────
 //
 // Owner report 2026-08-06, after the fixes shipped: "I talked about the bug in today's
@@ -1161,6 +1217,18 @@ export function startWorkers(
         }
       } catch (e) {
         console.warn(`stale-engine sweep failed: ${(e as Error).message}`);
+      }
+
+      // Apple → Google mirror, no button (owner ask 2026-08-07). Runs after the replan
+      // sweep so it reuses the scan cache those anchor reads just warmed.
+      try {
+        const m = await mirrorAppleSweep(db, secrets);
+        const moved = m.created + m.updated + m.deleted;
+        if (moved > 0) {
+          notify?.(`Mirrored Apple Calendar to Google: ${m.created} new, ${m.updated} updated, ${m.deleted} removed`);
+        }
+      } catch (e) {
+        console.warn(`apple mirror sweep failed: ${(e as Error).message}`);
       }
 
       if (gmailConfigured({ secrets })) {
