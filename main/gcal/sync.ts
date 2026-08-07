@@ -772,6 +772,27 @@ export function mergeCalendarSources(
 export const TOMBSTONE_DRAIN_LIMIT = 200;
 
 /**
+ * Events that must never be deleted by any automated process, regardless of what the plan or
+ * block tables currently look like.
+ *
+ * Owner report 2026-08-06: a completed task's calendar event was removed by the orphan
+ * cleanup after an unrelated DB operation (outside this app) orphaned its block. The cleanup
+ * was doing exactly its job — nothing claimed that event anymore — which is precisely why
+ * "claimed" cannot be defined ONLY by a live plan/block join. Completed work is protected
+ * independently, via the snapshot task.gcal_event_id (migration 14) taken the moment a task
+ * is marked done and never cleared afterward.
+ */
+export function protectedEventIds(db: Db): Set<string> {
+  return new Set(
+    (
+      db.prepare("SELECT gcal_event_id AS id FROM task WHERE status = 'done' AND gcal_event_id IS NOT NULL").all() as {
+        id: string;
+      }[]
+    ).map((r) => r.id)
+  );
+}
+
+/**
  * Delete every event the local plan no longer has a block for. Best-effort per event: an
  * event already gone from Google (404/410) is a SUCCESS — the goal is that it not be there.
  * Anything else leaves the row for the next push rather than losing track of it.
@@ -789,8 +810,13 @@ export async function drainTombstones(
   const posCal = getSetting(db, "pos_calendar_id");
   const cal = pushDeps(secrets, deps).calendar();
   const forget = db.prepare("DELETE FROM gcal_tombstone WHERE id = ?");
+  const protectedIds = protectedEventIds(db);
   let deleted = 0;
   for (const r of rows) {
+    // A tombstone can be QUEUED for a block that belonged to work marked done in the
+    // meantime (e.g. supersession during an accepted-day re-solve). Discard the debt rather
+    // than act on it — this event is now protected history.
+    if (protectedIds.has(r.event_id)) { forget.run(r.id); continue; }
     const calendarId = r.calendar_id ?? posCal;
     // No POS calendar has ever existed, so neither has the event. Drop the row.
     if (!calendarId) { forget.run(r.id); continue; }
@@ -952,15 +978,28 @@ async function pushTasksInner(
   let pushed = 0;
   let completed = 0;
 
+  // Owner report 2026-08-06: "the google tasks populated by the app are not dated. everything
+  // needs to be on a certain day." The push used hard_deadline_at — a CLOCK-TIME deadline,
+  // stated on maybe one task in twenty — and ignored plan_date, the day POS actually put the
+  // work on for every other task. So a task fully scheduled inside the app still reached
+  // Google Tasks with no due date at all, which is what he saw.
   const open = db
-    .prepare("SELECT id, title, notes, hard_deadline_at, gtasks_id FROM task WHERE status IN ('inbox','planned','in_progress')")
-    .all() as { id: number; title: string; notes: string | null; hard_deadline_at: string | null; gtasks_id: string | null }[];
+    .prepare(
+      `SELECT id, title, notes, plan_date, hard_deadline_at, gtasks_id
+         FROM task WHERE status IN ('inbox','planned','in_progress')`
+    )
+    .all() as {
+    id: number; title: string; notes: string | null;
+    plan_date: string | null; hard_deadline_at: string | null; gtasks_id: string | null;
+  }[];
   for (const t of open) {
-    const body = {
-      title: t.title,
-      notes: t.notes ?? undefined,
-      due: t.hard_deadline_at ? new Date(t.hard_deadline_at).toISOString() : undefined,
-    };
+    // A clock-time deadline is more specific than a plain day, so it wins when both exist.
+    const due = t.hard_deadline_at
+      ? new Date(t.hard_deadline_at).toISOString()
+      : t.plan_date
+        ? new Date(`${t.plan_date}T00:00:00Z`).toISOString()
+        : undefined;
+    const body = { title: t.title, notes: t.notes ?? undefined, due };
     if (t.gtasks_id) {
       try {
         await api.tasks.update({ tasklist: listId, task: t.gtasks_id, requestBody: { ...body, id: t.gtasks_id } });
@@ -1299,6 +1338,7 @@ export async function reconcileDayEvents(
           .all(dateISO) as { id: string }[]
       ).map((r) => r.id)
     );
+    for (const id of protectedEventIds(db)) claimed.add(id);
 
     for (const e of items) {
       if (claimed.has(e.id!)) continue;

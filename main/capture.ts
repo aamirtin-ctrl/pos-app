@@ -54,6 +54,8 @@ import { getCursor, setCursor, type ConnectorDeps, type SyncReport } from "./con
 import { contentHash, contentSeen, logExtraction } from "./crm/commitments.ts";
 import { appleDateToDate, decodeAttributedBody, imessageAvailable, DEFAULT_CHAT_DB } from "./connectors/imessage.ts";
 import { isDigestMessage, isDigestReply, handleDigestReply } from "./digest.ts";
+import { recordCapture, markCaptureDone } from "./capture-inbox.ts";
+import { llmHealth } from "./llm/provider.ts";
 import { isWakeMessage, recordWake } from "./wake.ts";
 
 const req: ReturnType<typeof createRequire> =
@@ -669,13 +671,16 @@ export async function runCapture(deps: ConnectorDeps): Promise<SyncReport> {
   const report: CaptureReport = { source: "capture", ingested: 0, skipped: 0, created: 0 };
   const doctrineDir = resolveDoctrineDir();
 
-  const batches = [await captureFromEmail(deps), await captureFromIMessage(deps)];
-  const errors = batches.flatMap((b) => b.errors);
-  const notes = batches.flatMap((b) => b.notes);
+  const batches: { source: "self_email" | "imessage"; batch: Awaited<ReturnType<typeof captureFromEmail>> }[] = [
+    { source: "self_email", batch: await captureFromEmail(deps) },
+    { source: "imessage", batch: await captureFromIMessage(deps) },
+  ];
+  const errors = batches.flatMap((b) => b.batch.errors);
+  const notes = batches.flatMap((b) => b.batch.notes);
   const kinds = new Map<string, number>();
 
   const cmdDeps = { db: deps.db, secrets: deps.secrets, doctrineDir, llm: deps.llm ?? null };
-  outer: for (const batch of batches) {
+  outer: for (const { source, batch } of batches) {
     report.skipped += batch.skipped;
     for (const m of batch.messages) {
       // The app's own morning digests land in the same self thread — never re-ingest them.
@@ -728,8 +733,17 @@ export async function runCapture(deps: ConnectorDeps): Promise<SyncReport> {
           await handleDigestReply(deps.db, deps.secrets, m.text);
           kinds.set("digest-reply", (kinds.get("digest-reply") ?? 0) + 1);
         } else {
+          // Recorded before interpretation (owner ask 2026-08-06, extending the sparkle box's
+          // durable inbox to this surface — the known gap named when that shipped). A THROW
+          // here already retried via the unadvanced cursor below; what neither this nor the
+          // sparkle path could see before is a DEGRADED SUCCESS — the fallback parser ran
+          // during an outage and returned a real but low-quality answer (his film/gym text
+          // fragmented into three garbled tasks) with nothing marking it as such.
+          const captureId = recordCapture(deps.db, source, m.text);
+          const healthy = deps.llm ? llmHealth(deps.db, deps.secrets).ok : false;
           const res = await handleCommand(cmdDeps, m.text);
           kinds.set(res.kind, (kinds.get(res.kind) ?? 0) + 1);
+          if (captureId !== null) markCaptureDone(deps.db, captureId, { kind: res.kind, degraded: !healthy });
           // Logged only after the assistant succeeded, so a failed run retries the text.
           logExtraction(deps.db, null, hash, "capture");
         }

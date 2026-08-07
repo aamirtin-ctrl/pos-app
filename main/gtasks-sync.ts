@@ -302,6 +302,14 @@ function pullFromGoogle(
     if (g.status === "completed") {
       const at = sqliteUtc(g.completed, now);
       db.prepare("UPDATE task SET status = 'done', completed_at = ? WHERE id = ?").run(at, t.id);
+      // Snapshot the calendar event here too — a completion pulled FROM Google is just as
+      // real as one checked off in the app, and must be just as protected. See migration 14.
+      db.prepare(
+        `UPDATE task SET gcal_event_id = COALESCE(gcal_event_id, (
+           SELECT b.gcal_event_id FROM block b WHERE b.task_id = task.id AND b.gcal_event_id IS NOT NULL
+            ORDER BY b.id DESC LIMIT 1
+         )) WHERE id = ?`
+      ).run(t.id);
       if (t.commitment_id != null) closeCommitment(db, t.commitment_id, at);
       result.completedLocally++;
       continue;

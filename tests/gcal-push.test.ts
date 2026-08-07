@@ -20,7 +20,7 @@ import {
   googleScopeStatus,
   RECONSENT_REQUIRED,
 } from "../main/gcal/auth.ts";
-import { pushPlan, pushTasks, reconcileDayEvents, type GcalPushDeps, type PushCalendarApi, type PushTasksApi } from "../main/gcal/sync.ts";
+import { pushPlan, pushTasks, reconcileDayEvents, protectedEventIds, drainTombstones, type GcalPushDeps, type PushCalendarApi, type PushTasksApi } from "../main/gcal/sync.ts";
 import { acceptPlan, pushPlanToGoogle, autoPushEnabled, AUTO_PUSH_KEY } from "../main/planner.ts";
 import { plansNeedingPush, sweepAutoPush } from "../main/workers.ts";
 import type { SecretStore } from "../main/secrets.ts";
@@ -598,5 +598,73 @@ describe("reconcileDayEvents", () => {
     const deps = fakeDeps();
     expect(await reconcileDayEvents(db, connected, "2026-08-06", deps)).toEqual({ seen: 0, removed: 0 });
     expect(deps.calls.eventsDelete).toBe(0);
+  });
+});
+
+
+// ── protecting completed work from every automated cleanup path ──────────────
+//
+// Owner report 2026-08-06: "some bug happened where it removed my Stanford math test calendar
+// event, even though that time had already passed and I had done that task. It shouldn't be
+// editing old stuff."
+//
+// What actually happened: a raw DB operation outside the app orphaned the block behind that
+// event (deleted its plan without cascading), and the orphan-event reconciler — working
+// exactly as designed — saw a Google event nothing claimed and removed it. The fix is not to
+// weaken that cleanup; it is that a DONE task's event must be unreachable by it, independent
+// of whatever plan/block rows still exist.
+describe("protected events (done work is never touched again)", () => {
+  it("protectedEventIds returns exactly the done tasks' snapshotted events", () => {
+    const planId = addPlan({ blocks: 1 });
+    setSetting(db, "pos_calendar_id", "POS_CAL");
+    db.prepare("UPDATE block SET gcal_event_id = 'math-test' WHERE plan_id = ?").run(planId);
+    db.prepare(
+      "INSERT INTO task (title, block_type, status, gcal_event_id) VALUES ('Math test', 'deep_work', 'done', 'math-test')"
+    ).run();
+    db.prepare(
+      "INSERT INTO task (title, block_type, status) VALUES ('Still open', 'deep_work', 'planned')"
+    ).run();
+    expect(protectedEventIds(db)).toEqual(new Set(["math-test"]));
+  });
+
+  it("reconcileDayEvents never deletes a protected event, even with its block orphaned", async () => {
+    setSetting(db, "pos_calendar_id", "POS_CAL");
+    // The exact shape of the bug: a done task's event id survives as a snapshot with NO live
+    // block claiming it (simulating the block having been lost to an out-of-band delete).
+    db.prepare(
+      "INSERT INTO task (title, block_type, status, gcal_event_id) VALUES ('Math test', 'deep_work', 'done', 'math-test')"
+    ).run();
+    const deps = fakeDeps();
+    deps.listed.push({ id: "math-test", summary: "Take Stanford math test" });
+    const res = await reconcileDayEvents(db, connected, "2026-08-06", deps);
+    expect(res.removed).toBe(0);
+    expect(deps.deleted).toEqual([]);
+  });
+
+  it("reconcileDayEvents still removes a genuine orphan beside a protected one", async () => {
+    setSetting(db, "pos_calendar_id", "POS_CAL");
+    db.prepare(
+      "INSERT INTO task (title, block_type, status, gcal_event_id) VALUES ('Math test', 'deep_work', 'done', 'math-test')"
+    ).run();
+    const deps = fakeDeps();
+    deps.listed.push({ id: "math-test", summary: "Take Stanford math test" }, { id: "ghost-lunch", summary: "Lunch" });
+    const res = await reconcileDayEvents(db, connected, "2026-08-06", deps);
+    expect(res.removed).toBe(1);
+    expect(deps.deleted).toEqual(["ghost-lunch"]);
+  });
+
+  it("drainTombstones discards a protected event's tombstone without calling Google", async () => {
+    db.prepare(
+      "INSERT INTO task (title, block_type, status, gcal_event_id) VALUES ('Math test', 'deep_work', 'done', 'math-test')"
+    ).run();
+    db.prepare("INSERT INTO gcal_tombstone (event_id, calendar_id) VALUES ('math-test', 'POS_CAL')").run();
+    db.prepare("INSERT INTO gcal_tombstone (event_id, calendar_id) VALUES ('genuinely-stale', 'POS_CAL')").run();
+    const deps = fakeDeps();
+    const res = await drainTombstones(db, connected, deps);
+    expect(res.deleted).toBe(1);
+    expect(deps.deleted).toEqual(["genuinely-stale"]);
+    expect(
+      db.prepare("SELECT COUNT(*) n FROM gcal_tombstone").get()
+    ).toEqual({ n: 0 }); // the protected one is discarded, not retried forever
   });
 });

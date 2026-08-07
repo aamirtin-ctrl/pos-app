@@ -14,6 +14,7 @@ import {
   type HudResult,
 } from "./ipc.ts";
 import { startWorkers, cleanupTentativeTasksV2, cleanupTentativeTasksV3 } from "./workers.ts";
+import { reconcileGoogleTasks } from "./gtasks-sync.ts";
 import { purgeBulkContactsOnce } from "./crm/review.ts";
 import { loadDoctrine } from "./engine/doctrine.ts";
 import { closePanel } from "./webpanel.ts";
@@ -317,6 +318,13 @@ app.whenReady().then(() => {
   });
   startWorkers(db, secrets, llm(), (msg: string) => {
     win?.webContents.send("pos:notify", msg);
+  });
+  // Owner report 2026-08-06: "I just marked as completed several google tasks. This didn't
+  // reflect on the app." The 15-minute tick is the durability net; this is the latency fix —
+  // a lightweight, health-gated pull the instant he looks at the app, so a completion checked
+  // off on his phone minutes ago is not still waiting on the clock.
+  win?.on("focus", () => {
+    void reconcileGoogleTasks(db!, secrets).catch(() => { /* the 15-min tick still covers it */ });
   });
 
   // One-time full reset (keyed on setting cleanup_tentative_v2, superseding the v1

@@ -311,6 +311,18 @@ export default function DayPlanner() {
     const t = setInterval(() => setNow(new Date()), 60000);
     return () => clearInterval(t);
   }, []);
+  // Owner report 2026-08-06: "I just marked as completed several google tasks. This didn't
+  // reflect on the app." The strip was fetch-on-mount only, so a completion that landed on
+  // the backend (the 15-min tick, or main's on-focus reconcile) had no way to reach the
+  // screen without navigating away and back. A local DB read is cheap; poll it.
+  useEffect(() => {
+    const t = setInterval(() => {
+      void window.pos.tasks.strip(dateRef.current).then((sr) => {
+        if (sr.ok && Array.isArray(sr.data)) setStripTasks(sr.data as StripTask[]);
+      });
+    }, 60000);
+    return () => clearInterval(t);
+  }, []);
   // Task lookup for the popover — purely additive detail, so failures stay silent.
   useEffect(() => {
     let cancelled = false;

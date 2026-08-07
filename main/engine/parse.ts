@@ -30,6 +30,13 @@ export interface ParsedTask {
   /** Part of the day he named ("tonight", "this morning"), or null. */
   dayPart: DayPart | null;
   /**
+   * "This happens every day", not just today (owner ask 2026-08-06: "I need time to workout
+   * and gym everyday… it should have realized this is a preference and add it into my
+   * calendars"). 'daily' when the text says so; null for the overwhelming majority — a plain
+   * one-off task, exactly as before.
+   */
+  recurrence: "daily" | null;
+  /**
    * True when the user said the work can happen ACROSS a range ("this week", "by Friday",
    * "no rush") rather than on one named day. A specific day is `false` with `windowEnd`
    * still carrying that day, so the caller can tell "Thursday" from "any day up to Thursday"
@@ -69,6 +76,11 @@ export const endOfThisWeek = (refISO: string) => isoOf(onOrAfterWeekday(utcMidni
  * exactly wrong when one was.
  */
 export type DayPart = "morning" | "afternoon" | "evening";
+
+const RECURRENCE_PATTERN = /\bevery\s*day\b|\beveryday\b|\bdaily\b|\beach day\b/i;
+export function parseRecurrence(text: string): "daily" | null {
+  return RECURRENCE_PATTERN.test(text ?? "") ? "daily" : null;
+}
 
 // Order matters: evening checked first so "tomorrow night" wins over any stray match, and the
 // patterns are deliberately BARE nouns with word boundaries — "Thursday evening", "late
@@ -436,6 +448,7 @@ function coerce(raw: unknown, doctrine: Doctrine, text: string, refISO: string):
       // Read from the owner's own words, not from the model: "tonight" is unambiguous and a
       // model that omits it should not cost him the constraint.
       dayPart: parseDayPart(sourceSegment(title, segments) ?? text),
+      recurrence: parseRecurrence(sourceSegment(title, segments) ?? text),
     });
   }
   return out;
@@ -568,8 +581,30 @@ export interface WorkSegment {
  * Split a braindump into the fragments that are really tasks, each carrying the scheduling
  * language that belongs to it. Returns [] when nothing in the text names work.
  */
+/**
+ * Pull "gym"/"workout" out as its OWN segment when it is conjoined onto something else —
+ * "post the video and 1.25 hrs for the gym" — before the general segmenter runs.
+ *
+ * Owner report 2026-08-06: his one sentence about filming AND the gym became three garbled
+ * fragments, and the gym half was swallowed into "post insta video and for the gym" — never
+ * scheduled at all. General "and"-list segmentation ("I need to film, edit, and post…") is
+ * genuinely an LLM-shaped problem no regex will solve reliably, and the durable capture queue
+ * now exists precisely to retry text like this once the model is back. But the gym specifically
+ * is common enough, and important enough — it is its own doctrine block type with its own
+ * sleep-floor rule — to earn one targeted rule regardless of what the model is doing.
+ */
+function extractGymFragment(text: string): { rest: string; gym: string | null } {
+  const m = text.match(
+    /,?\s*(?:and\s+)?((?:\d+(?:\.\d+)?|an?|half an?|a\s+couple(?:\s+of)?)\s*(?:h(?:ou)?rs?|min(?:ute)?s?)\s*)?(?:for\s+)?(?:the\s+)?\b(?:gym|work\s*out|workout)\b/i
+  );
+  if (!m) return { rest: text, gym: null };
+  const duration = (m[1] ?? "").trim();
+  return { rest: (text.slice(0, m.index) + text.slice(m.index! + m[0].length)).trim(), gym: `${duration} gym`.trim() };
+}
+
 export function workSegments(text: string): WorkSegment[] {
-  const parts = (text ?? "")
+  const { rest: preGym, gym } = extractGymFragment(text ?? "");
+  const parts = (preGym ?? "")
     // Sentence boundaries split too. "Tonight I need to do research for Liatris. Tomorrow I
     // need to continue working on it." is two instructions with two different days, and
     // without this it is one task that takes the FIRST day it sees. The lookarounds keep
@@ -594,6 +629,9 @@ export function workSegments(text: string): WorkSegment[] {
     const last = segs[segs.length - 1];
     last.full = [last.full, ...pending].join(", ");
   }
+  // Gym goes back on as its own segment, carrying whatever scheduling language surrounded the
+  // WHOLE sentence (so "everyday… gym" still reads as recurring, not just the film half).
+  if (gym) segs.push({ work: gym, full: `${gym}, ${text}` });
   return segs;
 }
 
@@ -679,6 +717,7 @@ export function deterministicParse(
       windowStart: window.windowStart ?? null,
       flexible: window.flexible,
       dayPart: parseDayPart(p),
+      recurrence: parseRecurrence(p),
     });
   }
   return out;

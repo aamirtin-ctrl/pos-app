@@ -530,4 +530,68 @@ CREATE INDEX idx_capture_pending ON capture_inbox(processed_at, id) WHERE proces
 ALTER TABLE task ADD COLUMN day_part TEXT;
 `,
   },
+  {
+    version: 14,
+    name: "protect_done_events",
+    sql: `
+-- Owner report 2026-08-06: "some bug happened where it removed my Stanford math test calendar
+-- event, even though that time had already passed and I had done that task. It shouldn't be
+-- editing old stuff."
+--
+-- What actually happened: earlier today I ran raw \`sqlite3 ... DELETE FROM plan\` commands by
+-- hand to clean up duplicate blocks. The sqlite3 CLI does not enable PRAGMA foreign_keys, so
+-- those deletes did NOT cascade to the blocks they owned — they were orphaned, invisible to
+-- every app query (all of them INNER JOIN block through plan), including the math test's own
+-- completed block. The orphan-event reconciler I built two features ago (reconcileDayEvents,
+-- to stop stale Google events from accumulating) then correctly did its job: it saw a Google
+-- Calendar event that nothing in the database claimed anymore, and deleted it. The event was
+-- his record of a real, completed test.
+--
+-- The fix is not "don't clean up orphans" — that mechanism is why his calendar was not
+-- drowning in duplicates. It is that DONE work must be a protected class the cleanup can never
+-- reach, independent of whatever plan/block rows happen to still exist. gcal_event_id is a
+-- durable snapshot, copied here the moment a task is marked done (tasks.setStatus,
+-- pullFromGoogle) and read by reconcileDayEvents/drainTombstones as permanently claimed.
+--
+-- Backfilled immediately for every task already done, via a plain SELECT with no plan join —
+-- exactly the query the orphan-cleanup lacked, which is what recovers the math test's id from
+-- its orphaned block without needing to touch or repair that block at all.
+ALTER TABLE task ADD COLUMN gcal_event_id TEXT;
+UPDATE task SET gcal_event_id = (
+  SELECT b.gcal_event_id FROM block b
+   WHERE b.task_id = task.id AND b.gcal_event_id IS NOT NULL
+   ORDER BY b.id DESC LIMIT 1
+) WHERE status = 'done' AND gcal_event_id IS NULL;
+`,
+  },
+  {
+    version: 15,
+    name: "recurring_tasks",
+    sql: `
+-- Owner report 2026-08-06: "I texted myself I need time to workout and gym everyday. The app
+-- populated time to film today but not to gym, and it didn't add time for this on any of the
+-- other days. It should have realized this is a preference and to add it in to my calendars."
+--
+-- "Everyday" names a STANDING commitment, not a one-off task, and nothing in the schema could
+-- express that — a task has exactly one plan_date. So it was captured as a single instance on
+-- the day he happened to text it and then, correctly by the rules that exist, never appeared
+-- again.
+--
+--   recurrence      — 'daily' on a TEMPLATE row (what he actually asked for: "this happens
+--                      every day"). NULL for an ordinary one-off task, which is every existing
+--                      row and everything captured from here on unless "everyday"/"every day"/
+--                      "daily" is heard in the text.
+--   recurrence_parent_id — set on an INSTANCE materialized FROM a template for one specific
+--                      day. The template's own row IS its first day's instance (parent NULL),
+--                      so day one needs no special case.
+--
+-- Materialization (main/crm/recurring.ts) runs before a day is planned: any template with no
+-- instance yet for that date gets one, cloned with that day's own estimate/window/day-part, so
+-- a recurring task is a REGULAR task from the solver's point of view — no separate code path,
+-- no different rules about deep-work caps or gym's sleep floor.
+ALTER TABLE task ADD COLUMN recurrence TEXT;
+ALTER TABLE task ADD COLUMN recurrence_parent_id INTEGER REFERENCES task(id) ON DELETE SET NULL;
+CREATE INDEX idx_task_recurrence_parent ON task(recurrence_parent_id) WHERE recurrence_parent_id IS NOT NULL;
+`,
+  },
 ];

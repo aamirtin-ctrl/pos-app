@@ -20,6 +20,7 @@ import {
   dedupeKeyFor,
   rehydrateCommitmentDates,
 } from "./crm/commitments.ts";
+import { dateUndatedTasks } from "./crm/taskdates.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { runEnrichment } from "./crm/enrich.ts";
 import { commitmentToTask, closeGoogleTask, drainTombstones, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
@@ -1060,6 +1061,19 @@ export function startWorkers(
         }
       } catch (e) {
         console.warn(`workers: capture drain failed: ${(e as Error).message}`);
+      }
+
+      // Owner ask 2026-08-06: "the google tasks populated by the app are not dated. everything
+      // needs to be on a certain day. this might require gemini and that's fine." Whatever the
+      // deterministic vocabulary above could not resolve — pure judgement calls like "spend
+      // another night in Como" — gets one batched, health-gated AI pass.
+      try {
+        if (llm && llmHealth(db, secrets).ok) {
+          const td = await dateUndatedTasks(db, llm);
+          if (td.dated > 0) notify?.(`Gave ${td.dated} undated task${td.dated === 1 ? "" : "s"} a day`);
+        }
+      } catch (e) {
+        console.warn(`workers: task-date pass failed: ${(e as Error).message}`);
       }
 
       // An undated commitment can never be scheduled, so it just reappears every morning

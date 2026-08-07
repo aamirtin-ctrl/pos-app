@@ -33,6 +33,7 @@ import { hasCalendarWriteScope, isGoogleConnected, RECONSENT_REQUIRED } from "./
 import { readAppleEvents, appleBlockType, excludedCalendarNames } from "./applecal.ts";
 import { eventsForDate as icsEventsForDate, icsBlockType } from "./icscal.ts";
 import { wakeTimeFor } from "./wake.ts";
+import { materializeRecurringTasks } from "./crm/recurring.ts";
 
 const toIso = (dateISO: string, min: number) =>
   `${dateISO}T${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}:00`;
@@ -56,8 +57,8 @@ export async function braindump(db: Db, doctrineDir: string, llm: LlmClient | nu
   const ins = db.prepare(
     `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
        is_mit, hard_deadline_at, status, splittable, estimate_source, plan_date, notes,
-       window_start, window_end, day_part)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?)`
+       window_start, window_end, day_part, recurrence)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   const tx = db.transaction(() => {
     for (const t of tasks) {
@@ -82,7 +83,7 @@ export async function braindump(db: Db, doctrineDir: string, llm: LlmClient | nu
         t.hardDeadlineAt ? `${planDate}T${t.hardDeadlineAt}:00` : null,
         t.splittable ? 1 : 0, t.estimateSource, planDate,
         t.personHint ? `person: ${t.personHint}` : null,
-        windowStart, windowEnd, t.dayPart ?? null
+        windowStart, windowEnd, t.dayPart ?? null, t.recurrence ?? null
       );
     }
   });
@@ -391,6 +392,9 @@ export async function generatePlan(
 
   // A task already placed — pinned by a drag, or sitting in a block that has already begun —
   // must not be offered to the solver again. Offering it is what duplicated his math test.
+  // "Everyday" work for THIS date gets its instance now, before the pool below is read — so
+  // a recurring template behaves as an ordinary task from here on, with no separate path.
+  materializeRecurringTasks(db, dateISO, (deps?.now ?? new Date()).toISOString().slice(0, 10));
   const allTaskRows = listTasks(db, dateISO);
   const taskRows = allTaskRows.filter((r: any) => !pinnedTaskIds.has(r.id as number));
 

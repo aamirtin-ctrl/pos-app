@@ -496,6 +496,16 @@ export function registerIpc(deps: IpcDeps) {
     const res = db.prepare(
       "UPDATE task SET status = ?, completed_at = CASE WHEN ? = 'done' THEN datetime('now') ELSE completed_at END WHERE id = ?"
     ).run(status, status, id);
+    // Snapshot the calendar event the moment work is marked done, independent of whatever
+    // plan/block rows happen to exist later — see migration 14 / protectedEventIds.
+    if (status === "done") {
+      db.prepare(
+        `UPDATE task SET gcal_event_id = COALESCE(gcal_event_id, (
+           SELECT b.gcal_event_id FROM block b WHERE b.task_id = task.id AND b.gcal_event_id IS NOT NULL
+            ORDER BY b.id DESC LIMIT 1
+         )) WHERE id = ?`
+      ).run(id);
+    }
     if (prior) journal.record(makeTaskStatusEntry(db, id, prior, status));
     return res;
   });
