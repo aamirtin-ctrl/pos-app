@@ -30,6 +30,16 @@ describe("doctrine", () => {
     expect(bufferedMinutes(doctrine, "meeting", 30)).toBe(30); // ×1.0
     expect(bufferedMinutes(doctrine, "unknown_type", 60)).toBe(75); // default 25%
   });
+
+  // Owner report 2026-08-07: "it put gym at 1 hr 45 mins" — he had said 1.25 hrs. The
+  // planning-fallacy multiplier is for guesses; a duration the owner STATED is not a guess.
+  it("never buffers a stated duration — the owner's number is the number", () => {
+    expect(bufferedMinutes(doctrine, "gym", 75, "stated")).toBe(75); // his exact case
+    expect(bufferedMinutes(doctrine, "deep_work", 120, "stated")).toBe(120);
+    expect(bufferedMinutes(doctrine, "admin", 20, "stated")).toBe(30); // grid round-up only
+    expect(bufferedMinutes(doctrine, "gym", 75, "inferred")).toBe(105); // guesses still buffered
+    expect(bufferedMinutes(doctrine, "gym", 75)).toBe(105); // absent source = inferred (old callers)
+  });
 });
 
 describe("buildGrid (Phase 3 gate)", () => {

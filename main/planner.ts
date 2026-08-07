@@ -182,7 +182,7 @@ export async function externalAnchors(
   // blocks time in POS. Best-effort: a missing permission must never break planning.
   const appleEvents: MergeableAppleEvent[] = [];
   try {
-    for (const ev of await readAppleEvents(dateISO, { exclude: excludedCalendarNames(db) })) {
+    for (const ev of await readAppleEvents(dateISO, { exclude: excludedCalendarNames(db), db })) {
       if (ev.allDay) continue; // same rule as the Google path — all-day never blocks
       const blockType = appleBlockType(ev.title, ev.calendar);
       appleEvents.push({

@@ -5,9 +5,12 @@
 import { describe, it, expect } from "vitest";
 import {
   FIELD_SEP,
+  SCAN_ERROR_MARKER,
   parseAppleDate,
   parseAppleLine,
   parseAppleEvents,
+  parseAppleScan,
+  healPartialScan,
   isAllDay,
   appleBlockType,
   classifyOsaError,
@@ -289,5 +292,54 @@ describe("parseCalendarNames", () => {
 
   it("returns an empty list for empty output", () => {
     expect(parseCalendarNames("")).toEqual([]);
+  });
+});
+
+
+// ── partial-scan resilience ───────────────────────────────────────────────────
+//
+// Owner report 2026-08-07: a family dinner on a shared iCloud calendar ("HYT Fam") never
+// became an anchor, and the planner scheduled the shutdown ritual inside it. The scan's
+// per-calendar `on error` used to coerce a FAILED calendar into an EMPTY one — these lock
+// the marker protocol and the snapshot healing that replaced that silence.
+describe("parseAppleScan / healPartialScan", () => {
+  const ev = (uid: string, cal: string, startH: number): string =>
+    row(uid, `Event ${uid}`, `2026-08-07T${String(startH).padStart(2, "0")}:00:00`, `2026-08-07T${String(startH + 1).padStart(2, "0")}:00:00`, cal);
+
+  it("separates event rows from error-marker rows", () => {
+    const out = parseAppleScan([ev("a", "Work", 9), `${SCAN_ERROR_MARKER}${FIELD_SEP}HYT Fam`, ev("b", "Home", 12)].join("\n"));
+    expect(out.events.map((e) => e.uid)).toEqual(["a", "b"]);
+    expect(out.erroredCalendars).toEqual(["HYT Fam"]);
+  });
+
+  it("a clean scan reports no errored calendars (old outputs parse unchanged)", () => {
+    const out = parseAppleScan([ev("a", "Work", 9)].join("\n"));
+    expect(out.erroredCalendars).toEqual([]);
+    expect(out.events).toHaveLength(1);
+  });
+
+  it("heals ONLY the errored calendar from the snapshot — his exact case", () => {
+    const fresh = parseAppleScan(ev("standoff", "Work", 18)).events;
+    const snapshot: AppleEvent[] = [
+      { uid: "dinner", title: "Dinner at our home", startMin: 1140, endMin: 1320, calendar: "HYT Fam", allDay: false },
+      { uid: "old-work", title: "Stale Work row", startMin: 540, endMin: 600, calendar: "Work", allDay: false },
+    ];
+    const healed = healPartialScan(fresh, ["HYT Fam"], snapshot);
+    // The dinner is restored; the stale Work row is NOT — Work scanned fine, so its
+    // fresh (empty-of-that-event) answer is the truth.
+    expect(healed.map((e) => e.uid).sort()).toEqual(["dinner", "standoff"]);
+  });
+
+  it("no errors → snapshot untouched; no snapshot → fresh returned as-is", () => {
+    const fresh: AppleEvent[] = [];
+    expect(healPartialScan(fresh, [], [{ uid: "x", title: "t", startMin: 0, endMin: 60, calendar: "A", allDay: false }])).toBe(fresh);
+    expect(healPartialScan(fresh, ["A"], null)).toBe(fresh);
+  });
+
+  it("calendar-name matching is case-folded, same rule as exclusions", () => {
+    const healed = healPartialScan([], ["hyt fam"], [
+      { uid: "dinner", title: "Dinner", startMin: 1140, endMin: 1320, calendar: "HYT Fam", allDay: false },
+    ]);
+    expect(healed).toHaveLength(1);
   });
 });

@@ -236,20 +236,43 @@ export async function reconcileGoogleTasks(
   return result;
 }
 
+/** The lists one reconcile reads: POS's own, plus the phone's default "My Tasks". */
+export const DEFAULT_TASKLIST = "@default";
+
 async function runReconcile(db: Db, deps: GoogleTasksDeps, result: ReconcileResult): Promise<void> {
-  const tasklist = await deps.ensureTasklist();
+  const posList = await deps.ensureTasklist();
 
-  // Read EVERY page before touching the database. A listing that fails halfway would
-  // otherwise look like "the owner deleted the rest of his tasks" and defer them all.
+  // Owner report 2026-08-07: "in my google tasks i added from much earlier i need to do my
+  // physics diagnostic today. yet its not scheduling for that." He types tasks into the
+  // normal Google Tasks app, which lands them in '@default' — a list this reconcile never
+  // read, so they simply did not exist here. Both lists are read now; each imported row
+  // remembers which list it came from (task.gtasks_list, NULL = POS list) so every write
+  // back goes to the right one.
+  //
+  // Read EVERY page of BOTH lists before touching the database. A listing that fails
+  // halfway would otherwise look like "the owner deleted the rest of his tasks" and defer
+  // them all. Deduped by id: '@default' aliases a real list id, so a fake or a quirk that
+  // serves the same rows twice must not import twice.
   const remote: GoogleTaskLite[] = [];
-  let pageToken: string | undefined;
-  do {
-    const page = await deps.listTasks({ tasklist, pageToken });
-    remote.push(...(page.items ?? []));
-    pageToken = page.nextPageToken ?? undefined;
-  } while (pageToken);
+  const seen = new Set<string>();
+  const listOf = new Map<string, string | null>(); // gtasks id → '@default' | null (POS list)
+  for (const [tasklist, tag] of [[posList, null], [DEFAULT_TASKLIST, DEFAULT_TASKLIST]] as const) {
+    let pageToken: string | undefined;
+    do {
+      const page = await deps.listTasks({ tasklist, pageToken });
+      for (const item of page.items ?? []) {
+        if (item.id && seen.has(item.id)) continue;
+        if (item.id) {
+          seen.add(item.id);
+          listOf.set(item.id, tag);
+        }
+        remote.push(item);
+      }
+      pageToken = page.nextPageToken ?? undefined;
+    } while (pageToken);
+  }
 
-  pullFromGoogle(db, deps, remote, result);
+  pullFromGoogle(db, deps, remote, listOf, result);
 
   // Push only after a clean pull — pushing on a failed pull would resurrect deletions.
   const pushed = await deps.pushTasks();
@@ -260,6 +283,7 @@ function pullFromGoogle(
   db: Db,
   deps: GoogleTasksDeps,
   remote: readonly GoogleTaskLite[],
+  listOf: ReadonlyMap<string, string | null>,
   result: ReconcileResult
 ): void {
   const now = deps.now();
@@ -367,9 +391,9 @@ function pullFromGoogle(
     const due = dueDateOf(g.due);
     db.prepare(
       `INSERT INTO task (title, notes, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
-                         status, plan_date, hard_deadline_at, estimate_source, gtasks_id)
-       VALUES (?, ?, 'admin', 2, 30, 30, 'inbox', ?, ?, 'inferred', ?)`
-    ).run(title.slice(0, 200), g.notes ?? null, due, due ? `${due}T00:00:00` : null, g.id);
+                         status, plan_date, hard_deadline_at, estimate_source, gtasks_id, gtasks_list)
+       VALUES (?, ?, 'admin', 2, 30, 30, 'inbox', ?, ?, 'inferred', ?, ?)`
+    ).run(title.slice(0, 200), g.notes ?? null, due, due ? `${due}T00:00:00` : null, g.id, listOf.get(g.id) ?? null);
     result.pulled++;
   }
 }

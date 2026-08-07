@@ -11,6 +11,7 @@ import { makeQueryEmbedder } from "./llm/embeddings.ts";
 import { patchPersonWithExtract } from "./crm/people.ts";
 import { reconnectDue, refreshNextTouch } from "./crm/reconnect.ts";
 import * as planner from "./planner.ts";
+import { isWakeMessage, recordWake } from "./wake.ts";
 import { addManual } from "./worklog.ts";
 import {
   contextBlock,
@@ -461,12 +462,40 @@ export function applyRule(db: Db, req: RuleRequest): AssistantResult {
 }
 
 export async function handleCommand(
-  deps: { db: Db; doctrineDir: string; secrets: SecretStore; llm: LlmClient | null },
+  deps: {
+    db: Db; doctrineDir: string; secrets: SecretStore; llm: LlmClient | null;
+    now?: () => Date;
+    /** Threaded into plan generation — lets tests inject anchors/clock (see ReplanDeps). */
+    planDeps?: planner.ReplanDeps;
+  },
   text: string
 ): Promise<AssistantResult> {
   const { db, doctrineDir, secrets, llm } = deps;
+  const now = deps.now ?? (() => new Date());
   const t = text.trim();
   if (!t) return { kind: "error", reply: "Say what you need — plan the day, find someone, note a fact." };
+
+  // "just woke up" is a WAKE REPORT, not work to schedule. The capture worker (email/
+  // iMessage) has known this since 2026-08-05, but this box did not — so on 2026-08-07 the
+  // owner typed "just woke up" into the sparkle and the deterministic fallback dutifully
+  // created a 50-minute focused_work task titled "Just woke up" and scheduled it. Same
+  // check, same rules (morning cutoff, short-message guard, message time = now here since
+  // he is literally typing it live), and it runs BEFORE classification so no model outage
+  // can ever turn a wake ping into a task again.
+  if (isWakeMessage(t, now().toISOString())) {
+    const rec = recordWake(db, now().toISOString());
+    if (rec?.stored) {
+      // The day is re-solved against the real wake immediately — he is standing at the
+      // app when he says this, so "the tick will get to it" is the wrong latency.
+      try {
+        await planner.generatePlan(db, doctrineDir, secrets, llm, today(), { fast: true, ...deps.planDeps });
+      } catch {
+        /* replan is best-effort; the wake itself is recorded either way */
+      }
+      return { kind: "plan", reply: `Good morning — wake recorded at ${rec.hhmm}, today re-planned around it.` };
+    }
+    return { kind: "answer", reply: "Morning! Already had your wake for today." };
+  }
 
   // classify: LLM fast-tier with deterministic fallback
   let intent = "question";
@@ -597,7 +626,7 @@ Command: """${t.slice(0, 600)}"""`,
       // wraps the LLM client for the braindump parse and the narration (withPreferences),
       // so there is nothing to prepend here and no chance of sending it twice.
       await planner.braindump(db, doctrineDir, llm, t, today());
-      const view = await planner.generatePlan(db, doctrineDir, secrets, llm, today());
+      const view = await planner.generatePlan(db, doctrineDir, secrets, llm, today(), deps.planDeps);
       const n = view?.blocks.filter((b: any) => !b.is_anchor).length ?? 0;
       const un = view?.unplaced?.length ?? 0;
       return {

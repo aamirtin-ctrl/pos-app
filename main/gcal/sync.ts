@@ -985,12 +985,13 @@ async function pushTasksInner(
   // Google Tasks with no due date at all, which is what he saw.
   const open = db
     .prepare(
-      `SELECT id, title, notes, plan_date, hard_deadline_at, gtasks_id
+      `SELECT id, title, notes, plan_date, hard_deadline_at, gtasks_id, gtasks_list
          FROM task WHERE status IN ('inbox','planned','in_progress')`
     )
     .all() as {
     id: number; title: string; notes: string | null;
     plan_date: string | null; hard_deadline_at: string | null; gtasks_id: string | null;
+    gtasks_list: string | null;
   }[];
   for (const t of open) {
     // A clock-time deadline is more specific than a plain day, so it wins when both exist.
@@ -1002,7 +1003,14 @@ async function pushTasksInner(
     const body = { title: t.title, notes: t.notes ?? undefined, due };
     if (t.gtasks_id) {
       try {
-        await api.tasks.update({ tasklist: listId, task: t.gtasks_id, requestBody: { ...body, id: t.gtasks_id } });
+        // A task imported from another list ('@default' — the phone's "My Tasks") lives
+        // there; updating it against the POS list is a 404 that would then re-insert it
+        // into the POS list as a duplicate the owner never asked to move.
+        await api.tasks.update({
+          tasklist: t.gtasks_list ?? listId,
+          task: t.gtasks_id,
+          requestBody: { ...body, id: t.gtasks_id },
+        });
         continue;
       } catch (e) {
         // Only a MISSING task justifies re-inserting. A scope refusal would fail the
@@ -1012,7 +1020,8 @@ async function pushTasksInner(
       }
     }
     const created = await api.tasks.insert({ tasklist: listId, requestBody: body });
-    db.prepare("UPDATE task SET gtasks_id = ? WHERE id = ?").run(created.data.id ?? null, t.id);
+    // The re-insert landed in the POS list wherever the row lived before.
+    db.prepare("UPDATE task SET gtasks_id = ?, gtasks_list = NULL WHERE id = ?").run(created.data.id ?? null, t.id);
     pushed++;
   }
 
@@ -1040,14 +1049,14 @@ async function pushTasksInner(
     pushed++;
   }
 
-  // complete Google tasks whose local task is done
+  // complete Google tasks whose local task is done — in whichever list each one lives
   const done = db
-    .prepare("SELECT gtasks_id FROM task WHERE status = 'done' AND gtasks_id IS NOT NULL")
-    .all() as { gtasks_id: string }[];
+    .prepare("SELECT gtasks_id, gtasks_list FROM task WHERE status = 'done' AND gtasks_id IS NOT NULL")
+    .all() as { gtasks_id: string; gtasks_list: string | null }[];
   for (const d of done) {
     try {
       await api.tasks.update({
-        tasklist: listId,
+        tasklist: d.gtasks_list ?? listId,
         task: d.gtasks_id,
         requestBody: { id: d.gtasks_id, status: "completed" },
       });

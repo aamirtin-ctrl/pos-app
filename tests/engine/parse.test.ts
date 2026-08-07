@@ -17,7 +17,9 @@ describe("deterministic parse (LLM-off fallback)", () => {
     expect(pset.blockType).toBe("deep_work");
     expect(pset.rawEstimateMinutes).toBe(120);
     expect(pset.estimateSource).toBe("stated");
-    expect(pset.estimatedMinutes).toBe(150); // 120 × 1.25
+    // Stated durations are never buffered (owner report 2026-08-07: "it put gym at
+    // 1 hr 45 mins" for a stated 1.25 hrs). "2hrs" means 120, not 120 × 1.25.
+    expect(pset.estimatedMinutes).toBe(120);
     expect(tasks.find((t) => /gym/i.test(t.title))!.blockType).toBe("gym");
     expect(tasks.find((t) => /reply to sarah/i.test(t.title))!.blockType).toBe("comms");
   });

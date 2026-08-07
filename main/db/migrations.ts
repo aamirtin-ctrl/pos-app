@@ -594,4 +594,37 @@ ALTER TABLE task ADD COLUMN recurrence_parent_id INTEGER REFERENCES task(id) ON 
 CREATE INDEX idx_task_recurrence_parent ON task(recurrence_parent_id) WHERE recurrence_parent_id IS NOT NULL;
 `,
   },
+  {
+    version: 16,
+    name: "stated_estimates_unbuffered",
+    sql: `
+-- Owner report 2026-08-07: "it put gym at 1 hr 45 mins" — he said 1.25 hrs. The
+-- planning-fallacy multiplier (gym ×1.4) was applied to a duration he STATED, turning his
+-- own number into the app's number. bufferedMinutes now skips the multiplier for
+-- estimate_source='stated'; this recomputes the rows already sitting in the schedule so the
+-- fix reaches today, not just the next braindump. Integer arithmetic: round raw up to the
+-- 15-minute grid, nothing more.
+UPDATE task
+   SET estimated_minutes = ((raw_estimate_minutes + 14) / 15) * 15
+ WHERE estimate_source = 'stated'
+   AND raw_estimate_minutes IS NOT NULL
+   AND status IN ('inbox','planned','in_progress');
+`,
+  },
+  {
+    version: 17,
+    name: "gtasks_list",
+    sql: `
+-- Owner report 2026-08-07: "in my google tasks i added from much earlier i need to do my
+-- physics diagnostic today. yet its not scheduling for that." The reconcile only ever read
+-- POS's own tasklist, so a task typed into the normal Google Tasks app (the default
+-- "My Tasks" list) was invisible here.
+--
+-- The pull now reads '@default' too. A task imported from there must remember which list it
+-- lives in, because every write back (title/due updates, completion) goes to a specific
+-- tasklist — patching a default-list task against the POS list is a 404.
+-- NULL = the POS list (every pre-existing linked task), so old rows keep old behavior.
+ALTER TABLE task ADD COLUMN gtasks_list TEXT;
+`,
+  },
 ];

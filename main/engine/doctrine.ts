@@ -380,8 +380,21 @@ export function capacityAt(doctrine: Doctrine, hoursAfterWake: number): number {
   return pts[pts.length - 1].capacity;
 }
 
-/** Planning-fallacy buffer: raw × category multiplier, capped, rounded up to 15. */
-export function bufferedMinutes(doctrine: Doctrine, blockType: string, raw: number): number {
+/**
+ * Planning-fallacy buffer: raw × category multiplier, capped, rounded up to 15.
+ *
+ * The multiplier exists because INFERRED estimates are guesses about the owner's guesses.
+ * A duration the owner STATED in his own words is neither — "1.25 hrs for the gym" means
+ * 75 minutes, and scheduling 105 reads as the app overriding him (owner report 2026-08-07:
+ * "it put gym at 1 hr 45 mins"). Stated numbers get only the 15-minute grid round-up.
+ */
+export function bufferedMinutes(
+  doctrine: Doctrine,
+  blockType: string,
+  raw: number,
+  source?: "stated" | "inferred" | null
+): number {
+  if (source === "stated") return Math.ceil(raw / 15) * 15;
   const mult =
     doctrine.estimation.category_multipliers[blockType] ??
     1 + doctrine.estimation.default_buffer_pct / 100;

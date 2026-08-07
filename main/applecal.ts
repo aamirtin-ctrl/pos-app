@@ -25,7 +25,7 @@ import { getSetting, setSetting } from "./db/db.ts";
 import type { SecretStore } from "./secrets.ts";
 import { google, type calendar_v3 } from "googleapis";
 import { isGoogleConnected, oauthClient } from "./gcal/auth.ts";
-import { googleICalUids } from "./gcal/sync.ts";
+import { googleICalUids, persistDayCache, readDayCache } from "./gcal/sync.ts";
 
 /** Google calendar that receives the mirrored Apple events. Nothing else is written. */
 export const APPLE_MIRROR_CALENDAR_NAME = "POS — Apple";
@@ -44,6 +44,18 @@ export const APPLE_EXCLUDED_SETTING_KEY = "apple_calendars_excluded";
 
 /** ASCII unit separator — rare enough that no calendar title contains it. */
 export const FIELD_SEP = "\u001f";
+
+/**
+ * Row prefix the scan script emits when ONE calendar's event query threw. Before
+ * 2026-08-07 that `on error` silently coerced the calendar to "no events" — and a shared
+ * iCloud calendar hiccuping during a scan is indistinguishable from a free evening. The
+ * owner's family-dinner event vanished from a day's anchors exactly that way, and the
+ * planner scheduled his shutdown ritual inside the dinner.
+ */
+export const SCAN_ERROR_MARKER = "!ERRCAL";
+
+/** settings-table prefix for the per-day last-known-good scan snapshot. */
+export const APPLE_CACHE_PREFIX = "apple_cache:";
 
 /** How long a cached day's read stays warm. The AppleScript scan is slow (see above). */
 const CACHE_TTL_MS = 5 * 60_000;
@@ -159,12 +171,47 @@ export function parseAppleLine(line: string): AppleEvent | null {
 
 /** Parse the full osascript stdout, skipping every unparseable row. */
 export function parseAppleEvents(stdout: string): AppleEvent[] {
-  const out: AppleEvent[] = [];
+  return parseAppleScan(stdout).events;
+}
+
+export interface AppleScanResult {
+  events: AppleEvent[];
+  /** Calendars whose event query THREW during the scan — their absence proves nothing. */
+  erroredCalendars: string[];
+}
+
+/** Parse scan output including `!ERRCAL<US>name` marker rows (see SCAN_ERROR_MARKER). */
+export function parseAppleScan(stdout: string): AppleScanResult {
+  const events: AppleEvent[] = [];
+  const erroredCalendars: string[] = [];
   for (const line of (stdout ?? "").split("\n")) {
-    const ev = parseAppleLine(line);
-    if (ev) out.push(ev);
+    const trimmed = line.replace(/\r$/, "");
+    if (trimmed.startsWith(SCAN_ERROR_MARKER + FIELD_SEP)) {
+      const name = trimmed.slice(SCAN_ERROR_MARKER.length + FIELD_SEP.length).trim();
+      if (name && !erroredCalendars.includes(name)) erroredCalendars.push(name);
+      continue;
+    }
+    const ev = parseAppleLine(trimmed);
+    if (ev) events.push(ev);
   }
-  return out;
+  return { events, erroredCalendars };
+}
+
+/**
+ * Fill the holes a partial scan left: for each calendar that ERRORED, take its events
+ * from the last clean snapshot of the same day. Calendars that scanned fine contribute
+ * their fresh rows only — a snapshot must never resurrect an event the owner deleted
+ * from a calendar we could actually read.
+ */
+export function healPartialScan(
+  fresh: AppleEvent[],
+  erroredCalendars: readonly string[],
+  snapshot: readonly AppleEvent[] | null | undefined
+): AppleEvent[] {
+  if (erroredCalendars.length === 0 || !snapshot?.length) return fresh;
+  const errored = new Set(erroredCalendars.map(foldName));
+  const patched = snapshot.filter((e) => errored.has(foldName(e.calendar)));
+  return [...fresh, ...patched];
 }
 
 // ── calendar filtering (pure) ────────────────────────────────────────────────
@@ -345,7 +392,11 @@ tell application "Calendar"
 			try
 				set evs to (every event of c whose start date is greater than or equal to dayStart and start date is less than dayEnd)
 			on error
+				-- A failed calendar must be DISTINGUISHABLE from an empty one: shared iCloud
+				-- calendars flake, and "no events" here once cost a real family dinner its
+				-- anchor. The marker row lets the reader fall back to the last good scan.
 				set evs to {}
+				set end of rows to ("!ERRCAL" & sep & cname)
 			end try
 			repeat with e in evs
 				try
@@ -386,7 +437,7 @@ export function excludedCalendarNames(db: Db): string[] {
  */
 export async function readAppleEvents(
   dateISO: string,
-  opts?: { force?: boolean; exclude?: readonly string[] }
+  opts?: { force?: boolean; exclude?: readonly string[]; db?: Db }
 ): Promise<AppleEvent[]> {
   const exclude = [...(opts?.exclude ?? [])].map((s) => s.trim()).filter(Boolean);
   // the exclusion set changes what the scan returns, so it is part of the cache key
@@ -394,9 +445,35 @@ export async function readAppleEvents(
   const hit = cache.get(key);
   if (!opts?.force && hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.events;
 
+  // Last clean scan of this day, when a db is in hand to keep one. This is what stands in
+  // for a calendar (or the whole scan) that fails: absence of evidence from a FAILED read
+  // is not evidence of a free evening (owner report 2026-08-07 — a shutdown ritual was
+  // scheduled inside a family dinner the scan had silently dropped).
+  const snapshot = opts?.db ? readDayCache<AppleEvent[]>(opts.db, APPLE_CACHE_PREFIX, dateISO) : null;
+
   const res = await runOsascript(buildEventsScript(dateISO, exclude));
-  if (!res.ok) throw res.error;
-  const events = filterAppleEvents(parseAppleEvents(res.stdout), exclude);
+  if (!res.ok) {
+    if (Array.isArray(snapshot)) {
+      console.warn(`applecal: scan failed for ${dateISO} (${res.error.message}); serving last-known snapshot`);
+      return filterAppleEvents(snapshot, exclude);
+    }
+    throw res.error;
+  }
+  const scan = parseAppleScan(res.stdout);
+  const fresh = filterAppleEvents(scan.events, exclude);
+  if (scan.erroredCalendars.length > 0) {
+    console.warn(`applecal: calendars failed mid-scan for ${dateISO}: ${scan.erroredCalendars.join(", ")}`);
+  }
+  const events = filterAppleEvents(healPartialScan(fresh, scan.erroredCalendars, snapshot), exclude);
+  // Only a FULLY clean scan may become the new last-known-good — persisting a healed
+  // result would launder a failure into future "truth".
+  if (opts?.db && scan.erroredCalendars.length === 0) {
+    try {
+      persistDayCache(opts.db, APPLE_CACHE_PREFIX, dateISO, JSON.stringify(fresh));
+    } catch (err) {
+      console.warn(`applecal: persisting scan snapshot failed: ${(err as Error).message}`);
+    }
+  }
   cache.set(key, { at: Date.now(), events });
   return events;
 }

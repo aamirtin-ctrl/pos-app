@@ -33,22 +33,27 @@ afterEach(() => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-/** Fake Google surface: pages of tasks in, call log out. */
+/** Fake Google surface: pages of tasks in, call log out. POS list + '@default' (phone). */
 function fakeDeps(
   pages: GoogleTaskLite[][],
-  opts: { pushResult?: { pushed: number; completed: number }; pushThrows?: string } = {}
+  opts: {
+    pushResult?: { pushed: number; completed: number };
+    pushThrows?: string;
+    defaultListPages?: GoogleTaskLite[][];
+  } = {}
 ): Partial<GoogleTasksDeps> & { calls: { list: number; patch: number; insert: number; push: number } } {
   const calls = { list: 0, patch: 0, insert: 0, push: 0 };
   return {
     calls,
     isConnected: () => true,
     ensureTasklist: async () => "POS_LIST",
-    listTasks: async ({ pageToken }) => {
+    listTasks: async ({ tasklist, pageToken }) => {
+      const source = tasklist === "@default" ? (opts.defaultListPages ?? []) : pages;
       const idx = pageToken ? Number(pageToken) : 0;
       calls.list++;
       return {
-        items: pages[idx] ?? [],
-        nextPageToken: idx + 1 < pages.length ? String(idx + 1) : undefined,
+        items: source[idx] ?? [],
+        nextPageToken: idx + 1 < source.length ? String(idx + 1) : undefined,
       };
     },
     patchTask: async () => {
@@ -296,7 +301,7 @@ describe("pagination and push", () => {
     );
     const res = await reconcileGoogleTasks(db, connected, deps);
 
-    expect(deps.calls.list).toBe(2);
+    expect(deps.calls.list).toBe(3); // 2 POS pages + the '@default' read (empty)
     expect(deps.calls.push).toBe(1);
     expect(res.pushed).toBe(7);
     expect(task(t1).status).toBe("inbox"); // page one saved it
@@ -399,5 +404,61 @@ describe("task.updated_at trigger", () => {
     expect(after.u).toBeTruthy();
     t.close();
     fs.rmSync(d, { recursive: true, force: true });
+  });
+});
+
+
+// ── the phone's own "My Tasks" list ('@default') ─────────────────────────────
+//
+// Owner report 2026-08-07: "in my google tasks i added from much earlier i need to do my
+// physics diagnostic today. yet its not scheduling for that." He types tasks into the normal
+// Google Tasks app; those land in '@default', which the reconcile never read.
+describe("default-list pull", () => {
+  it("imports a task typed into the phone's default list, dated from its due date — his exact case", async () => {
+    const deps = fakeDeps([[]], {
+      defaultListPages: [[
+        { id: "phys1", title: "Physics diagnostic", status: "needsAction", due: "2026-08-07T00:00:00.000Z" },
+      ]],
+    });
+    const res = await reconcileGoogleTasks(db, connected, deps);
+    expect(res.pulled).toBe(1);
+    const row = db.prepare("SELECT * FROM task WHERE gtasks_id = 'phys1'").get() as any;
+    expect(row.title).toBe("Physics diagnostic");
+    expect(row.plan_date).toBe("2026-08-07"); // scheduled ON the day he named
+    expect(row.gtasks_list).toBe("@default"); // writes back to the right list
+  });
+
+  it("a POS-list import records no list override (NULL = POS list)", async () => {
+    const deps = fakeDeps([[{ id: "pos1", title: "From POS list", status: "needsAction" }]]);
+    await reconcileGoogleTasks(db, connected, deps);
+    const row = db.prepare("SELECT * FROM task WHERE gtasks_id = 'pos1'").get() as any;
+    expect(row.gtasks_list).toBeNull();
+  });
+
+  it("the same id served by both lists imports exactly once", async () => {
+    const g: GoogleTaskLite = { id: "dup1", title: "Aliased row", status: "needsAction" };
+    const deps = fakeDeps([[g]], { defaultListPages: [[g]] });
+    const res = await reconcileGoogleTasks(db, connected, deps);
+    expect(res.pulled).toBe(1);
+    const n = (db.prepare("SELECT COUNT(*) AS n FROM task WHERE gtasks_id = 'dup1'").get() as any).n;
+    expect(n).toBe(1);
+  });
+
+  it("completing a default-list task in Google completes it here too", async () => {
+    const id = addTask({ title: "Physics diagnostic", gtasksId: "phys1" });
+    db.prepare("UPDATE task SET gtasks_list = '@default' WHERE id = ?").run(id);
+    const deps = fakeDeps([[]], {
+      defaultListPages: [[{ id: "phys1", title: "Physics diagnostic", status: "completed", completed: "2026-08-07T20:00:00Z" }]],
+    });
+    await reconcileGoogleTasks(db, connected, deps);
+    expect(task(id).status).toBe("done");
+  });
+
+  it("a default-list task missing from BOTH lists defers, same as a POS-list deletion", async () => {
+    const id = addTask({ title: "Deleted on phone", gtasksId: "gonex" });
+    db.prepare("UPDATE task SET gtasks_list = '@default' WHERE id = ?").run(id);
+    const deps = fakeDeps([[]]);
+    await reconcileGoogleTasks(db, connected, deps);
+    expect(task(id).status).toBe("deferred");
   });
 });

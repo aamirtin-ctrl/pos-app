@@ -681,7 +681,7 @@ export function registerIpc(deps: IpcDeps) {
   h("applecal.available", () => appleCalendarAvailable());
   // names for the Settings picker; POS's own mirror calendars are never listed
   h("applecal.calendars", () => listAppleCalendars());
-  h("applecal.events", (dateISO: string) => readAppleEvents(dateISO, { exclude: excludedCalendarNames(db) }));
+  h("applecal.events", (dateISO: string) => readAppleEvents(dateISO, { exclude: excludedCalendarNames(db), db }));
   // The mirror writes to Google too, so it hits the same stale-scope wall — map it to the
   // one typed string the UI knows how to act on. (applecal.ts stays free of auth policy.)
   h("applecal.mirror", async (dateISO: string) => {
