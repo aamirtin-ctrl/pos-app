@@ -490,6 +490,150 @@ export async function pullNotionTasks(db: Db, secrets: SecretStore): Promise<num
   return pulled;
 }
 
+// ── agentic-coding curriculum (a specific Notion database drives ONE recurring task) ──
+//
+// Owner ask 2026-08-07: "i have a specific calendar in my notion under the page 'Agentic
+// Engineering...'. it gives me info on what to do for the 30 min coding sesh's i have
+// everyday... pos can determine timings but that has the info on how to spend my time."
+//
+// POS already owns WHEN (the "Learn agentic coding" daily recurring task, materialized
+// per-day by crm/recurring.ts). This owns WHAT: each day's materialized instance is
+// enriched from the matching row of the owner's "Agentic Engineering — 30 Day Plan"
+// database (one row per calendar day: Task title, Type select Learn/Apply, Week select,
+// Link url), so the title/notes carry the day's actual topic once — and everything
+// downstream (Google Calendar push, and Apple Calendar via his Google account already
+// being subscribed inside Calendar.app) inherits it automatically. No new write path.
+//
+// The link between the recurring template and its Notion database lives in the
+// TEMPLATE row's own `notes` (never an instance's — instances don't inherit notes at
+// materialization, see recurring.ts), same marker-in-notes idiom as gtasks-sync's
+// `pos:task:<id>`. Never write to the template's TITLE: every future instance copies it
+// verbatim, so overwriting it with one day's topic would poison every day after.
+
+export const AGENTIC_CURRICULUM_MARKER_PREFIX = "notion:curriculum:";
+
+/** The Notion database id a recurring template is linked to, from its own `notes`. */
+export function curriculumDbIdFromNotes(notes: string | null | undefined): string | null {
+  const m = new RegExp(`${AGENTIC_CURRICULUM_MARKER_PREFIX}(\\S+)`).exec(notes ?? "");
+  return m ? m[1] : null;
+}
+
+export interface CurriculumEntry {
+  title: string;
+  type: string | null;
+  week: string | null;
+  link: string | null;
+  done: boolean;
+}
+
+/** The one row (if any) whose Date property equals `dateISO` — a calendar keyed by day. */
+export async function queryCurriculumForDate(
+  secrets: SecretStore,
+  databaseId: string,
+  dateISO: string
+): Promise<CurriculumEntry | null> {
+  const token = requireToken(secrets);
+  const res = await notionFetch(token, `/databases/${databaseId}/query`, {
+    method: "POST",
+    body: { filter: { property: "Date", date: { equals: dateISO } }, page_size: 1 },
+  });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const row = ((res.results ?? []) as any[])[0];
+  if (!row) return null;
+  const props = row.properties ?? {};
+  return {
+    title: extractTitle(row),
+    type: props.Type?.select?.name ?? null,
+    week: props.Week?.select?.name ?? null,
+    link: props.Link?.url ?? null,
+    done: props.Done?.checkbox === true,
+  };
+}
+
+/**
+ * "Learn: Master.dev guide — How AI Code Generation Actually Works" — Type folded into the
+ * title so the calendar block says what KIND of session it is at a glance.
+ *
+ * Skips the prefix when the row's own title already carries it: his "Apply" rows are titled
+ * "Apply: run the GitHub ReAct example locally", which would otherwise read "Apply: Apply:
+ * …" on the calendar (caught against the real database, 2026-08-07).
+ */
+export function formatCurriculumTitle(entry: CurriculumEntry): string {
+  const title = entry.title.trim();
+  if (!entry.type) return title.slice(0, 200);
+  const alreadyPrefixed = new RegExp(`^${entry.type}\\s*:`, "i").test(title);
+  return (alreadyPrefixed ? title : `${entry.type}: ${title}`).slice(0, 200);
+}
+
+/** Week + link, one per line; null when the row carries neither (nothing to add). */
+export function formatCurriculumNotes(entry: CurriculumEntry): string | null {
+  const lines = [entry.week, entry.link].filter((v): v is string => Boolean(v));
+  return lines.length ? lines.join("\n") : null;
+}
+
+/** Swappable query fn — real Notion in production, a fake in tests. No network in tests. */
+export interface CurriculumDeps {
+  queryForDate: typeof queryCurriculumForDate;
+}
+
+export interface CurriculumSyncResult {
+  enriched: number;
+}
+
+/**
+ * For every recurring template linked to a curriculum database, enrich whichever of its
+ * already-materialized instances (today or later — never rewrite history) still carry the
+ * template's generic title. That equality check IS the "not yet enriched" sentinel: once
+ * enriched, a task's title reads like a specific topic and stops matching, so it is never
+ * re-fetched or clobbered — including by the owner renaming it, which is meant to stick.
+ * A day with no matching row (before the plan starts, or a weekend the curriculum skips)
+ * is left exactly as materialized: the generic title is a perfectly good fallback.
+ */
+export async function enrichAgenticCurriculumTasks(
+  db: Db,
+  secrets: SecretStore,
+  todayISO: string,
+  deps: CurriculumDeps = { queryForDate: queryCurriculumForDate }
+): Promise<CurriculumSyncResult> {
+  if (!secrets.get("NOTION_TOKEN")) return { enriched: 0 };
+
+  const templates = db
+    .prepare(
+      `SELECT id, title, notes FROM task
+        WHERE recurrence = 'daily' AND recurrence_parent_id IS NULL AND notes LIKE ?`
+    )
+    .all(`${AGENTIC_CURRICULUM_MARKER_PREFIX}%`) as { id: number; title: string; notes: string }[];
+
+  let enriched = 0;
+  for (const t of templates) {
+    const dbId = curriculumDbIdFromNotes(t.notes);
+    if (!dbId) continue;
+    const pending = db
+      .prepare(
+        `SELECT id, plan_date FROM task
+          WHERE recurrence_parent_id = ? AND title = ? AND plan_date IS NOT NULL AND plan_date >= ?`
+      )
+      .all(t.id, t.title, todayISO) as { id: number; plan_date: string }[];
+    for (const p of pending) {
+      let entry: CurriculumEntry | null;
+      try {
+        entry = await deps.queryForDate(secrets, dbId, p.plan_date);
+      } catch (e) {
+        console.warn(`agentic curriculum lookup failed for ${p.plan_date}: ${(e as Error).message}`);
+        continue;
+      }
+      if (!entry) continue;
+      db.prepare("UPDATE task SET title = ?, notes = ? WHERE id = ?").run(
+        formatCurriculumTitle(entry),
+        formatCurriculumNotes(entry),
+        p.id
+      );
+      enriched++;
+    }
+  }
+  return { enriched };
+}
+
 // ── combined sync ────────────────────────────────────────────────────────────
 
 export interface NotionSyncCounts extends PushCounts {

@@ -46,7 +46,8 @@ import { handleCommand } from "./assistant.ts";
 import { sendMorningDigest, shouldSendDigest } from "./digest.ts";
 import { loadDoctrine } from "./engine/doctrine.ts";
 import { runMsgPlans } from "./msgplans.ts";
-import { syncNotion, notionConfigured } from "./notion.ts";
+import { syncNotion, notionConfigured, enrichAgenticCurriculumTasks } from "./notion.ts";
+import { materializeRecurringTasks } from "./crm/recurring.ts";
 import { getSetting, setSetting } from "./db/db.ts";
 
 // node-cron ships no type declarations — minimal local surface via createRequire.
@@ -1191,6 +1192,36 @@ export function startWorkers(
         }
       } catch (e) {
         console.warn(`screen time auto-capture failed: ${(e as Error).message}`);
+      }
+
+      // Agentic-coding curriculum (owner ask 2026-08-07): Notion says WHAT each 30-minute
+      // session is for, POS says WHEN.
+      //
+      // Ordering is load-bearing, and getting it wrong would have shipped a half-working
+      // feature. A block carries its OWN title, copied from the task when the day is solved,
+      // and re-planning is gated on the anchor fingerprint — a task rename is not a calendar
+      // change, so it would never trigger a re-solve. Enriching after the sweep would rename
+      // the task while the calendar block (and the Google/Apple event pushed from it) kept
+      // the generic "Learn agentic coding" indefinitely.
+      //
+      // So: materialize the horizon's instances and enrich them FIRST. The days are then
+      // solved from already-correct titles, and every downstream copy inherits the topic with
+      // no new write path. materializeRecurringTasks is idempotent (generatePlan calls it
+      // again per-date and finds the instances already there).
+      //
+      // Gated on the token alone — this reads a database he shared directly with the
+      // integration, independent of whether the POS parent page was ever set up.
+      if (secrets.get("NOTION_TOKEN")) {
+        try {
+          const today = new Date().toISOString().slice(0, 10);
+          for (const d of upcomingDates(today, sweepDays)) materializeRecurringTasks(db, d, today);
+          const c = await enrichAgenticCurriculumTasks(db, secrets, today);
+          if (c.enriched > 0) {
+            notify?.(`Filled in ${c.enriched} agentic-coding session${c.enriched === 1 ? "" : "s"} from Notion`);
+          }
+        } catch (e) {
+          console.warn(`workers: agentic curriculum sync failed: ${(e as Error).message}`);
+        }
       }
 
       // The calendar moving under a plan re-solves it — today AND the next two days, since
