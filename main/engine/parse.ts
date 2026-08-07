@@ -77,7 +77,11 @@ export const endOfThisWeek = (refISO: string) => isoOf(onOrAfterWeekday(utcMidni
  */
 export type DayPart = "morning" | "afternoon" | "evening";
 
-const RECURRENCE_PATTERN = /\bevery\s*day\b|\beveryday\b|\bdaily\b|\beach day\b/i;
+// "30 mins A day" carries the same standing commitment as "every day" — the duration in
+// front is what separates it from "spend a day in Como" (owner miss 2026-08-07: "can u
+// dedicate 30 mins a day to learning agentic coding" was filed as a note).
+const RECURRENCE_PATTERN =
+  /\bevery\s*day\b|\beveryday\b|\bdaily\b|\beach day\b|(?:mins?|minutes?|h(?:ou)?rs?)\s+(?:a|per|each)\s+day\b/i;
 export function parseRecurrence(text: string): "daily" | null {
   return RECURRENCE_PATTERN.test(text ?? "") ? "daily" : null;
 }

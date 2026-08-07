@@ -43,6 +43,9 @@ const LIVE_STATUSES = ["inbox", "planned", "in_progress"] as const;
 /** The note pushTasks stamps on a commitment it pushed with no local task row. */
 export const COMMITMENT_MARKER_PREFIX = "pos:commitment:";
 
+/** The note pushTasks stamps on every task it pushes — the push's idempotency key. */
+export const TASK_MARKER_PREFIX = "pos:task:";
+
 /** Only the Google Task fields this module reads (keeps the fake API in tests honest). */
 export interface GoogleTaskLite {
   id?: string | null;
@@ -170,6 +173,12 @@ export function commitmentIdFromNotes(notes: string | null | undefined): number 
   return m ? Number(m[1]) : null;
 }
 
+/** The local task id a pushed Google task carries in its notes (TASK_MARKER_PREFIX). */
+export function taskIdFromNotes(notes: string | null | undefined): number | null {
+  const m = new RegExp(`${TASK_MARKER_PREFIX}(\\d+)`).exec(notes ?? "");
+  return m ? Number(m[1]) : null;
+}
+
 /** Reject-after-timeout. Does not cancel `p`; the partial result object is already valid. */
 function withDeadline<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -188,6 +197,7 @@ interface LocalTaskRow {
   id: number;
   title: string;
   hard_deadline_at: string | null;
+  plan_date: string | null;
   commitment_id: number | null;
   gtasks_id: string;
   /** Local half of the conflict clock (migration 11). NULL = never edited here. */
@@ -299,7 +309,7 @@ function pullFromGoogle(
 
   const locals = db
     .prepare(
-      `SELECT id, title, hard_deadline_at, commitment_id, gtasks_id, updated_at
+      `SELECT id, title, hard_deadline_at, plan_date, commitment_id, gtasks_id, updated_at
          FROM task
         WHERE gtasks_id IS NOT NULL AND status IN (${LIVE_STATUSES.map(() => "?").join(",")})`
     )
@@ -355,8 +365,34 @@ function pullFromGoogle(
       db.prepare("UPDATE task SET title = ? WHERE id = ?").run(gTitle, t.id);
       changed = true;
     }
-    if (remoteWins && gDue !== localDue && gDue !== pushedDueDateOf(t.hard_deadline_at)) {
-      db.prepare("UPDATE task SET hard_deadline_at = ? WHERE id = ?").run(gDue ? `${gDue}T00:00:00` : null, t.id);
+    // The push derives `due` from plan_date when there is no clock deadline (2026-08-06 fix),
+    // so OUR OWN date coming back must not read as an edit. Missing this turned every pushed
+    // task's plan_date into a MIDNIGHT hard deadline on the next pull — already in the past
+    // by morning, so the solver refused to place any of them ("deadline_conflict", owner-
+    // visible 2026-08-07: physics diagnostic, film/edit and three others all unplaced into
+    // a wide-open day).
+    const pushedFromPlanDate = t.plan_date && !t.hard_deadline_at ? t.plan_date : null;
+    if (
+      remoteWins &&
+      gDue !== localDue &&
+      gDue !== pushedDueDateOf(t.hard_deadline_at) &&
+      // guard only when there IS an echo to guard against — `null !== null` must not
+      // block the legitimate "owner removed the due date" clear below
+      (pushedFromPlanDate === null || gDue !== pushedFromPlanDate)
+    ) {
+      // Google's due is DATE-only (its API discards the time part) — it names the DAY the
+      // task belongs on, never a clock time. Moving a date on the phone moves plan_date; it
+      // must not fabricate a midnight deadline.
+      if (gDue) {
+        db.prepare("UPDATE task SET plan_date = ? WHERE id = ?").run(gDue, t.id);
+        if (t.hard_deadline_at) {
+          // A real clock deadline follows its task to the new day, keeping its time.
+          const time = t.hard_deadline_at.slice(10) || "T23:59:00";
+          db.prepare("UPDATE task SET hard_deadline_at = ? WHERE id = ?").run(`${gDue}${time}`, t.id);
+        }
+      } else {
+        db.prepare("UPDATE task SET hard_deadline_at = NULL WHERE id = ?").run(t.id);
+      }
       changed = true;
     }
     if (changed) result.pulled++;
@@ -383,17 +419,38 @@ function pullFromGoogle(
       continue;
     }
 
+    // A pos:task marker means POS itself pushed this row. An unlinked one is a stray
+    // from a crash between Google's insert and the local gtasks_id write (2026-08-07:
+    // "Call family" came back three times this way). Relink it to its task when that
+    // task lost its id; otherwise it is a duplicate of a row we already track — never
+    // an import either way.
+    const pushedTaskId = taskIdFromNotes(g.notes);
+    if (pushedTaskId != null) {
+      const local = db
+        .prepare("SELECT id, gtasks_id FROM task WHERE id = ?")
+        .get(pushedTaskId) as { id: number; gtasks_id: string | null } | undefined;
+      if (local && local.gtasks_id == null && g.deleted !== true) {
+        db.prepare("UPDATE task SET gtasks_id = ?, gtasks_list = ? WHERE id = ?")
+          .run(g.id, listOf.get(g.id) ?? null, local.id);
+        result.pulled++;
+      }
+      continue;
+    }
+
     // Created by the owner directly in Google Tasks (phone). Deleted or already-done
     // rows are history, not inbox items.
     if (g.deleted === true || g.status === "completed") continue;
     const title = (g.title ?? "").trim();
     if (!title) continue; // Google keeps empty draft rows; they are not tasks yet
     const due = dueDateOf(g.due);
+    // due is DATE-only in Google Tasks: it names the day (plan_date), never a clock time.
+    // Writing `${due}T00:00:00` here used to hand the solver a deadline that was already
+    // in the past the moment the day started.
     db.prepare(
       `INSERT INTO task (title, notes, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
-                         status, plan_date, hard_deadline_at, estimate_source, gtasks_id, gtasks_list)
-       VALUES (?, ?, 'admin', 2, 30, 30, 'inbox', ?, ?, 'inferred', ?, ?)`
-    ).run(title.slice(0, 200), g.notes ?? null, due, due ? `${due}T00:00:00` : null, g.id, listOf.get(g.id) ?? null);
+                         status, plan_date, estimate_source, gtasks_id, gtasks_list)
+       VALUES (?, ?, 'admin', 2, 30, 30, 'inbox', ?, 'inferred', ?, ?)`
+    ).run(title.slice(0, 200), g.notes ?? null, due, g.id, listOf.get(g.id) ?? null);
     result.pulled++;
   }
 }

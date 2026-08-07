@@ -69,3 +69,13 @@ describe("his actual sentence, end to end through the no-model path", () => {
     expect(gym.recurrence).toBe("daily");
   });
 });
+
+
+describe("recurrence — duration-a-day phrasing (owner miss 2026-08-07)", () => {
+  it("'30 mins a day' reads as daily; a bare 'a day' does not", () => {
+    expect(parseRecurrence("can u dedicate 30 mins a day to learning agentic coding")).toBe("daily");
+    expect(parseRecurrence("an hour per day of reading")).toBe("daily");
+    expect(parseRecurrence("spend a day in Como")).toBeNull();
+    expect(parseRecurrence("30 minutes each day for review")).toBe("daily");
+  });
+});

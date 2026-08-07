@@ -1019,7 +1019,14 @@ async function pushTasksInner(
       : t.plan_date
         ? new Date(`${t.plan_date}T00:00:00Z`).toISOString()
         : undefined;
-    const body = { title: t.title, notes: t.notes ?? undefined, due };
+    // The marker makes the push IDEMPOTENT across crashes. On 2026-08-07 the app was
+    // quit mid-push: Google had created the task, the local gtasks_id write never
+    // happened, and the next run re-inserted — then the pull imported the orphaned
+    // copies back as "new" tasks ("Call family" ×3 on the owner's screen). With the
+    // marker, the pull recognizes our own strays and relinks or skips them instead.
+    const marker = `pos:task:${t.id}`;
+    const notes = t.notes ? `${t.notes}\n${marker}` : marker;
+    const body = { title: t.title, notes, due };
     if (t.gtasks_id) {
       try {
         // A task imported from another list ('@default' — the phone's "My Tasks") lives

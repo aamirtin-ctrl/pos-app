@@ -72,6 +72,16 @@ describe("handleCommand — wake reports", () => {
     expect(n).toBe(0);
   });
 
+  it("a recurring time dedication routes to the planner, never to a note — his exact input", async () => {
+    // 2026-08-07: "can u dedicate 30 mins a day to learning agentic coding" was filed as a
+    // note by the model. The deterministic read (duration + a-day recurrence) must win.
+    const res = await handleCommand(deps(), "can u dedicate 30 mins a day to learning agentic coding");
+    expect(res.kind).toBe("plan");
+    const row = db.prepare("SELECT * FROM task ORDER BY id DESC LIMIT 1").get() as any;
+    expect(row.recurrence).toBe("daily");
+    expect(row.raw_estimate_minutes).toBe(30);
+  });
+
   it("a braindump that merely MENTIONS waking still schedules work", async () => {
     const res = await handleCommand(
       deps(),

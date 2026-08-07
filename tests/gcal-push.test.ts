@@ -95,7 +95,7 @@ interface FakeCalls {
  */
 function fakeDeps(
   opts: { throwOn?: keyof FakeCalls; error?: () => Error } = {}
-): GcalPushDeps & { calls: FakeCalls; deleted: string[]; listed: { id: string; summary: string }[] } {
+): GcalPushDeps & { calls: FakeCalls; deleted: string[]; listed: { id: string; summary: string }[]; taskBodies: any[] } {
   const calls: FakeCalls = {
     calendarsGet: 0, calendarsInsert: 0, eventsInsert: 0, eventsUpdate: 0, eventsDelete: 0, tasksInsert: 0,
   };
@@ -103,6 +103,8 @@ function fakeDeps(
   const deleted: string[] = [];
   /** What the fake calendar currently holds, for the orphan reconcile. */
   const listed: { id: string; summary: string }[] = [];
+  /** Bodies of every tasks.insert, so marker/notes shape is assertable. */
+  const taskBodies: any[] = [];
   const boom = opts.error ?? insufficientPermission;
   const guard = (k: keyof FakeCalls) => {
     calls[k]++;
@@ -160,8 +162,9 @@ function fakeDeps(
       async list() {
         return { data: { items: [] } };
       },
-      async insert() {
+      async insert(args: { tasklist: string; requestBody: unknown }) {
         guard("tasksInsert");
+        taskBodies.push(args.requestBody);
         return { data: { id: `t${++eventSeq}` } };
       },
       async update() {
@@ -169,7 +172,7 @@ function fakeDeps(
       },
     },
   };
-  return { calls, deleted, listed, calendar: () => calendar, tasks: () => tasks };
+  return { calls, deleted, listed, taskBodies, calendar: () => calendar, tasks: () => tasks };
 }
 
 let dir: string;
@@ -666,5 +669,30 @@ describe("protected events (done work is never touched again)", () => {
     expect(
       db.prepare("SELECT COUNT(*) n FROM gcal_tombstone").get()
     ).toEqual({ n: 0 }); // the protected one is discarded, not retried forever
+  });
+});
+
+
+// ── push idempotency marker ──────────────────────────────────────────────────
+//
+// 2026-08-07: the app was quit mid-push. Google had created the task; the local gtasks_id
+// write never happened; the next run re-inserted, and the pull imported the orphans back
+// as "new" tasks ("Call family" ×3). The marker is what lets the pull recognize our own
+// strays (gtasks-sync.taskIdFromNotes) instead of importing them.
+describe("pushTasks stamps pos:task markers", () => {
+  it("every inserted task carries pos:task:<id>, appended after any real notes", async () => {
+    const withNotes = Number(
+      db.prepare("INSERT INTO task (title, block_type, status, notes) VALUES ('Call family', 'admin', 'inbox', 'person: family')").run().lastInsertRowid
+    );
+    const bare = Number(
+      db.prepare("INSERT INTO task (title, block_type, status) VALUES ('Physics', 'deep_work', 'inbox')").run().lastInsertRowid
+    );
+    const deps = fakeDeps();
+    setSetting(db, "pos_tasklist_id", "POS_LIST");
+    await pushTasks(db, connected, deps);
+    expect(deps.taskBodies.length).toBe(2);
+    const notes = deps.taskBodies.map((b) => String(b.notes));
+    expect(notes.some((n) => n === `person: family\npos:task:${withNotes}`)).toBe(true);
+    expect(notes.some((n) => n === `pos:task:${bare}`)).toBe(true);
   });
 });

@@ -10,6 +10,7 @@ import { openDb, type Db } from "../main/db/db.ts";
 import {
   reconcileGoogleTasks,
   dueDateOf,
+  taskIdFromNotes,
   pushedDueDateOf,
   commitmentIdFromNotes,
   remoteIsNewer,
@@ -249,7 +250,10 @@ describe("Google-only tasks", () => {
     expect(row.notes).toBe("from the phone");
     expect(row.status).toBe("inbox");
     expect(row.plan_date).toBe("2026-08-09");
-    expect(row.hard_deadline_at).toBe("2026-08-09T00:00:00");
+    // Google's due is DATE-only: it names the day, never a midnight clock deadline. The
+    // old `${due}T00:00:00` here handed the solver a deadline already in the past the
+    // moment the day started (owner-visible 2026-08-07).
+    expect(row.hard_deadline_at).toBeNull();
   });
 
   it("leaves an undated phone task undated (no plan_date, so it lands in the inbox)", async () => {
@@ -460,5 +464,85 @@ describe("default-list pull", () => {
     const deps = fakeDeps([[]]);
     await reconcileGoogleTasks(db, connected, deps);
     expect(task(id).status).toBe("deferred");
+  });
+});
+
+
+// ── the midnight-deadline echo (owner-visible 2026-08-07) ────────────────────
+//
+// pushTasks derives `due` from plan_date; the pull then read OUR OWN date back as "the
+// owner edited the due date" and wrote hard_deadline_at = plan_date at midnight — a
+// deadline already in the past, so the solver refused to place every pushed task
+// ("deadline_conflict" into a wide-open day: physics diagnostic, film/edit and four more).
+describe("due-date echo and date-only semantics", () => {
+  it("our own plan_date coming back as due is NOT an edit", async () => {
+    const id = addTask({ title: "Film & edit Instagram content", gtasksId: "g1" });
+    db.prepare("UPDATE task SET plan_date = '2026-08-07' WHERE id = ?").run(id);
+    const deps = fakeDeps([[
+      // exactly what pushTasks sent: plan_date at UTC midnight, remote clock newer
+      { id: "g1", title: "Film & edit Instagram content", status: "needsAction",
+        due: "2026-08-07T00:00:00.000Z", updated: "2026-08-07T14:25:00.000Z" },
+    ]]);
+    await reconcileGoogleTasks(db, connected, deps);
+    const row = task(id);
+    expect(row.hard_deadline_at).toBeNull(); // never fabricate a midnight deadline
+    expect(row.plan_date).toBe("2026-08-07");
+  });
+
+  it("a genuinely moved due date moves plan_date — a day, not a midnight clock time", async () => {
+    const id = addTask({ title: "Errand", gtasksId: "g2" });
+    db.prepare("UPDATE task SET plan_date = '2026-08-07' WHERE id = ?").run(id);
+    const deps = fakeDeps([[
+      { id: "g2", title: "Errand", status: "needsAction",
+        due: "2026-08-09T00:00:00.000Z", updated: "2026-08-07T15:00:00.000Z" },
+    ]]);
+    const res = await reconcileGoogleTasks(db, connected, deps);
+    expect(res.pulled).toBe(1);
+    const row = task(id);
+    expect(row.plan_date).toBe("2026-08-09");
+    expect(row.hard_deadline_at).toBeNull();
+  });
+
+  it("an import from Google carries plan_date only — no fabricated deadline", async () => {
+    const deps = fakeDeps([[]], {
+      defaultListPages: [[{ id: "phys2", title: "Physics diagnostic", status: "needsAction", due: "2026-08-07T00:00:00.000Z" }]],
+    });
+    await reconcileGoogleTasks(db, connected, deps);
+    const row = db.prepare("SELECT * FROM task WHERE gtasks_id = 'phys2'").get() as any;
+    expect(row.plan_date).toBe("2026-08-07");
+    expect(row.hard_deadline_at).toBeNull();
+  });
+});
+
+// ── stray pushed rows relink instead of importing (the "Call family ×3" case) ─
+describe("pos:task marker", () => {
+  it("parses the marker out of pushed notes", () => {
+    expect(taskIdFromNotes("some note\npos:task:45")).toBe(45);
+    expect(taskIdFromNotes("pos:commitment:9")).toBeNull();
+    expect(taskIdFromNotes(null)).toBeNull();
+  });
+
+  it("an unlinked marker row RELINKS to its task instead of importing a duplicate", async () => {
+    const id = addTask({ title: "Call family" }); // crashed mid-push: no gtasks_id locally
+    const deps = fakeDeps([[
+      { id: "stray1", title: "Call family", status: "needsAction", notes: `pos:task:${id}` },
+    ]]);
+    const res = await reconcileGoogleTasks(db, connected, deps);
+    expect(task(id).gtasks_id).toBe("stray1");
+    const n = (db.prepare("SELECT COUNT(*) AS n FROM task WHERE title = 'Call family'").get() as any).n;
+    expect(n).toBe(1); // relinked, not duplicated
+    expect(res.pulled).toBe(1);
+  });
+
+  it("a marker row whose task is already linked elsewhere is skipped, never imported", async () => {
+    const id = addTask({ title: "Call family", gtasksId: "real1" });
+    const deps = fakeDeps([[
+      { id: "real1", title: "Call family", status: "needsAction", notes: `pos:task:${id}` },
+      { id: "stray2", title: "Call family", status: "needsAction", notes: `pos:task:${id}` },
+    ]]);
+    await reconcileGoogleTasks(db, connected, deps);
+    const n = (db.prepare("SELECT COUNT(*) AS n FROM task WHERE title = 'Call family'").get() as any).n;
+    expect(n).toBe(1);
+    expect(task(id).gtasks_id).toBe("real1"); // the real link is untouched
   });
 });

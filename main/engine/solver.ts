@@ -863,7 +863,9 @@ function solvePass(
  * planned. Forget to bump it and the fix ships, the tests pass, and the owner's calendar
  * keeps showing yesterday's bug — which is exactly what happened on 2026-08-06.
  */
-export const ENGINE_VERSION = "1.2.0";
+// 1.2.1: preferred anchors survive partial overlap with fixed ones (family-dinner-at-11AM);
+//        obligation vocabulary + family-calendar tier changed what counts as fixed.
+export const ENGINE_VERSION = "1.2.1";
 // 1.1.0: deadline windows (deferred_within_window)
 // 1.2.0: shutdown closes the day for assigned `personal` work too; unsplittable deep work
 //        over the block cap is placed whole instead of dropped; the morning routine expands

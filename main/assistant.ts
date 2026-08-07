@@ -11,6 +11,7 @@ import { makeQueryEmbedder } from "./llm/embeddings.ts";
 import { patchPersonWithExtract } from "./crm/people.ts";
 import { reconnectDue, refreshNextTouch } from "./crm/reconnect.ts";
 import * as planner from "./planner.ts";
+import { parseRecurrence } from "./engine/parse.ts";
 import { isWakeMessage, recordWake } from "./wake.ts";
 import { addManual } from "./worklog.ts";
 import {
@@ -556,6 +557,11 @@ Command: """${t.slice(0, 600)}"""`,
     // a single item with an explicit clock time is an event, not a braindump
     if (/\b(\d{1,2})(:\d{2})?\s*(am|pm)\b/i.test(t) && !/[,;\n]/.test(t)) intent = "add_event";
   }
+  // A recurring time dedication — a duration plus "every day"/"a day" — is a SCHEDULE
+  // request however politely it is phrased. The model filed "can u dedicate 30 mins a day
+  // to learning agentic coding" as a note (2026-08-07), and a note schedules nothing. The
+  // deterministic read wins: braindump it, and parseRecurrence tags the daily template.
+  if (parseRecurrence(t) && /\d+\s*(?:h(?:ou)?rs?|mins?|minutes?)\b/i.test(t)) intent = "plan_day";
   // Deterministic worklog prefix wins over everything (incl. the add_note "log" regex).
   if (/^log[:\s]/i.test(t)) intent = "log_work";
   // Same for the "remember: …" prefix — it must never be read as a note about a contact.
