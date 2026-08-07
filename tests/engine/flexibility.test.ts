@@ -300,11 +300,10 @@ describe("solver — determinism with preferred blocks present", () => {
     expect(JSON.stringify(r3)).toBe(JSON.stringify(r1));
   });
 
-  it("planner-placed work never double-books a minute (anchors may share an edge)", () => {
-    // Reading (preferred) and Doctor (fixed) partially overlap. Since 2026-08-07 a partial
-    // overlap KEEPS the preferred block in place — two real events brushing each other is
-    // how calendars look (the family-dinner case). The invariant that must hold instead:
-    // nothing the PLANNER placed overlaps anything at all.
+  it("the day is still a partition — displacement never double-books a minute", () => {
+    // Reading (preferred) and Doctor (fixed) partially overlap → Reading is released and
+    // re-placed elsewhere (any overlap displaces a preferred anchor, see above). Nothing
+    // in the final schedule may overlap anything else, anchor or placed work alike.
     const anchors: Anchor[] = [
       { startMin: 13 * 60, endMin: 14 * 60, blockType: "personal", title: "Reading", flexibility: "preferred" },
       { startMin: 13 * 60 + 30, endMin: 14 * 60 + 30, blockType: "personal", title: "Doctor", flexibility: "fixed" },
@@ -315,19 +314,14 @@ describe("solver — determinism with preferred blocks present", () => {
       mkTask({ blockType: "gym", estimatedMinutes: 60, title: "Gym" }),
     ];
     const r = solve(ts, doctrine, anchors);
-    // Both anchors keep their real minutes…
-    const reading = r.blocks.find((b) => b.title === "Reading")!;
-    expect(reading.startMin).toBe(13 * 60);
-    // …and every planner-placed block avoids every other block entirely.
-    const placed = r.blocks.filter((b) => !b.isAnchor);
-    for (const p of placed) {
-      for (const other of r.blocks) {
-        if (other === p) continue;
-        expect(
-          overlaps(p, other),
-          `"${p.title}" (${p.startMin}-${p.endMin}) overlaps "${other.title}" (${other.startMin}-${other.endMin})`
-        ).toBe(false);
-      }
+    const sorted = [...r.blocks].sort((a, b) => a.startMin - b.startMin || a.endMin - b.endMin);
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = sorted[i - 1];
+      const cur = sorted[i];
+      expect(
+        cur.startMin,
+        `"${cur.title}" (${cur.startMin}-${cur.endMin}) overlaps "${prev.title}" (${prev.startMin}-${prev.endMin})`
+      ).toBeGreaterThanOrEqual(prev.endMin);
     }
   });
 
@@ -541,24 +535,42 @@ describe("family dinner stays a dinner", () => {
     expect(inferFlexibility({ title: "reading", calendarName: "Personal" })).toBe("preferred");
   });
 
-  it("a preferred block PARTIALLY overlapped by a fixed anchor stays put", () => {
-    // Even if classification got it wrong again: dinner 19:00–22:00 vs standoff 18:00–19:30.
-    // Sharing an edge with a fixed event must not eject a block from its evening.
+  it("classification is what makes two real events sit still, not the solver — correctly tagged, the dinner never moves", () => {
+    // Dinner correctly reads as `fixed` now (family calendar + dinner-shaped title). Two
+    // FIXED anchors are never displaced by each other, however they overlap — this is the
+    // actual fix for the family-dinner incident, not a solver carve-out.
     const dinner: Anchor = {
       startMin: 19 * 60, endMin: 22 * 60, blockType: "personal",
-      title: "Dinner (misread as preferred)", flexibility: "preferred",
+      title: "Dinner at our home", flexibility: "fixed",
     };
     const standoff: Anchor = {
       startMin: 18 * 60, endMin: 19 * 60 + 30, blockType: "meeting",
       title: "Graduate St. Mark's standoff", flexibility: "fixed",
     };
     const r = solve([], doctrine, [dinner, standoff]);
-    const d = r.blocks.find((b) => b.title.startsWith("Dinner"))!;
+    const d = r.blocks.find((b) => b.title === "Dinner at our home")!;
     expect(d.startMin).toBe(19 * 60);
     expect(d.endMin).toBe(22 * 60);
   });
 
-  it("full coverage still releases — the dentist-on-reading case is unchanged", () => {
+  it("a preferred block is displaced by ANY overlap with a fixed one, partial included", () => {
+    // `preferred` is reserved for solo placeholders with no obligation signal — if
+    // classification ever mistags a real event as `preferred` again, the solver must not
+    // paper over it by leaving a partial double-booking on the schedule. A real fixed
+    // appointment landing on any part of a placeholder moves the placeholder, full stop.
+    const readingBlock: Anchor = {
+      startMin: 14 * 60, endMin: 15 * 60, blockType: "personal", title: "Reading", flexibility: "preferred",
+    };
+    const clipped: Anchor = {
+      // overlaps only the last 15 minutes of Reading — a brush, not a cover
+      startMin: 14 * 60 + 45, endMin: 15 * 60 + 30, blockType: "personal", title: "Doctor", flexibility: "fixed",
+    };
+    const r = solve([], doctrine, [readingBlock, clipped]);
+    const b = r.blocks.find((x) => x.title === "Reading")!;
+    expect(overlaps(b, clipped)).toBe(false);
+  });
+
+  it("full coverage still releases too — the dentist-on-reading case", () => {
     const readingBlock: Anchor = {
       startMin: 14 * 60, endMin: 15 * 60, blockType: "personal", title: "Reading", flexibility: "preferred",
     };
@@ -567,6 +579,6 @@ describe("family dinner stays a dinner", () => {
     };
     const r = solve([], doctrine, [readingBlock, dentist]);
     const b = r.blocks.find((x) => x.title === "Reading")!;
-    expect(overlaps(b, dentist)).toBe(false); // fully covered → moved out entirely
+    expect(overlaps(b, dentist)).toBe(false);
   });
 });

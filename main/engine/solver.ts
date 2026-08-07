@@ -323,21 +323,27 @@ function solveTiered(
   // slot hostage; they are simply re-placed.
   const released: ReleasedAnchor[] = flexibleAnchors.map((a) => ({ anchor: a, displacedBy: null }));
 
-  // A `preferred` block a `fixed` anchor fully COVERS cannot stay where it is — the two
-  // would paint on top of each other with nothing left over. It loses, unconditionally, in
-  // pass 1. This is the owner's literal case: the dentist appointment lands on top of the
-  // reading block.
+  // A `preferred` block whose minutes a `fixed` anchor claims — fully OR partially —
+  // cannot stay where it is. `preferred` is reserved for solo calendar entries that read
+  // as personal placeholders, not commitments (no attendees, no obligation/social
+  // wording, no shared-calendar signal — see inferFlexibility). Nothing in that
+  // definition survives a real appointment landing on top of it, by however many minutes.
+  // This is the owner's literal case: the dentist appointment lands on top of the reading
+  // block.
   //
-  // A PARTIAL overlap is different, and the distinction cost a real evening (2026-08-07): a
-  // three-hour family dinner (19:00–22:00, misclassified `preferred` at the time) brushed a
-  // fixed school event (18:00–19:30) for thirty minutes, was released as if it were a
-  // 30-minute reading block, and got re-seated at 11 AM. Two real events sharing an edge is
-  // how calendars actually look — he arrives late, the world does not move. The block stays
-  // put; only the non-overlapping minutes read as genuinely occupied either way.
+  // Two REAL events sharing an edge (he arrives late, the world does not move) is not a
+  // solver-level exception — it is what `fixed` anchors already do, since `fixed` anchors
+  // are never displaced by each other regardless of overlap. The family-dinner incident
+  // (2026-08-07: a 3-hour dinner brushed a fixed school event for 30 minutes and was
+  // relocated to 11 AM) was a MISCLASSIFICATION, not a solver bug — the dinner should have
+  // been `fixed` from the start (see SOCIAL_COMMITMENT_PATTERNS / family-calendar tier in
+  // gcal/sync.ts). Carving a partial-overlap exception in here to paper over that instead
+  // made a real bug: a personal placeholder clipped by 5 minutes of a real appointment
+  // would sit half-overlapping it in the final schedule. Fix classification, not this.
   const keptPreferred: Anchor[] = [];
   for (const p of preferredAnchors) {
-    const covered = fixedAnchors.find((f) => f.startMin <= p.startMin && f.endMin >= p.endMin);
-    if (covered) released.push({ anchor: p, displacedBy: covered.title });
+    const clash = fixedAnchors.find((f) => f.startMin < p.endMin && f.endMin > p.startMin);
+    if (clash) released.push({ anchor: p, displacedBy: clash.title });
     else keptPreferred.push(p);
   }
 
@@ -863,9 +869,13 @@ function solvePass(
  * planned. Forget to bump it and the fix ships, the tests pass, and the owner's calendar
  * keeps showing yesterday's bug — which is exactly what happened on 2026-08-06.
  */
-// 1.2.1: preferred anchors survive partial overlap with fixed ones (family-dinner-at-11AM);
-//        obligation vocabulary + family-calendar tier changed what counts as fixed.
-export const ENGINE_VERSION = "1.2.1";
+// 1.2.1: obligation vocabulary + family-calendar tier changed what counts as fixed
+//        (family-dinner-at-11AM fix).
+// 1.2.2: reverted 1.2.1's partial-overlap carve-out for preferred anchors — it was papering
+//        over the classification bug at the wrong layer, and let a real fixed appointment
+//        sit half-overlapping a personal placeholder in the output. Back to: ANY overlap
+//        with a fixed anchor displaces a preferred one (owner correction, 2026-08-07).
+export const ENGINE_VERSION = "1.2.2";
 // 1.1.0: deadline windows (deferred_within_window)
 // 1.2.0: shutdown closes the day for assigned `personal` work too; unsplittable deep work
 //        over the block cap is placed whole instead of dropped; the morning routine expands

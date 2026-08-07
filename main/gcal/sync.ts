@@ -542,16 +542,37 @@ export async function readAnchors(db: Db, secrets: SecretStore, dateISO: string)
   return readAnchorsLive(db, secrets, dateISO);
 }
 
+/**
+ * True for any Google calendar POS itself writes to — "POS — Planned" (pushed plan blocks)
+ * and the Apple mirror (2026-08-07 fix, see readAnchorsLive). Both are write destinations,
+ * never a source of anchors: reading either back is the app double-booking against its own
+ * output, or — for the mirror specifically — reading an event back under a "POS — " calendar
+ * name and misclassifying it as planner-owned when it originated as a real Apple commitment.
+ */
+export function isOwnWriteCalendar(
+  calendarId: string | null | undefined,
+  posId: string | null | undefined,
+  mirrorId: string | null | undefined
+): boolean {
+  if (!calendarId) return true; // no id at all is never a valid anchor source either
+  return calendarId === posId || calendarId === mirrorId;
+}
+
 /** The actual Google round-trip; updates the in-process cache AND the persisted snapshot. */
 async function readAnchorsLive(db: Db, secrets: SecretStore, dateISO: string): Promise<ExternalAnchor[]> {
   const cal = calApi(secrets);
   const posId = getSetting(db, "pos_calendar_id");
+  // Duplicated literal, not an import: applecal.ts already imports FROM this module
+  // (googleICalUids, persistDayCache, readDayCache) — importing its APPLE_MIRROR_SETTING_KEY
+  // back here would make the two files circularly dependent. Keep this string in sync with
+  // applecal.ts's APPLE_MIRROR_SETTING_KEY if that constant's value ever changes.
+  const mirrorId = getSetting(db, "apple_mirror_calendar_id");
   const dayStart = new Date(`${dateISO}T00:00:00`);
   const dayEnd = new Date(`${dateISO}T23:59:59`);
   const list = await cal.calendarList.list({ maxResults: 250 });
   const anchors: ExternalAnchor[] = [];
   for (const c of list.data.items ?? []) {
-    if (!c.id || c.id === posId) continue;
+    if (!c.id || isOwnWriteCalendar(c.id, posId, mirrorId)) continue;
     const events = await cal.events.list({
       calendarId: c.id,
       timeMin: dayStart.toISOString(),

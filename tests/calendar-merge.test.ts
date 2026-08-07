@@ -8,6 +8,7 @@
 import { describe, it, expect } from "vitest";
 import {
   mergeCalendarSources,
+  isOwnWriteCalendar,
   type MergeableAppleEvent,
   type MergeableGoogleAnchor,
 } from "../main/gcal/sync.ts";
@@ -158,5 +159,33 @@ describe("mergeCalendarSources", () => {
     );
     expect(skipped).toEqual([{ uid: "uid-standup@google.com", reason: "same-uid" }]);
     expect(anchors.map((a) => a.title)).toEqual(["Standup", "Gym"]);
+  });
+});
+
+// ── the Apple-mirror feedback loop (owner-visible 2026-08-07) ───────────────
+//
+// mirrorAppleSweep writes Apple events into a Google calendar named "POS — Apple". That
+// name starts with the same "POS — " prefix inferFlexibility uses to mean "planner-
+// authored, therefore flexible". readAnchorsLive read the mirrored dinner back as a
+// genuine Google anchor, tagged it flexible, and the merge (time+title fallback) preferred
+// that copy over the correctly-tiered `fixed` Apple original — a flexible anchor has no
+// task behind it, so the solver silently dropped the entire 3-hour dinner from the day.
+//
+// isOwnWriteCalendar is the fix: both calendars POS itself writes to are excluded from
+// ever being read back as an anchor source, so this class of event never reaches the merge
+// carrying the wrong tier in the first place.
+describe("isOwnWriteCalendar", () => {
+  it("excludes the planner calendar and the Apple mirror, nothing else", () => {
+    const posId = "pos123";
+    const mirrorId = "mirror456";
+    expect(isOwnWriteCalendar(posId, posId, mirrorId)).toBe(true);
+    expect(isOwnWriteCalendar(mirrorId, posId, mirrorId)).toBe(true);
+    expect(isOwnWriteCalendar("some-other-calendar", posId, mirrorId)).toBe(false);
+    expect(isOwnWriteCalendar(undefined, posId, mirrorId)).toBe(true); // no id → never a valid source
+  });
+
+  it("works before either calendar has been created (both ids null)", () => {
+    expect(isOwnWriteCalendar("anything", null, null)).toBe(false);
+    expect(isOwnWriteCalendar(null, null, null)).toBe(true);
   });
 });
