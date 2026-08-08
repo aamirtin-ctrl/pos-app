@@ -64,8 +64,26 @@ export function normalizePhone(input: string | null | undefined): NormResult | n
   if (!input) return null;
   const raw = input.trim();
   if (!raw) return null;
-  const hasPlus = raw.trimStart().startsWith("+");
-  const digits = raw.replace(/[^\d]/g, "");
+
+  // An EXTENSION is not part of the number. Every non-digit was being stripped, so
+  // "+1 (214) 908-8938 ext 5" became +121490889385 — a confidently wrong 13-digit number that
+  // matches nobody, splitting one contact into two and attributing their messages to neither.
+  // The whole point of this module is that a wrong link is worse than no link, so the
+  // extension is cut before the digits are read (audited 2026-08-08).
+  // No word boundaries on the "x" at all — "5551234x99" and "x200" are both ordinary written
+  // forms and neither has one. Over-matching is prevented by a CONSEQUENCE check instead of a
+  // boundary: the strip only stands if what remains is still a plausible number. So "fax
+  // 2149088938" — where the "x" is part of a label and the digits after it ARE the number —
+  // strips down to nothing usable and the original is kept.
+  const withoutExt = raw.replace(/\s*(?:,|;|ext(?:ension)?\.?|x|#)\s*\d{1,5}\s*$/i, "").trim();
+  const base = withoutExt.replace(/\D/g, "").length >= 7 ? withoutExt : raw;
+
+  // "00" is the international prefix the rest of the world dials; it means the same thing as
+  // "+". Treating it as ordinary digits made every such number unparseable — safe, but a
+  // contact silently unlinkable.
+  const normalizedPrefix = base.replace(/^\s*00(?=\d)/, "+");
+  const hasPlus = normalizedPrefix.trimStart().startsWith("+");
+  const digits = normalizedPrefix.replace(/[^\d]/g, "");
   if (!digits) return null;
 
   let e164: string | null = null;

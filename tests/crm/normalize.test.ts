@@ -87,3 +87,61 @@ describe("normalize", () => {
     expect(isGenericEmailDomain("")).toBe(false);
   });
 });
+
+// ── extensions and the international "00" prefix ────────────────────────────
+//
+// This module exists so a handle resolves to the RIGHT person, and identity.ts is explicit
+// that a wrong link is worse than no link. Two inputs broke that (audited 2026-08-08):
+//
+//   "+1 (214) 908-8938 ext 5" normalized to +121490889385 — every non-digit was stripped, so
+//   the extension became part of the number. A confidently wrong 13-digit value that matches
+//   nobody: the same contact reached by their plain number would resolve to a different
+//   person, or to none, and their history would split in two.
+//
+//   "0044 20 7946 0958" returned null. "00" is the international prefix most of the world
+//   dials and means exactly what "+" means. Safe (no wrong link) but the contact was silently
+//   unresolvable.
+//
+// His live data is clean — 162 US numbers and one international, none malformed — so this is
+// prevention, not repair.
+describe("normalizePhone — extensions and prefixes", () => {
+  const n = (s: string) => normalizePhone(s)?.norm ?? null;
+
+  it("drops an extension however it is written", () => {
+    for (const t of [
+      "+1 (214) 908-8938 ext 5",
+      "214-908-8938 x200",
+      "2149088938 extension 12",
+      "+1 214 908 8938 #7",
+      "+12149088938x99",
+      "214-908-8938, 44",
+    ]) {
+      expect(n(t), t).toBe("+12149088938");
+    }
+  });
+
+  it("keeps a label that merely CONTAINS an x, where the digits are the number", () => {
+    // "fax 2149088938" — the x is part of a word and what follows it IS the number. The strip
+    // is guarded by consequence rather than by a word boundary: it only stands if what remains
+    // is still a plausible number.
+    expect(n("fax 2149088938")).toBe("+12149088938");
+    expect(n("tel 2149088938")).toBe("+12149088938");
+  });
+
+  it("reads '00' as the international prefix it is", () => {
+    expect(n("0044 20 7946 0958")).toBe("+442079460958");
+    expect(n("+44 20 7946 0958")).toBe("+442079460958");
+  });
+
+  it("still refuses anything it cannot read, rather than guessing", () => {
+    for (const t of ["911", "", "not a phone", "12", "011 44 20 7946 0958"]) {
+      expect(n(t), t).toBeNull();
+    }
+  });
+
+  it("leaves the ordinary forms exactly as they were", () => {
+    for (const t of ["+12149088938", "12149088938", "2149088938", "(214) 908-8938", "214.908.8938"]) {
+      expect(n(t), t).toBe("+12149088938");
+    }
+  });
+});
