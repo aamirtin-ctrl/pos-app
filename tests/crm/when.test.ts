@@ -42,3 +42,56 @@ describe("parseWhen", () => {
     expect(iso(parseWhen("great chatting, take care", ANCHOR))).toBeNull();
   });
 });
+
+// ── hostile and abbreviated dates (audited 2026-08-08) ──────────────────────
+//
+// Found by handing parseWhen deliberately awkward input rather than the phrasings it was
+// written for. A due date is acted on, so a confident wrong answer is worse here than an
+// admission of ignorance — everything unreadable already returns null, and these now do too.
+describe("parseWhen — abbreviations, retrospect, and impossible dates", () => {
+  const BASE = new Date("2026-08-08T12:00:00Z"); // a Saturday
+  const iso = (t: string) => {
+    const d = parseWhen(t, BASE);
+    return d ? d.toISOString().slice(0, 10) : null;
+  };
+
+  it("'tmw' is tomorrow — the abbreviation in his own messages", () => {
+    // Commitment 113 in his live database: "Wanna come to library with me tmw am". "tmrw"
+    // and "tmr" were both handled; the one he actually typed was not, so it got no date.
+    expect(iso("wanna come to library with me tmw am")).toBe("2026-08-09");
+    for (const t of ["tmw", "tmrw", "tmr", "tomorrow", "tmoro", "tmorow"]) {
+      expect(iso(`let's do it ${t}`), t).toBe("2026-08-09");
+    }
+  });
+
+  it("a retrospective reference is not a due date", () => {
+    // The weekday rule would otherwise resolve "last friday" to the NEXT Friday: a future
+    // deadline invented out of a sentence about the past.
+    for (const t of ["last friday", "previous tuesday", "past monday", "last week"]) {
+      expect(iso(`we discussed it ${t}`), t).toBeNull();
+    }
+    // …while the forward-looking forms are untouched
+    expect(iso("next friday")).toBe("2026-08-21");
+    expect(iso("this friday")).toBe("2026-08-14");
+  });
+
+  it("an impossible calendar date is null, not the day it rolls over to", () => {
+    // Date.UTC silently rolls: "feb 30" became March 2 and "2026-13-45" became 14 Feb 2027.
+    expect(iso("due feb 30")).toBeNull();
+    expect(iso("due 2026-02-30")).toBeNull();
+    expect(iso("due 2026-13-45")).toBeNull();
+    expect(iso("the 31st of february")).toBeNull();
+    // real dates still resolve
+    expect(iso("due 2026-09-15")).toBe("2026-09-15");
+    expect(iso("due feb 28")).toBe("2027-02-28");
+  });
+
+  it("the day may sit on either side of the month name", () => {
+    // Only the trailing form was read, so "the 5th of September" silently became the 1st.
+    for (const t of ["the 5th of september", "5 september", "sep 5", "september 5"]) {
+      expect(iso(t), t).toBe("2026-09-05");
+    }
+    // a bare month still means the 1st, as before
+    expect(iso("september")).toBe("2026-09-01");
+  });
+});

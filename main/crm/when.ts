@@ -12,6 +12,20 @@ function midnight(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 const addDays = (d: Date, n: number) => new Date(d.getTime() + n * DAY);
+
+/**
+ * A UTC date only if that date really exists. Date.UTC silently rolls an impossible day into
+ * the next month — "feb 30" became March 2, and the garbage "2026-13-45" became 14 Feb 2027 —
+ * so a typo produced a confident wrong DUE DATE rather than an admission of ignorance
+ * (2026-08-08). Everything here already returns null for "I could not read that"; an
+ * impossible date is exactly that.
+ */
+function exactUTC(year: number, monthIdx: number, day: number): Date | null {
+  if (!Number.isFinite(year) || !Number.isFinite(monthIdx) || !Number.isFinite(day)) return null;
+  if (monthIdx < 0 || monthIdx > 11 || day < 1 || day > 31) return null;
+  const d = new Date(Date.UTC(year, monthIdx, day));
+  return d.getUTCFullYear() === year && d.getUTCMonth() === monthIdx && d.getUTCDate() === day ? d : null;
+}
 const addMonths = (d: Date, n: number) =>
   new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + n, d.getUTCDate()));
 
@@ -32,11 +46,14 @@ export function parseWhen(text: string, anchor: Date): Date | null {
 
   // Absolute ISO date wins.
   const iso = low.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
-  if (iso) return new Date(Date.UTC(+iso[1], +iso[2] - 1, +iso[3]));
+  if (iso) return exactUTC(+iso[1], +iso[2] - 1, +iso[3]);
 
   // Relative keywords.
   if (/\bday after tomorrow\b/.test(low)) return addDays(A, 2);
-  if (/\btomorrow\b|\btmrw\b|\btmr\b/.test(low)) return addDays(A, 1);
+  // "tmw" was missing while "tmrw" and "tmr" were present, and "tmw" is the one that turned
+  // up in his real data — commitment 113, "Wanna come to library with me tmw am", parsed with
+  // no date at all (2026-08-08).
+  if (/\btomorrow\b|\btmrw\b|\btmr\b|\btmw\b|\btmoro?w?\b/.test(low)) return addDays(A, 1);
   if (/\btoday\b|\btonight\b/.test(low)) return A;
   if (/\bnext week\b/.test(low)) return addDays(A, 7);
   if (/\bnext month\b/.test(low)) return addMonths(A, 1);
@@ -48,6 +65,11 @@ export function parseWhen(text: string, anchor: Date): Date | null {
   }
 
   if (/\b(this )?weekend\b/.test(low)) return onOrAfterWeekday(A, 6); // Saturday
+
+  // A RETROSPECTIVE reference names a day that has already gone. It is not a plan, and the
+  // weekday rule below would otherwise resolve "last friday" to the NEXT Friday — a future
+  // due date invented out of a sentence about the past (2026-08-08).
+  if (/\b(?:last|previous|past)\s+(?:mon|tue|wed|thu|fri|sat|sun|week|month)/.test(low)) return null;
 
   // Weekdays, optionally "this"/"next".
   const wd = low.match(/\b(this |next )?(mon|tue|wed|thu|fri|sat|sun)(?:day|s|nesday|rsday|urday)?\b/);
@@ -66,14 +88,21 @@ export function parseWhen(text: string, anchor: Date): Date | null {
   );
   if (mm) {
     const monthIdx = MONTHS[mm[1].slice(0, 3)];
+    // The day can sit on either side of the month: "sep 5" and "the 5th of September" are the
+    // same date. Only the trailing form was read, so the leading one silently became the 1st
+    // of the month — a wrong due date rather than a missing one (2026-08-08). After wins when
+    // both are present, since that is the form he actually writes.
     const after = cleaned.slice(mm.index! + mm[0].length);
-    const dayM = after.match(/\b([0-3]?\d)\b/);
+    const before = cleaned.slice(0, mm.index!);
+    const afterM = after.match(/\b([0-3]?\d)\b/);
+    const beforeM = before.match(/\b([0-3]?\d)(?:st|nd|rd|th)?\s+(?:of\s+)?$/);
+    const dayM = afterM ?? beforeM;
     const day = dayM && +dayM[1] >= 1 && +dayM[1] <= 31 ? +dayM[1] : 1;
     // Only accept a PLAUSIBLE 4-digit year (19xx/20xx) — a phone/number fragment isn't a year.
     const yearM = low.match(/\b(19|20)\d{2}\b/);
     let year = yearM ? +yearM[0] : anchor.getUTCFullYear();
     if (!yearM && monthIdx < anchor.getUTCMonth()) year += 1; // next upcoming, relative to anchor
-    return new Date(Date.UTC(year, monthIdx, day));
+    return exactUTC(year, monthIdx, day);
   }
 
   return null;
