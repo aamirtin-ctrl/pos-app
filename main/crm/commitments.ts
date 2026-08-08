@@ -85,6 +85,46 @@ import { parseWindow } from "../engine/parse.ts";
 export const REVIEW_CONFIDENCE = 0.7;
 /** Deterministic-fallback rows are raw message fragments, never rewrites — cap them here. */
 export const FALLBACK_CONFIDENCE = 0.5;
+
+/**
+ * Who owes whom, decided from the message alone — the no-LLM path's answer.
+ *
+ * The fallback hard-coded `i_owe_them` for everything, which is right for the common case
+ * (he promises someone something) and plainly wrong for the opposite one. On 2026-08-08 his
+ * review queue held "EURO 26 — I will be gone for the evening", written by Hudson, listed as
+ * something AAMIR owed Hudson. The interaction already knows whether the message came in or
+ * went out; the fallback simply never looked.
+ *
+ * Two signals, read against who was speaking:
+ *   a first-person promise ("I'll…", "let me…")  → the SPEAKER owes
+ *   a request ("can you…", "please…", "send me…") → the LISTENER owes
+ *
+ * When both appear ("can you send the deck? I'll pay you back"), the one stated FIRST wins —
+ * it is the point of the message, and the same tie-break the duration parser uses. When
+ * neither appears, nothing has been learned and the old default stands, so this can only
+ * ever move a row it has evidence about.
+ */
+const SELF_COMMIT_RE =
+  /\b(?:i'?ll|i will|i'?m gonna|i am gonna|i'?m going to|i am going to|let me|i can|i'?ve got|i got you)\b/i;
+const REQUEST_RE =
+  /\b(?:can you|could you|would you|will you|please|pls|send me|share|lmk|let me know|wanna|do you want|are you able)\b/i;
+
+export function fallbackDirection(
+  text: string | null | undefined,
+  messageDirection: string | null | undefined
+): CommitmentDirection {
+  const t = text ?? "";
+  const commitAt = t.search(SELF_COMMIT_RE);
+  const requestAt = t.search(REQUEST_RE);
+  if (commitAt < 0 && requestAt < 0) return "i_owe_them"; // no evidence — unchanged default
+
+  const speakerOwes = commitAt >= 0 && (requestAt < 0 || commitAt < requestAt);
+  const inbound = (messageDirection ?? "").toLowerCase() === "inbound";
+  // inbound  → the speaker is THEM;  outbound → the speaker is HIM.
+  if (speakerOwes) return inbound ? "they_owe_me" : "i_owe_them";
+  return inbound ? "i_owe_them" : "they_owe_me";
+}
+
 /**
  * Candidates looked at per run. The whole batch costs TWO LLM calls, so this is a prompt
  * -size bound, not a cost bound; anything past it waits for the next sync (its interaction
@@ -1032,7 +1072,7 @@ export async function extractCommitmentsLlm(
         pending.push({
           candidateN: c.n,
           personId: c.row.person_id,
-          direction: "i_owe_them",
+          direction: fallbackDirection(c.text, c.row.direction),
           description: p.description,
           dueAt: p.dueAt,
           kind: "task",
