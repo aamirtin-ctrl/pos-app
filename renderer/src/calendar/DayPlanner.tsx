@@ -6,7 +6,7 @@ import NotionTab from "./NotionTab.tsx";
 import {
   COLORS, DOCTRINE_NARRATION, FALLBACK_COLOR, GRID_END_MIN, GRID_START_MIN, GUTTER_PX,
   PX_PER_MIN, WINDOW_START_MIN, addDaysISO, buildItems, cardHeights, firstSentences, fmtDur,
-  fmtHour, fmtMin, freeGaps, layoutLanes, todayISO, yOf,
+  fmtHour, fmtMin, freeGaps, layoutLanes, todayISO, yOf, localDateISO,
   type DayData, type ExternalEvent, type Item, type LaidOutItem, type PlanView,
 } from "./shared.ts";
 
@@ -110,7 +110,7 @@ export default function DayPlanner() {
   const dayWheel = React.useRef(0);
   const shiftDay = (n: number) => {
     slideDir.current = n > 0 ? 1 : -1;
-    setDate((d: string) => new Date(new Date(`${d}T12:00:00`).getTime() + n * 86400000).toISOString().slice(0, 10));
+    setDate((d: string) => addDaysISO(d, n));
   };
   const onDayWheel = (e: React.WheelEvent) => {
     if (Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
@@ -380,7 +380,9 @@ export default function DayPlanner() {
     return Array.from({ length: 7 }, (_, i) => {
       const dd = new Date(d.getTime() + (i - dow) * 86400000);
       return {
-        iso: dd.toISOString().slice(0, 10),
+        // localDateISO, not toISOString: `dd` is local NOON, and east of UTC+12 that is the
+        // previous UTC day — the whole week strip would shift by one.
+        iso: localDateISO(dd),
         letter: dd.toLocaleDateString(undefined, { weekday: "narrow" }),
         num: dd.getDate(),
       };

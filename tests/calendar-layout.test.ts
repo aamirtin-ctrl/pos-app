@@ -11,6 +11,7 @@
 import { describe, it, expect } from "vitest";
 import {
   MIN_CARD_PX, PX_PER_MIN, buildItems, cardHeightPx, cardHeights, layoutLanes,
+  todayISO, addDaysISO, localDateISO,
   type Block, type ExternalEvent, type Item, type LaidOutItem, type PlanView,
 } from "../renderer/src/calendar/shared.ts";
 
@@ -191,5 +192,54 @@ describe("buildItems external/anchor dedupe", () => {
       { startMin: 700, endMin: 730, title: "Board call", blockType: "meeting" },
     ]);
     expect(items).toHaveLength(2);
+  });
+});
+
+// ── the calendar must open on the day he is actually living in ──────────────
+//
+// shared.todayISO seeds DayPlanner's initial date, decides `isToday` and `isPastDay`, and is
+// where the "Today" button jumps. It was `new Date().toISOString().slice(0, 10)` — the UTC
+// date — so west of UTC, for the last hours of every evening (America/Chicago from 19:00),
+// the app OPENED ON TOMORROW and rendered the actual today as a past day, greyed and behind
+// him. The same fault was fixed across the main process earlier on 2026-08-08; the renderer
+// is a separate bundle and had been missed.
+describe("renderer date helpers are local, not UTC", () => {
+  it("localDateISO reads the local calendar date at every hour", () => {
+    for (const hour of [0, 9, 12, 19, 20, 23]) {
+      // Constructed from local components, so this IS 2026-08-07 wherever the test runs.
+      expect(localDateISO(new Date(2026, 7, 7, hour, 30)), `${hour}:30 local`).toBe("2026-08-07");
+    }
+  });
+
+  it("todayISO agrees with the local clock, not with UTC", () => {
+    const now = new Date();
+    expect(todayISO()).toBe(localDateISO(now));
+    // Where the two genuinely differ (west of UTC late in the day), prove they differ — this
+    // is the bug, and it must not be reintroduced.
+    const evening = new Date(2026, 7, 7, 23, 30);
+    if (evening.getTimezoneOffset() > 0) {
+      expect(evening.toISOString().slice(0, 10)).not.toBe(localDateISO(evening));
+    }
+  });
+
+  it("addDaysISO steps CALENDAR days, across months, years and DST", () => {
+    expect(addDaysISO("2026-08-07", 1)).toBe("2026-08-08");
+    expect(addDaysISO("2026-08-07", -1)).toBe("2026-08-06");
+    expect(addDaysISO("2026-08-31", 1)).toBe("2026-09-01");
+    expect(addDaysISO("2026-12-31", 1)).toBe("2027-01-01");
+    expect(addDaysISO("2027-01-01", -1)).toBe("2026-12-31");
+    // both US DST transitions
+    expect(addDaysISO("2027-03-13", 1)).toBe("2027-03-14");
+    expect(addDaysISO("2027-03-14", 1)).toBe("2027-03-15");
+    expect(addDaysISO("2027-11-06", 1)).toBe("2027-11-07");
+    expect(addDaysISO("2027-11-07", 1)).toBe("2027-11-08");
+  });
+
+  it("a week of addDaysISO round-trips", () => {
+    let d = "2026-08-07";
+    for (let i = 0; i < 7; i++) d = addDaysISO(d, 1);
+    expect(d).toBe("2026-08-14");
+    for (let i = 0; i < 7; i++) d = addDaysISO(d, -1);
+    expect(d).toBe("2026-08-07");
   });
 });

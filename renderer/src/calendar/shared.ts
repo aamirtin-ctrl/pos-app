@@ -337,9 +337,33 @@ export function placePopover(
   };
 }
 
-export const todayISO = () => new Date().toISOString().slice(0, 10);
-export const addDaysISO = (iso: string, n: number) =>
-  new Date(new Date(`${iso}T12:00:00`).getTime() + n * 86400000).toISOString().slice(0, 10);
+/**
+ * The LOCAL calendar date, which is the one he is living in.
+ *
+ * `new Date().toISOString().slice(0, 10)` is the UTC date. West of UTC the two disagree for
+ * the last hours of every evening — America/Chicago from 19:00 — and this value seeds the day
+ * the calendar OPENS on (DayPlanner's initial state), decides `isToday`, decides `isPastDay`,
+ * and is where the "Today" button jumps. So from 7pm the app opened on TOMORROW and rendered
+ * the actual today as a past day, greyed and behind him.
+ *
+ * The same fault was fixed across the main process on 2026-08-08 (main/dates.ts); the
+ * renderer has its own copy because it is a separate bundle, and it had been missed.
+ */
+export const localDateISO = (d: Date): string =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+export const todayISO = () => localDateISO(new Date());
+
+/**
+ * `n` CALENDAR days from an ISO date. Advancing the date rather than adding 86_400_000ms,
+ * because a day is 23 or 25 hours twice a year. (The previous version anchored at local noon
+ * to dodge that, which worked — this states the intent instead of encoding it in a constant.)
+ */
+export const addDaysISO = (iso: string, n: number): string => {
+  const d = new Date(`${iso}T12:00:00`);
+  d.setDate(d.getDate() + n);
+  return localDateISO(d);
+};
 export const minOf = (iso: string) => parseInt(iso.slice(11, 13), 10) * 60 + parseInt(iso.slice(14, 16), 10);
 export const fmtMin = (m: number) => {
   const h = Math.floor(m / 60) % 24, mm = m % 60;
