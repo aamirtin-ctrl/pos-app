@@ -12,6 +12,7 @@ import {
   underCeiling,
   recordFailure,
   clearFailure,
+  inQuotaCooldown,
   lastFailure,
   failureIsCurrent,
   monthSpend,
@@ -65,6 +66,12 @@ export class LlmClient {
     if (!provider) return null;
     if (!underCeiling(this.db)) {
       console.warn(`llm: monthly ceiling reached; '${feature}' degrading to deterministic`);
+      return null;
+    }
+    // A quota refusal seconds ago answers for this call too. Without this every feature in
+    // the tick pays its own doomed round-trip to be told the same thing. See QUOTA_COOLDOWN_MS.
+    if (inQuotaCooldown(lastFailure(this.db))) {
+      console.warn(`llm: within quota cooldown; '${feature}' degrading to deterministic`);
       return null;
     }
     const model = MODELS[provider][tier];
