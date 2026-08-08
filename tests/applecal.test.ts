@@ -4,6 +4,8 @@
 
 import { describe, it, expect } from "vitest";
 import {
+  asString,
+  asList,
   FIELD_SEP,
   SCAN_ERROR_MARKER,
   parseAppleDate,
@@ -381,6 +383,55 @@ describe("parseAppleDate — hostile input", () => {
   it("still rejects the obviously unreadable", () => {
     for (const t of ["", "   ", "garbage", "9999-99-99T99:99:99"]) {
       expect(parseAppleDate(t), t).toBeNull();
+    }
+  });
+});
+
+// ── quoting names we do not control into an AppleScript program ─────────────
+//
+// Calendar names round-trip from Calendar.app, through the exclusion setting, and back into
+// the scan script. They are not under our control, and the script is source code.
+//
+// Quotes and backslashes were escaped; newlines were not. An AppleScript string literal
+// cannot span lines, so a calendar named with an embedded newline would not merely be
+// mis-escaped — it would make the whole program a syntax error and take the ENTIRE scan down,
+// losing every calendar's events for the day. That is the same silent-empty-day failure this
+// file was already bitten by in a different form (audited 2026-08-08).
+describe("AppleScript quoting", () => {
+  it("escapes the characters that would break out of a string literal", () => {
+    expect(asString('Work "Main"')).toBe('"Work \\"Main\\""');
+    expect(asString("C:\\path")).toBe('"C:\\\\path"');
+    expect(asString('a\\"b')).toBe('"a\\\\\\"b"');
+  });
+
+  it("escapes newlines, which no literal can contain", () => {
+    expect(asString("line1\nline2")).toBe('"line1\\nline2"');
+    expect(asString("line1\r\nline2")).toBe('"line1\\nline2"');
+    expect(asString("line1\rline2")).toBe('"line1\\nline2"');
+    // the whole point: the emitted literal stays on ONE line
+    expect(asString("a\nb")).not.toContain("\n");
+  });
+
+  it("leaves ordinary names alone", () => {
+    expect(asString("HYT Fam")).toBe('"HYT Fam"');
+    expect(asString("Holidays in United States")).toBe('"Holidays in United States"');
+    expect(asString("")).toBe('""');
+  });
+
+  it("a list of hostile names is still a single-line, well-formed literal", () => {
+    const list = asList(['a"b', "c\\d", "e\nf", "plain"]);
+    expect(list).not.toContain("\n");
+    expect(list.startsWith("{") && list.endsWith("}")).toBe(true);
+    expect(asList([])).toBe("{}");
+  });
+
+  it("the generated scan script survives a hostile calendar name", () => {
+    const script = buildEventsScript("2026-08-07", ['Bad"Name', "Two\nLines"]);
+    // Every line of the emitted program must have balanced quotes; an unterminated literal is
+    // what a raw newline would have produced.
+    for (const line of script.split("\n")) {
+      const quotes = (line.match(/(?<!\\)"/g) ?? []).length;
+      expect(quotes % 2, `unbalanced quotes in: ${line}`).toBe(0);
     }
   });
 });

@@ -348,13 +348,25 @@ export function runOsascript(script: string, timeoutMs = OSASCRIPT_TIMEOUT_MS): 
 
 const DATE_ISO_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
 
-/** Quote a string for AppleScript source. Backslash and double quote are the only escapes. */
-function asString(s: string): string {
-  return `"${(s ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+/**
+ * Quote a string for AppleScript source.
+ *
+ * Newlines matter as much as quotes: an AppleScript string literal cannot span lines, so a
+ * calendar named with an embedded newline would not merely be mis-escaped — it would make the
+ * whole program a syntax error and take the ENTIRE scan down, losing every calendar's events
+ * for the day. These names round-trip from Calendar.app through the exclusion setting and
+ * back into the script, so they are not under our control (audited 2026-08-08).
+ *
+ * Not an injection risk either way: with quotes escaped, an unterminated literal fails to
+ * compile rather than executing anything. But a scan that dies is the silent-empty-day
+ * failure this file has already been bitten by once.
+ */
+export function asString(s: string): string {
+  return `"${(s ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r\n|\r|\n/g, "\\n")}"`;
 }
 
 /** `{"a", "b"}` — an AppleScript list literal, or `{}` when empty. */
-function asList(items: readonly string[]): string {
+export function asList(items: readonly string[]): string {
   return items.length === 0 ? "{}" : `{${items.map(asString).join(", ")}}`;
 }
 
