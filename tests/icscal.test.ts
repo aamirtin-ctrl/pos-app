@@ -262,3 +262,61 @@ describe("subscriptions", () => {
     await expect(addSubscription(db, "not a url", undefined, noNetwork)).rejects.toThrow(/not a valid/);
   });
 });
+
+// ── DST: the grid is a wall clock, not an elapsed-time line ─────────────────
+//
+// endMin was derived as startMin + (end − start) in real milliseconds. That equals the wall
+// clock only on a 24-hour day: across a DST boundary a 01:00→04:00 event has two elapsed
+// hours and three wall hours, so the calendar ended it at 03:00. The Apple reader has always
+// avoided this (applecal.wallEpoch is UTC-based on purpose so its durations are wall minutes);
+// Google was fixed the same day. This was the last source still doing it the wrong way.
+const DST_FEED = [
+  "BEGIN:VCALENDAR",
+  "VERSION:2.0",
+  "PRODID:-//pos-tests//EN",
+  "BEGIN:VEVENT",
+  "UID:spring-1@pos-tests",
+  "DTSTAMP:20270301T000000Z",
+  "DTSTART:20270314T010000",
+  "DTEND:20270314T040000",
+  "SUMMARY:Across the spring-forward gap",
+  "END:VEVENT",
+  "BEGIN:VEVENT",
+  "UID:fall-1@pos-tests",
+  "DTSTAMP:20271101T000000Z",
+  "DTSTART:20271107T010000",
+  "DTEND:20271107T040000",
+  "SUMMARY:Across the fall-back repeat",
+  "END:VEVENT",
+  "BEGIN:VEVENT",
+  "UID:fall-late@pos-tests",
+  "DTSTAMP:20271101T000000Z",
+  "DTSTART:20271107T230000",
+  "DTEND:20271108T000000",
+  "SUMMARY:Late on the 25-hour day",
+  "END:VEVENT",
+  "END:VCALENDAR",
+].join("\r\n");
+
+describe("eventsFromParsed across DST", () => {
+  const parsed = () => ical.sync.parseICS(DST_FEED);
+
+  it("keeps wall-clock end on the 23-hour (spring forward) day", () => {
+    const e = eventsFromParsed(parsed(), "2027-03-14").find((x) => x.uid === "spring-1@pos-tests");
+    expect(e, "the event should be on the day").toBeTruthy();
+    expect(e!.startMin).toBe(60);
+    expect(e!.endMin, "04:00 must be minute 240, not 180").toBe(240);
+  });
+
+  it("keeps wall-clock end on the 25-hour (fall back) day", () => {
+    const e = eventsFromParsed(parsed(), "2027-11-07").find((x) => x.uid === "fall-1@pos-tests");
+    expect(e!.startMin).toBe(60);
+    expect(e!.endMin, "04:00 must be minute 240, not 300").toBe(240);
+  });
+
+  it("a late event on the 25-hour day still ends at midnight, not past it", () => {
+    const e = eventsFromParsed(parsed(), "2027-11-07").find((x) => x.uid === "fall-late@pos-tests");
+    expect(e!.startMin).toBe(23 * 60);
+    expect(e!.endMin).toBe(1440);
+  });
+});

@@ -82,6 +82,10 @@ export function icsBlockType(title: string): "meeting" | "personal" {
   return appleBlockType(title, "");
 }
 
+/** Local calendar date of a Date, as YYYY-MM-DD — the key the day window is keyed on. */
+const localDateOf = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
 /**
  * Expand one parsed feed into the timed events of a single LOCAL day.
  *
@@ -96,8 +100,15 @@ export function icsBlockType(title: string): "meeting" | "personal" {
 export function eventsFromParsed(parsed: CalendarResponse, dateISO: string): IcsEvent[] {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateISO)) throw new Error(`bad date: ${dateISO}`);
   const dayStart = new Date(`${dateISO}T00:00:00`);
-  // inclusive window end just before next midnight, so a 00:00-tomorrow start is out
-  const dayEnd = new Date(dayStart.getTime() + 86_400_000 - 1);
+  // Inclusive window end just before the NEXT LOCAL MIDNIGHT, so a 00:00-tomorrow start is
+  // out. Derived by advancing the date rather than adding 86_400_000ms: a calendar day is
+  // not always 24 hours. On the 25-hour DST day the fixed-milliseconds window fell an hour
+  // short and a 23:00 event was never returned at all — the whole evening simply missing from
+  // the feed — and on the 23-hour day it reached an hour INTO tomorrow and could pull in the
+  // next day's first event.
+  const nextMidnight = new Date(dayStart);
+  nextMidnight.setDate(nextMidnight.getDate() + 1);
+  const dayEnd = new Date(nextMidnight.getTime() - 1);
 
   const out: IcsEvent[] = [];
   for (const comp of Object.values(parsed ?? {})) {
@@ -117,9 +128,19 @@ export function eventsFromParsed(parsed: CalendarResponse, dateISO: string): Ics
       if (inst.isFullDay) continue;
       if (inst.event.status === "CANCELLED") continue; // cancelled single occurrence
       const startMin = inst.start.getHours() * 60 + inst.start.getMinutes();
-      const durationMin = Math.round((inst.end.getTime() - inst.start.getTime()) / 60_000);
-      // clamp: an event running past midnight only occupies the rest of this day
-      const endMin = Math.min(1440, durationMin > 0 ? startMin + durationMin : startMin + 15);
+      // WALL CLOCK, not elapsed milliseconds. The grid is a wall-clock line, so the end has
+      // to be read the same way the start is. Deriving it from (end − start) is equivalent
+      // only on a 24-hour day: across a DST boundary a 01:00→04:00 event has two elapsed
+      // hours and three wall hours, so it ended at 03:00 on the calendar (2026-08-07 audit).
+      // The Apple reader already avoids this by computing its duration from wall-clock
+      // components (applecal.wallEpoch, UTC-based on purpose); Google was fixed the same day.
+      // An end on a LATER date means the event runs through midnight — it occupies the rest
+      // of this day and no more.
+      const endsToday = localDateOf(inst.end) === dateISO;
+      const wallEnd = inst.end.getHours() * 60 + inst.end.getMinutes();
+      const rawEnd = endsToday ? wallEnd : 1440;
+      // A zero-length (or malformed) instance still deserves a visible sliver, as before.
+      const endMin = rawEnd > startMin ? Math.min(1440, rawEnd) : Math.min(1440, startMin + 15);
       out.push({
         uid: (inst.event.uid ?? ev.uid ?? "").trim(),
         title: summaryText(inst.summary),
