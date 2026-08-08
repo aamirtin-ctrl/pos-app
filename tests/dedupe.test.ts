@@ -20,6 +20,7 @@ import {
   contentHash,
   contentSeen,
   logExtraction,
+  CONTENT_DEDUPE_HOURS,
   slugifyTitle,
   dedupeKeyFor,
 } from "../main/crm/commitments.ts";
@@ -450,5 +451,63 @@ describe("cleanupDuplicateCommitments (one-shot backfill of what already landed)
     expect(rows).toHaveLength(1);
     expect(rows[0].id).toBe(keeper);
     expect(rows[0].confidence).toBe(0.95);
+  });
+});
+
+// ── saying the same thing again on another day must work ────────────────────
+//
+// The dedupe defends against one message arriving twice: iMessage echoes the note-to-self
+// thread and a braindump often goes to both the self-mail address and the self thread
+// (owner report 2026-08-05, "2 items landed ~4 times"). Those copies land within minutes.
+//
+// But the rule was "exactly once, EVER". Repeating a short sentence on a later day — "gym
+// today", "call mom", "physics diagnostic" — was therefore swallowed in silence: counted as
+// skipped, cursor advanced, no task created, nothing on screen to notice. Audited
+// 2026-08-08 and bounded to CONTENT_DEDUPE_HOURS.
+describe("content dedupe is bounded in time", () => {
+  const backdate = (hash: string, hours: number) =>
+    db.prepare("UPDATE extraction_log SET decided_at = datetime('now', ?) WHERE content_hash = ?")
+      .run(`-${hours} hours`, hash);
+
+  it("an echo minutes later is still suppressed", () => {
+    const h = contentHash("gym today");
+    logExtraction(db, null, h, "capture");
+    expect(contentSeen(db, h)).toBe(true);
+  });
+
+  it("the same sentence days later is NOT suppressed — it is a new instruction", () => {
+    const h = contentHash("gym today");
+    logExtraction(db, null, h, "capture");
+    backdate(h, 72);
+    expect(contentSeen(db, h)).toBe(false);
+  });
+
+  it("the boundary behaves — just inside suppressed, just outside allowed", () => {
+    const h = contentHash("call mom");
+    logExtraction(db, null, h, "capture");
+    backdate(h, CONTENT_DEDUPE_HOURS - 1);
+    expect(contentSeen(db, h), "just inside the window").toBe(true);
+    backdate(h, CONTENT_DEDUPE_HOURS + 1);
+    expect(contentSeen(db, h), "just outside the window").toBe(false);
+  });
+
+  it("re-deciding restamps the row, so the window slides with the latest delivery", () => {
+    // Without the restamp the row keeps its FIRST timestamp forever: a repeat processed a
+    // week later would leave the clock untouched, and that repeat's OWN echo minutes later
+    // would pass the window check and duplicate.
+    const h = contentHash("physics diagnostic");
+    logExtraction(db, null, h, "capture");
+    backdate(h, 72);
+    expect(contentSeen(db, h)).toBe(false); // the repeat gets through…
+    logExtraction(db, null, h, "capture"); // …and is logged again
+    expect(contentSeen(db, h), "its own echo must now be suppressed").toBe(true);
+  });
+
+  it("still collapses one message arriving by two channels", () => {
+    // The original bug: identical text from mail AND iMessage in the same sweep.
+    const h = contentHash("Everyday I need 30 minutes to film insta");
+    expect(contentSeen(db, h)).toBe(false);
+    logExtraction(db, null, h, "capture");
+    for (let i = 0; i < 3; i++) expect(contentSeen(db, h), `copy ${i + 2}`).toBe(true);
   });
 });

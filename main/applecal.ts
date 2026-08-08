@@ -3,6 +3,18 @@
 // READ: every event whose START falls on a given day, across ALL local calendars,
 //       via AppleScript (`osascript`). These join the planner's anchors alongside
 //       Google Calendar events, so the day view reflects the Mac's real calendar.
+//
+//       KNOWN LIMITATION (audited 2026-08-08, deliberately not fixed). "Whose START falls
+//       on the day" means an event that began YESTERDAY and runs into this morning is not
+//       returned at all — a red-eye landing at 08:00 blocks the evening it departed and
+//       leaves the arrival morning looking free. The Google reader handles this correctly
+//       (gcal/sync.dayWindowMinutes clamps a spanning event into each day it touches), and
+//       since his Google account is subscribed inside Calendar.app almost every event
+//       arrives by that path too, so the exposure is Apple-ONLY overnight events.
+//       Widening the `whose` clause to an overlap test (`end date > dayStart and start date
+//       < dayEnd`) is the fix, but this scan already costs 30-90s of CPU and was a real
+//       source of machine slowness, so it is not worth paying for that narrow case
+//       speculatively. Revisit if an Apple-only overnight event is ever actually missed.
 // WRITE: ONLY into a dedicated Google calendar named "POS — Apple". Never the
 //        primary calendar, never "POS — Planned". Mirroring is keyed on the Apple
 //        UID stored in extendedProperties.private.appleUid, so it is idempotent and

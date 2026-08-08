@@ -112,9 +112,34 @@ export function contentHash(text: string | null | undefined): string {
   return createHash("sha256").update(normalizeContent(text)).digest("hex");
 }
 
-/** True when this exact content was already decided (any verdict) — never re-send it. */
-export function contentSeen(db: Db, hash: string): boolean {
-  return !!db.prepare("SELECT 1 FROM extraction_log WHERE content_hash = ?").get(hash);
+/**
+ * How long identical text counts as the SAME delivery rather than a new instruction.
+ *
+ * The dedupe exists because one message genuinely arrives more than once: iMessage echoes
+ * the note-to-self thread, and a braindump often goes to both the self-mail address and the
+ * self thread (owner report 2026-08-05: "2 items landed ~4 times"). Those copies arrive
+ * within minutes of each other.
+ *
+ * The rule was "exactly once, EVER", which over-solves it. Saying the same short sentence
+ * again on a different day — "gym today", "call mom", "physics diagnostic" — is a new
+ * instruction, and it was being silently swallowed: counted as skipped, cursor advanced, no
+ * task, no error, nothing on screen to notice (audited 2026-08-08). A day is comfortably
+ * longer than any multi-channel echo or delivery delay and comfortably shorter than "I told
+ * it again."
+ */
+export const CONTENT_DEDUPE_HOURS = 24;
+
+/**
+ * True when this exact content was already decided RECENTLY (any verdict) — i.e. this is
+ * another copy of a message already handled, not the owner saying the same thing again.
+ */
+export function contentSeen(db: Db, hash: string, withinHours: number = CONTENT_DEDUPE_HOURS): boolean {
+  return !!db
+    .prepare(
+      `SELECT 1 FROM extraction_log
+        WHERE content_hash = ? AND decided_at >= datetime('now', ?)`
+    )
+    .get(hash, `-${withinHours} hours`);
 }
 
 /**
@@ -132,7 +157,12 @@ export function logExtraction(
     `INSERT INTO extraction_log (interaction_id, content_hash, verdict) VALUES (?, ?, ?)
      ON CONFLICT(content_hash) DO UPDATE SET
        verdict = excluded.verdict,
-       interaction_id = COALESCE(extraction_log.interaction_id, excluded.interaction_id)`
+       interaction_id = COALESCE(extraction_log.interaction_id, excluded.interaction_id),
+       -- The window in contentSeen only slides if re-deciding the same content restamps it.
+       -- Without this the row keeps its FIRST timestamp forever, so a repeat processed a
+       -- week later would leave the clock untouched and its own echo minutes afterwards
+       -- would pass the window check and duplicate.
+       decided_at = datetime('now')`
   ).run(interactionId, hash, verdict);
 }
 
