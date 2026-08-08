@@ -633,3 +633,32 @@ describe("solver — malformed anchors", () => {
     expect(r.blocks.some((b) => b.title === "Dinner")).toBe(true);
   });
 });
+
+// ── gym respects a deadline like everything else ────────────────────────────
+//
+// Gym is placed by its own rule (physical peak, sleep floor) rather than through the shared
+// work path, and in gaining that rule it lost the deadline filter every other path applies.
+// It did not even report the deadline when it gave up, passing a hard-coded null to
+// unplacedReason. Found by property fuzzing (tests/engine/solver-fuzz.test.ts, seed 2).
+describe("solver — gym and hard deadlines", () => {
+  it("places the gym before a deadline it can meet", () => {
+    const t = mkTask({ blockType: "gym", estimatedMinutes: 60, title: "Gym", deadlineMin: 12 * 60 });
+    const r = solve([t], doctrine, []);
+    const b = r.blocks.find((x) => x.taskId === t.id);
+    expect(b, "it fits before noon, so it should be placed").toBeTruthy();
+    expect(b!.endMin).toBeLessThanOrEqual(12 * 60);
+  });
+
+  it("reports it rather than scheduling after the deadline — 'gym before my 6pm class'", () => {
+    // 04:56 is before he is even awake, so no honest slot exists.
+    const t = mkTask({ blockType: "gym", estimatedMinutes: 179, title: "Gym", deadlineMin: 296 });
+    const r = solve([t], doctrine, []);
+    expect(r.blocks.some((x) => x.taskId === t.id), "must not be placed past its deadline").toBe(false);
+    expect(r.unplaced.map((u) => u.task.id)).toContain(t.id);
+  });
+
+  it("an undated gym is unaffected", () => {
+    const t = mkTask({ blockType: "gym", estimatedMinutes: 75, title: "Gym" });
+    expect(solve([t], doctrine, []).blocks.some((x) => x.taskId === t.id)).toBe(true);
+  });
+});

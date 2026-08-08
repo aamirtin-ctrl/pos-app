@@ -563,9 +563,16 @@ function solvePass(
   for (const t of tasks.filter((x) => x.blockType === "gym").sort(byId)) {
     take(t);
     const len = slotsFor(t.estimatedMinutes);
-    const cands = candidates("gym", len);
+    // Gym is placed by its own rule (physical peak, sleep floor) rather than through the
+    // shared work path, and in gaining that rule it lost the deadline filter every other
+    // path applies — it did not even report the deadline in its unplaced reason, passing a
+    // hard-coded null. So "gym before my 6pm class" was silently scheduled at 8pm.
+    // Found by property fuzzing (2026-08-08, seed 2): a gym task whose deadline fell before
+    // the wake time — impossible to satisfy — was placed at 10:00 rather than reported.
+    let cands = candidates("gym", len);
+    if (t.deadlineMin != null) cands = cands.filter((i0) => minOf(i0 + len) <= t.deadlineMin!);
     if (cands.length === 0) {
-      unplaced.push({ task: t, reason: unplacedReason("gym", len, null) });
+      unplaced.push({ task: t, reason: unplacedReason("gym", len, t.deadlineMin) });
       continue;
     }
     const fourH = sleepMin - (hc.min_gym_end_before_sleep_hours + 1) * 60; // 4h scored pref
