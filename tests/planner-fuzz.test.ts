@@ -18,7 +18,7 @@ import os from "node:os";
 import path from "node:path";
 import { openDb, type Db } from "../main/db/db.ts";
 import { SecretStore } from "../main/secrets.ts";
-import { generatePlan } from "../main/planner.ts";
+import { generatePlan, tasksUnaccountedFor } from "../main/planner.ts";
 import { BLOCK_TYPES } from "../main/engine/doctrine.ts";
 import type { Anchor } from "../main/engine/grid.ts";
 
@@ -185,6 +185,22 @@ describe("generatePlan invariants over random days", () => {
           `seed ${seed}: task ${t.id} is on ${DATE} but neither scheduled nor reported unplaced`
         ).toBe(true);
       }
+      db.prepare("DELETE FROM task").run();
+    }
+  });
+
+  it("the stale-plan trigger CONVERGES — a solved day never asks to be solved again", async () => {
+    // tasksUnaccountedFor drives a re-plan (planner.replanUpcoming). If any task could be
+    // neither scheduled nor reported, the trigger would fire on every tick forever: a
+    // 15-minute loop that re-solves and re-pushes his calendar with no new answer. This is
+    // the property that rules that out, checked against the same random corpus.
+    for (let seed = 1; seed <= SEEDS; seed++) {
+      const anchors = seedDay(seed);
+      await generatePlan(db, doctrineDir, secrets, null, DATE, deps(anchors));
+      expect(
+        tasksUnaccountedFor(db, DATE),
+        `seed ${seed}: the day still reports unaccounted work immediately after being solved`
+      ).toBe(0);
       db.prepare("DELETE FROM task").run();
     }
   });
