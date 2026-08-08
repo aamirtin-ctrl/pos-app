@@ -48,6 +48,7 @@ import { loadDoctrine } from "./engine/doctrine.ts";
 import { runMsgPlans } from "./msgplans.ts";
 import { syncNotion, notionConfigured, enrichAgenticCurriculumTasks } from "./notion.ts";
 import { materializeRecurringTasks } from "./crm/recurring.ts";
+import { todayISO, addDaysISO } from "./dates.ts";
 import { getSetting, setSetting } from "./db/db.ts";
 
 // node-cron ships no type declarations — minimal local surface via createRequire.
@@ -748,7 +749,7 @@ export async function cleanupDuplicateCommitments(
 
 /** Settings key marking the day's enrichment pass as done (one pass per calendar day). */
 export function enrichDayKey(now: Date = new Date()): string {
-  return `enrich_day:${now.toISOString().slice(0, 10)}`;
+  return `enrich_day:${todayISO(now)}`;
 }
 
 // ── auto-push sweep ──────────────────────────────────────────────────────────
@@ -862,7 +863,7 @@ export async function mirrorAppleSweep(
   const avail = await (opts.available ?? appleCalendarAvailable)();
   if (!avail.ok) return { ...out, skipped: "apple_unavailable" };
 
-  const today = opts.today ?? new Date().toISOString().slice(0, 10);
+  const today = opts.today ?? todayISO();
   const mirror = opts.mirror ?? mirrorToGoogle;
   for (const dateISO of upcomingDates(today, opts.days ?? REPLAN_HORIZON_DAYS)) {
     try {
@@ -917,8 +918,8 @@ export function plansOnStaleEngine(
   now: Date = new Date(),
   windowDays = STALE_ENGINE_WINDOW_DAYS
 ): StaleEnginePlan[] {
-  const today = now.toISOString().slice(0, 10);
-  const until = new Date(now.getTime() + windowDays * 86_400_000).toISOString().slice(0, 10);
+  const today = todayISO(now);
+  const until = addDaysISO(now, windowDays);
   return (
     db
       .prepare(
@@ -1046,7 +1047,7 @@ export function startWorkers(
   // does the same for subscribed feeds. Either way the in-process caches are hot
   // before the user first clicks Calendar, so the tab opens without a network wait.
   void (async () => {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = todayISO();
     try {
       await readAnchors(db, secrets, today);
     } catch (e) {
@@ -1180,7 +1181,7 @@ export function startWorkers(
       // Objective outcomes from yesterday, after midday so his own answers win.
       try {
         if (getSetting(db, "screentime_enabled") === "1" && new Date().getHours() >= 12) {
-          const target = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+          const target = addDaysISO(new Date(), -1);
           const key = `screentime_autocapture_${target}`;
           if (!getSetting(db, key) && screenTimeAvailable().ok) {
             const res = autoCaptureOutcomes(db, target);
@@ -1213,7 +1214,7 @@ export function startWorkers(
       // integration, independent of whether the POS parent page was ever set up.
       if (secrets.get("NOTION_TOKEN")) {
         try {
-          const today = new Date().toISOString().slice(0, 10);
+          const today = todayISO();
           const doc = loadDoctrine(resolveDoctrineDir());
           for (const d of upcomingDates(today, sweepDays)) materializeRecurringTasks(db, d, today, doc);
           const c = await enrichAgenticCurriculumTasks(db, secrets, today);

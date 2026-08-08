@@ -34,6 +34,7 @@ import { readAppleEvents, appleBlockType, excludedCalendarNames } from "./applec
 import { eventsForDate as icsEventsForDate, icsBlockType } from "./icscal.ts";
 import { wakeTimeFor } from "./wake.ts";
 import { materializeRecurringTasks } from "./crm/recurring.ts";
+import { todayISO } from "./dates.ts";
 
 const toIso = (dateISO: string, min: number) =>
   `${dateISO}T${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}:00`;
@@ -394,7 +395,7 @@ export async function generatePlan(
   // must not be offered to the solver again. Offering it is what duplicated his math test.
   // "Everyday" work for THIS date gets its instance now, before the pool below is read — so
   // a recurring template behaves as an ordinary task from here on, with no separate path.
-  materializeRecurringTasks(db, dateISO, (deps?.now ?? new Date()).toISOString().slice(0, 10), doctrine);
+  materializeRecurringTasks(db, dateISO, todayISO(deps?.now ?? new Date()), doctrine);
   const allTaskRows = listTasks(db, dateISO);
   const taskRows = allTaskRows.filter((r: any) => !pinnedTaskIds.has(r.id as number));
 
@@ -815,7 +816,7 @@ export async function moveBlockToDay(
   if (row.plan_date === targetDateISO) return { moved: false, error: "same_day" };
   // The past cannot be scheduled into — the grid floor would refuse every slot anyway, and
   // silently accepting the drop would look like it worked.
-  const today = (deps?.now ?? new Date()).toISOString().slice(0, 10);
+  const today = todayISO(deps?.now ?? new Date());
   if (targetDateISO < today) return { moved: false, error: "past_day" };
 
   db.transaction(() => {
@@ -1303,7 +1304,7 @@ export async function replanUpcoming(
   llm: LlmClient | null,
   opts: { days?: number; today?: string; deps?: ReplanDeps } = {}
 ): Promise<ReplanSweepResult> {
-  const today = opts.today ?? new Date().toISOString().slice(0, 10);
+  const today = opts.today ?? todayISO();
   const out: ReplanSweepResult = { checked: [], replanned: [], displaced: {}, freed: {} };
 
   for (const dateISO of upcomingDates(today, opts.days ?? REPLAN_HORIZON_DAYS)) {

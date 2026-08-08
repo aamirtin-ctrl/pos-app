@@ -1,6 +1,7 @@
 // ALL ipcMain handlers — the single typed boundary between renderer and main.
 // Channel names mirror the window.pos.* surface in renderer/src/pos.d.ts.
 
+import { todayISO } from "./dates.ts";
 import { ipcMain, shell, dialog, BrowserWindow } from "electron";
 import type { Db } from "./db/db.ts";
 import { getSetting, setSetting, hasVec } from "./db/db.ts";
@@ -451,7 +452,7 @@ export function registerIpc(deps: IpcDeps) {
     const c = db.prepare("SELECT id, description, due_at FROM commitment WHERE id = ?").get(id) as
       | { id: number; description: string; due_at: string | null } | undefined;
     if (!c) throw new Error("commitment not found");
-    const today = new Date().toISOString().slice(0, 10);
+    const today = todayISO();
     db.prepare(
       `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
         commitment_id, status, plan_date, hard_deadline_at, estimate_source)

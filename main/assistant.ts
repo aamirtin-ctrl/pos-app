@@ -13,6 +13,7 @@ import { reconnectDue, refreshNextTouch } from "./crm/reconnect.ts";
 import * as planner from "./planner.ts";
 import { parseRecurrence } from "./engine/parse.ts";
 import { isWakeMessage, recordWake } from "./wake.ts";
+import { todayISO } from "./dates.ts";
 import { addManual } from "./worklog.ts";
 import {
   contextBlock,
@@ -37,7 +38,7 @@ export interface AssistantResult {
   hits?: { type: string; label: string; sub: string; href: string }[];
 }
 
-const today = () => new Date().toISOString().slice(0, 10);
+const today = () => todayISO();
 
 // ── NL rules engine (gap #19; ported from PersonalCRM2 lib/llm.ts parseRuleRequest) ──
 // The user configures the CRM in prose: "my family group shouldn't show as follow-ups",
@@ -790,11 +791,11 @@ interface ParsedEvent {
 
 /** LLM first (handles "coffee w/ Raj a week from Tuesday"), deterministic fallback second. */
 async function parseEvent(text: string, llm: LlmClient | null): Promise<ParsedEvent | null> {
-  const todayISO = new Date().toISOString().slice(0, 10);
+  const todayISODate = todayISO();
   if (llm) {
     const res = await llm.call(
       "event_parse", "fast",
-      `Extract ONE calendar event. Today is ${todayISO} (${WEEKDAYS[new Date().getDay()]}).
+      `Extract ONE calendar event. Today is ${todayISODate} (${WEEKDAYS[new Date().getDay()]}).
 Return STRICT JSON only:
 {"title":"<short title, no date/time words>","date":"YYYY-MM-DD","start":"HH:MM" 24-hour,"minutes":<duration, default 60>,"block_type":"meeting"|"personal"}
 "meeting" if another person is involved, else "personal". Resolve relative dates against today. If no year is stated pick the nearest future occurrence.

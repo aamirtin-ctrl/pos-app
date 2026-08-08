@@ -122,3 +122,35 @@ describe("ENGINE_VERSION", () => {
     expect(maj > 1 || (maj === 1 && min >= 2)).toBe(true);
   });
 });
+
+// ── the evening hole (owner-facing, audited 2026-08-08) ─────────────────────
+//
+// The sweep window started at `now.toISOString().slice(0, 10)` — the UTC date. West of UTC
+// that becomes TOMORROW for the last hours of every evening (America/Chicago: from 19:00),
+// so `plan_date >= today` excluded the day actually on screen. An engine fix shipped in the
+// evening therefore never reached today's plan, which is precisely when it would be shipped
+// after a day of use. Verified against the real case: the 1.2.3 bump at 23:55 re-solved the
+// following day and left the current one stale.
+describe("plansOnStaleEngine — late in the evening", () => {
+  it("still flags TODAY at 22:00 local, when UTC has already rolled over", () => {
+    addPlan({ date: "2026-08-07", engine: "1.0.0" });
+    const evening = new Date(2026, 7, 7, 22, 0); // 22:00 local, by construction
+    expect(dates(plansOnStaleEngine(db, evening))).toContain("2026-08-07");
+  });
+
+  it("and at 23:59, the far edge", () => {
+    addPlan({ date: "2026-08-07", engine: "1.0.0" });
+    expect(dates(plansOnStaleEngine(db, new Date(2026, 7, 7, 23, 59)))).toContain("2026-08-07");
+  });
+
+  it("yesterday is still excluded — the window starts at today, not before it", () => {
+    addPlan({ date: "2026-08-06", engine: "1.0.0" });
+    expect(dates(plansOnStaleEngine(db, new Date(2026, 7, 7, 22, 0)))).not.toContain("2026-08-06");
+  });
+
+  it("the far end of the window is a calendar day out, not 24h of milliseconds", () => {
+    // Across a DST boundary a fixed-ms window lands on the wrong date at the edge.
+    addPlan({ date: "2027-03-14", engine: "1.0.0" }); // the 23-hour day
+    expect(dates(plansOnStaleEngine(db, new Date(2027, 2, 13, 22, 0), 1))).toContain("2027-03-14");
+  });
+});

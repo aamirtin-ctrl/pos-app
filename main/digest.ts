@@ -11,6 +11,7 @@
 // messaging.ts, so a minimal equivalent lives here with the identical
 // automation_denied mapping. Tests inject `runScript` — no osascript, no network.
 
+import { todayISO } from "./dates.ts";
 import { execFile } from "node:child_process";
 import type { Db } from "./db/db.ts";
 import { getSetting, setSetting } from "./db/db.ts";
@@ -42,7 +43,7 @@ export function isDigestReply(text: string | null | undefined): boolean {
 
 /** "YYYY-MM-DD" for the digest_* setting keys (UTC, matching the rest of the codebase). */
 export function digestDateISO(now: Date = new Date()): string {
-  return now.toISOString().slice(0, 10);
+  return todayISO(now);
 }
 
 // ── compose ──────────────────────────────────────────────────────────────────
