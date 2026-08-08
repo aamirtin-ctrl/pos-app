@@ -3,7 +3,7 @@
   "productName": "POS",
   "version": "0.1.0",
   "private": true,
-  "description": "Personal Operating System — relationships, calendar engine, messaging (local-first macOS app)",
+  "description": "Personal Operating System \u2014 relationships, calendar engine, messaging (local-first macOS app)",
   "main": "dist-main/main.cjs",
   "author": "Aamir Tinwala",
   "scripts": {
@@ -17,7 +17,9 @@
     "start": "npm run rebuild:electron && npm run build && electron .",
     "test": "vitest run",
     "migrate:from-postgres": "tsx scripts/migrate-from-postgres.ts",
-    "package": "npm run build && electron-builder --mac --arm64"
+    "package": "npm run build && electron-builder --mac --arm64",
+    "test:tz": "for TZ in Pacific/Midway Pacific/Honolulu America/Chicago UTC Asia/Tokyo Pacific/Kiritimati; do echo \"== TZ=$TZ\"; TZ=$TZ npm run -s test:electron || exit 1; done",
+    "test:electron": "ELECTRON_RUN_AS_NODE=1 electron node_modules/vitest/vitest.mjs run"
   },
   "dependencies": {
     "@google/genai": "^2.7.0",
