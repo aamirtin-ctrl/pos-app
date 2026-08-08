@@ -11,7 +11,7 @@ import { makeQueryEmbedder } from "./llm/embeddings.ts";
 import { patchPersonWithExtract } from "./crm/people.ts";
 import { reconnectDue, refreshNextTouch } from "./crm/reconnect.ts";
 import * as planner from "./planner.ts";
-import { parseRecurrence } from "./engine/parse.ts";
+import { parseRecurrence, statedMinutes } from "./engine/parse.ts";
 import { isWakeMessage, recordWake } from "./wake.ts";
 import { todayISO } from "./dates.ts";
 import { addManual } from "./worklog.ts";
@@ -553,7 +553,13 @@ Command: """${t.slice(0, 600)}"""`,
   if (intent === "question") {
     if (/\b(who|reach out|talk to|intro|connect me)\b/i.test(t) && /\babout|for|on|who\b/i.test(t)) intent = "find_people";
     if (/^(note|remember|met|log)\b/i.test(t)) intent = "add_note";
-    if (/\b(plan|schedule|braindump)\b/i.test(t) || /\d+\s*(h|hr|hrs|hours|min)/i.test(t)) intent = "plan_day";
+    // "names a duration" is statedMinutes' job, not a second, cruder regex. The digit-only
+    // version this replaced (/\d+\s*(h|hr|hrs|hours|min)/) could not see a WORD duration, so
+    // "gym for an hour tomorrow" was answered as a question — a context blob on screen and
+    // nothing scheduled — while "gym for 1 hour tomorrow" planned the day. Same lesson as the
+    // duplicated tapback pattern: two definitions of one idea drift, and the weaker one ends
+    // up on the path that matters (2026-08-08).
+    if (/\b(plan|schedule|braindump)\b/i.test(t) || statedMinutes(t) !== null) intent = "plan_day";
     if (/^(find|search|look ?up|show me|when did|what did)\b/i.test(t)) intent = "search";
     // a single item with an explicit clock time is an event, not a braindump
     if (/\b(\d{1,2})(:\d{2})?\s*(am|pm)\b/i.test(t) && !/[,;\n]/.test(t)) intent = "add_event";
