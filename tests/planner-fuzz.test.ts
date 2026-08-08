@@ -217,3 +217,58 @@ describe("generatePlan invariants over random days", () => {
     }
   });
 });
+
+// ── the two days a year that are not 24 hours long ──────────────────────────
+//
+// Twice a year his day is 23 or 25 hours. Every date bug found on 2026-08-08 was some form of
+// assuming otherwise, so the whole-day outcome is worth asserting rather than inferring from
+// the unit fixes: the grid is a wall clock bounded by wake and the shutdown ritual, so a DST
+// day should look exactly like any other. This is the test that notices if that stops being
+// true.
+describe("planning across a DST transition", () => {
+  const DST_DAYS = [
+    ["2027-03-13", "the day before spring forward"],
+    ["2027-03-14", "the 23-hour day"],
+    ["2027-03-15", "the day after"],
+    ["2027-11-06", "the day before fall back"],
+    ["2027-11-07", "the 25-hour day"],
+    ["2027-11-08", "the day after"],
+  ] as const;
+
+  for (const [DAY, label] of DST_DAYS) {
+    it(`${DAY} — ${label} — plans like any other day`, async () => {
+      const ins = db.prepare(
+        `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
+                           is_mit, status, plan_date, estimate_source)
+         VALUES (?, 'focused_work', 3, 90, 90, 0, 'inbox', ?, 'stated')`
+      );
+      for (let i = 0; i < 3; i++) ins.run(`task-${i}`, DAY);
+
+      await generatePlan(db, doctrineDir, secrets, null, DAY, {
+        anchors: async () => [],
+        now: new Date(`${DAY}T06:00:00`),
+      });
+      const pid = (db.prepare("SELECT MAX(id) id FROM plan WHERE plan_date = ?").get(DAY) as { id: number }).id;
+      const rows = db
+        .prepare("SELECT title, starts_at, ends_at FROM block WHERE plan_id = ? ORDER BY starts_at")
+        .all(pid) as { title: string; starts_at: string; ends_at: string }[];
+
+      expect(rows.length, "the day is still a day").toBeGreaterThan(0);
+      for (const b of rows) {
+        expect(b.starts_at.slice(0, 10), `${b.title} escaped the date`).toBe(DAY);
+        expect(Date.parse(b.ends_at), `${b.title} ends before it starts`).toBeGreaterThan(Date.parse(b.starts_at));
+      }
+      for (let i = 1; i < rows.length; i++) {
+        expect(
+          Date.parse(rows[i].starts_at),
+          `"${rows[i].title}" overlaps "${rows[i - 1].title}"`
+        ).toBeGreaterThanOrEqual(Date.parse(rows[i - 1].ends_at));
+      }
+      const unplaced = JSON.parse(
+        (db.prepare("SELECT unplaced_tasks u FROM plan WHERE id = ?").get(pid) as { u: string }).u
+      ) as unknown[];
+      expect(unplaced, "three 90-minute tasks fit in any of these days").toHaveLength(0);
+      db.prepare("DELETE FROM task").run();
+    });
+  }
+});
