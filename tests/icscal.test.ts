@@ -379,3 +379,52 @@ describe("weekly recurrence lands on the right LOCAL day", () => {
     expect(floatingDriftDays(late)).toBe(expected);
   });
 });
+
+// ── the drift correction must not disturb the other rule kinds ──────────────
+//
+// floatingDriftDays shifts every occurrence of a recurring event by a whole day when
+// DTSTART's UTC and local dates differ. That is right for the weekly case it was written
+// for, and it would be easy for it to be wrong for the others — a daily rule that skips a
+// day, or a monthly rule that lands on the 2nd. Self-review after the fix (2026-08-08).
+const recurring = (hhmm: string, rrule: string) =>
+  [
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//pos-tests//EN", "BEGIN:VEVENT", "UID:rr@pos-tests",
+    "DTSTAMP:20260601T000000Z", `DTSTART:20260701T${hhmm}00`, `DTEND:20260701T${hhmm}00`,
+    `RRULE:${rrule}`, "SUMMARY:thing", "END:VEVENT", "END:VCALENDAR",
+  ].join("\r\n");
+
+describe("recurrence kinds survive the floating-time correction", () => {
+  const count = (hhmm: string, rrule: string, dateISO: string) =>
+    eventsFromParsed(ical.sync.parseICS(recurring(hhmm, rrule)), dateISO).filter((e) => e.uid === "rr@pos-tests")
+      .length;
+
+  // Every case is checked at 09:00 (UTC and local dates agree — drift 0) AND at 20:00 (they
+  // differ in his zone — drift 1), so the correction is exercised in both states.
+  for (const hhmm of ["0900", "2000"]) {
+    it(`DAILY appears on every day (DTSTART ${hhmm})`, () => {
+      for (const d of ["2026-08-04", "2026-08-05", "2026-08-06"]) {
+        expect(count(hhmm, "FREQ=DAILY", d), d).toBe(1);
+      }
+    });
+
+    it(`MONTHLY lands on the 1st and nowhere else (DTSTART ${hhmm})`, () => {
+      expect(count(hhmm, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-08-01")).toBe(1);
+      expect(count(hhmm, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-09-01")).toBe(1);
+      expect(count(hhmm, "FREQ=MONTHLY;BYMONTHDAY=1", "2026-08-02")).toBe(0);
+    });
+
+    it(`WEEKLY BYDAY=MO,WE,FR hits exactly those days (DTSTART ${hhmm})`, () => {
+      expect(count(hhmm, "FREQ=WEEKLY;BYDAY=MO,WE,FR", "2026-08-03"), "Monday").toBe(1);
+      expect(count(hhmm, "FREQ=WEEKLY;BYDAY=MO,WE,FR", "2026-08-04"), "Tuesday").toBe(0);
+      expect(count(hhmm, "FREQ=WEEKLY;BYDAY=MO,WE,FR", "2026-08-05"), "Wednesday").toBe(1);
+      expect(count(hhmm, "FREQ=WEEKLY;BYDAY=MO,WE,FR", "2026-08-07"), "Friday").toBe(1);
+    });
+
+    it(`COUNT still terminates the series (DTSTART ${hhmm})`, () => {
+      // Three Wednesdays from 2026-07-01: Jul 1, 8, 15. August must be empty.
+      expect(count(hhmm, "FREQ=WEEKLY;BYDAY=WE;COUNT=3", "2026-07-08")).toBe(1);
+      expect(count(hhmm, "FREQ=WEEKLY;BYDAY=WE;COUNT=3", "2026-07-15")).toBe(1);
+      expect(count(hhmm, "FREQ=WEEKLY;BYDAY=WE;COUNT=3", "2026-08-05"), "past the count").toBe(0);
+    });
+  }
+});
