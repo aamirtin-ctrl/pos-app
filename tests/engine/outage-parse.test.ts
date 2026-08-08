@@ -154,6 +154,26 @@ describe("titles after the duration is stripped", () => {
     expect(titleFromFragment("gym everyday")).toBe("Gym");
   });
 
+  it("drops a trailing WHEN — the date was already captured from it", () => {
+    // A block on Saturday titled "… tomorrow" reads as though it belongs on Sunday.
+    expect(titleFromFragment("read that essay on making content tonight")).toBe(
+      "Read that essay on making content"
+    );
+    expect(titleFromFragment("call the bank today")).toBe("Call the bank");
+    expect(titleFromFragment("finish the deck this week")).toBe("Finish the deck");
+    // …but a WHEN in the middle is part of the sentence, not a trailing marker
+    expect(titleFromFragment("prep tomorrow's demo")).toMatch(/tomorrow/i);
+  });
+
+  it("strips the scheduling verb around a gerund — his errands sentence", () => {
+    // "I need to spend 45 minutes doing errands to return stuff tomorrow" was titled
+    // "Spend doing errands to return stuff tomorrow" on his real calendar.
+    expect(titleFromFragment("I need to spend 45 minutes doing errands to return stuff tomorrow")).toBe(
+      "Errands to return stuff"
+    );
+    expect(titleFromFragment("spend time doing the pset this week")).toBe("The pset");
+  });
+
   it("never returns an empty title", () => {
     // Every strip could in principle consume the whole fragment; the original must come back.
     for (const t of ["30 mins", "an hour", "to", "on the"]) {

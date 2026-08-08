@@ -712,6 +712,9 @@ const TITLE_STRIP = [
   // duration and was left titled "Slot to edit/film insta content".
   /^(?:slot|set|block|carve|reserve|schedule|spend|dedicate|allocate)\s+(?:aside\s+|out\s+)?(?:some\s+)?(?:to|for|on)\s+/i,
   /^(?:slot|carve|reserve|dedicate|allocate)\s+/i,
+  // "spend 45 minutes DOING errands" loses its duration and is left as "Spend doing errands".
+  /^(?:spend\s+)?(?:some\s+)?(?:time\s+)?doing\s+/i,
+  /^spend\s+(?=\w)/i,
   /^(?:spend\s+)?(?:some\s+)?time\s+(?:to|for|on)\s+/i,
   /^in\s+total\s+/i,
   // Addressed-to-the-assistant phrasing: "can u dedicate 30 mins a day to learning agentic
@@ -749,6 +752,13 @@ export function titleFromFragment(fragment: string): string {
     // block called "… everyday" reads wrong on a calendar that shows one day.
     .replace(/\band\s+a\s+(?:half|quarter)\b/gi, " ")
     .replace(/\b(?:every\s*day|everyday|daily|each\s+day)\b/gi, " ")
+    // A trailing "tomorrow"/"tonight"/"this week" is WHEN, and parseWindow/parseDayPart have
+    // already taken it. Leaving it on the card is noise at best and wrong at worst — a block
+    // sitting on Saturday titled "… tomorrow" reads as though it belongs on Sunday.
+    .replace(
+      /[\s,]+(?:today|tomorrow|tmrw|tonight|tonite|this\s+(?:week|weekend|morning|afternoon|evening)|next\s+week)\s*$/i,
+      " "
+    )
     .replace(/\s{2,}/g, " ")
     .trim();
   // Strip repeatedly: speech stacks these ("maybe about like to go through…").
