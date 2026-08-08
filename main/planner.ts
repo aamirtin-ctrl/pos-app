@@ -1266,6 +1266,51 @@ export function tasksAwaitingPlan(db: Db, dateISO: string): number {
   ).n;
 }
 
+/**
+ * Schedulable work sitting on a day whose CURRENT plan neither scheduled nor reported.
+ *
+ * The re-plan triggers were "the calendar moved" (anchor fingerprint) and "the solver
+ * changed" (engine version). Neither notices the third way a stored plan goes stale: the day
+ * gained a task after it was solved. A task deferred INTO the day from the day before, one
+ * imported from Google Tasks or Notion for a future date, one he typed for Saturday — all
+ * land on a day that already has a plan, and tasksAwaitingPlan deliberately returns 0 there.
+ * Nothing else looked, so the work sat with a plan_date and no block: invisible on the
+ * calendar and indistinguishable from having been thrown away, which is the same shape as
+ * the deferral bug fixed on 2026-08-06 and the reason that fix was only half of it.
+ *
+ * "Accounted for" is deliberately generous — placed OR listed in unplaced_tasks. A day that
+ * honestly reported it could not fit the work is not stale; only a day that has never
+ * considered the task at all is.
+ */
+export function tasksUnaccountedFor(db: Db, dateISO: string): number {
+  const plan = db
+    .prepare("SELECT id, unplaced_tasks FROM plan WHERE plan_date = ? ORDER BY id DESC LIMIT 1")
+    .get(dateISO) as { id: number; unplaced_tasks: string | null } | undefined;
+  if (!plan) return 0; // no plan yet — that is tasksAwaitingPlan's job, not this one
+
+  const known = new Set<number>();
+  for (const b of db.prepare("SELECT task_id FROM block WHERE plan_id = ? AND task_id IS NOT NULL").all(plan.id) as {
+    task_id: number;
+  }[]) {
+    known.add(b.task_id);
+  }
+  try {
+    for (const u of JSON.parse(plan.unplaced_tasks ?? "[]") as { taskId?: number }[]) {
+      if (typeof u?.taskId === "number") known.add(u.taskId);
+    }
+  } catch {
+    /* unreadable bookkeeping is not a reason to re-plan on a loop — treat as nothing known */
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT id FROM task
+        WHERE plan_date = ? AND status IN (${SCHEDULABLE_TASK_STATUSES.map(() => "?").join(",")})`
+    )
+    .all(dateISO, ...SCHEDULABLE_TASK_STATUSES) as { id: number }[];
+  return rows.filter((t) => !known.has(t.id)).length;
+}
+
 export function upcomingDates(today: string, days: number): string[] {
   const base = Date.parse(`${today}T00:00:00Z`);
   const out: string[] = [];
@@ -1322,6 +1367,16 @@ export async function replanUpcoming(
       // calendar it was indistinguishable from having been thrown away. A deferral that lands
       // on a day nobody plans IS a deletion, whatever the database says.
       if (tasksAwaitingPlan(db, dateISO) > 0) {
+        await generatePlan(db, doctrineDir, secrets, llm, dateISO, opts.deps);
+        out.replanned.push(dateISO);
+        continue;
+      }
+      // ── a day whose plan has never seen some of its work gets re-solved ──
+      //
+      // The other half of the same bug. Deferral onto an UNPLANNED day was fixed above; work
+      // arriving on a day that already HAS a plan was not, and no other trigger looks at the
+      // task pool. See tasksUnaccountedFor.
+      if (tasksUnaccountedFor(db, dateISO) > 0) {
         await generatePlan(db, doctrineDir, secrets, llm, dateISO, opts.deps);
         out.replanned.push(dateISO);
         continue;
