@@ -1504,6 +1504,19 @@ export async function reconcileDayEvents(
   const out: ReconcileDayResult = { seen: 0, removed: 0 };
   const calId = getSetting(db, "pos_calendar_id");
   if (!calId) return out;
+  // HARD GUARD — this is the only UNBOUNDED delete in the app. Every other delete names a
+  // specific event POS created, so pointing one at the wrong calendar merely 404s; this one
+  // removes everything on the calendar that no block claims. Aimed at "primary" it would
+  // erase his real events, and aimed at the Apple mirror it would erase every mirrored
+  // event, since none of those are claimed by blocks either.
+  //
+  // mirrorToGoogle has carried exactly this guard since it shipped ("refusing to write
+  // outside POS — Apple"). The more dangerous operation was the one without it (2026-08-08).
+  const mirrorId = getSetting(db, "apple_mirror_calendar_id");
+  if (calId === "primary" || (mirrorId && calId === mirrorId)) {
+    console.warn(`gcal: refusing to sweep "${calId}" — not the planner's own calendar`);
+    return out;
+  }
   return withReconsentMapping(async () => {
     const cal = pushDeps(secrets, deps).calendar();
     const res = await cal.events.list({

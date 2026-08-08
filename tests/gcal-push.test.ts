@@ -586,6 +586,49 @@ describe("reconcileDayEvents", () => {
     expect(deps.deleted.sort()).toEqual(["orphan-1", "orphan-2"]);
   });
 
+  // ── the guard on the app's only unbounded delete (2026-08-08) ────────────
+  //
+  // Every other delete in the app names a specific event POS created, so aiming one at the
+  // wrong calendar merely 404s. This one removes everything the blocks do not claim. Aimed
+  // at "primary" it would erase his real events; aimed at the Apple mirror it would erase
+  // every mirrored event, since none of those are claimed by blocks either. mirrorToGoogle
+  // has carried this guard since it shipped; the more dangerous operation did not.
+  it("refuses to sweep the primary calendar", async () => {
+    addPlan({ blocks: 1 });
+    setSetting(db, "pos_calendar_id", "primary");
+    const deps = fakeDeps();
+    deps.listed.push({ id: "a-real-event", summary: "Dinner with family" });
+
+    const res = await reconcileDayEvents(db, connected, new Date().toISOString().slice(0, 10), deps);
+    expect(res.removed).toBe(0);
+    expect(deps.deleted).toEqual([]);
+  });
+
+  it("refuses to sweep the Apple mirror calendar", async () => {
+    addPlan({ blocks: 1 });
+    setSetting(db, "pos_calendar_id", "MIRROR_CAL");
+    setSetting(db, "apple_mirror_calendar_id", "MIRROR_CAL");
+    const deps = fakeDeps();
+    deps.listed.push({ id: "mirrored-dinner", summary: "Dinner at our home" });
+
+    const res = await reconcileDayEvents(db, connected, new Date().toISOString().slice(0, 10), deps);
+    expect(res.removed).toBe(0);
+    expect(deps.deleted).toEqual([]);
+  });
+
+  it("still sweeps the planner's own calendar", async () => {
+    // The guard must not turn the feature off.
+    addPlan({ blocks: 1 });
+    setSetting(db, "pos_calendar_id", "POS_CAL");
+    setSetting(db, "apple_mirror_calendar_id", "MIRROR_CAL");
+    const deps = fakeDeps();
+    deps.listed.push({ id: "orphan-x", summary: "stale" });
+
+    const res = await reconcileDayEvents(db, connected, new Date().toISOString().slice(0, 10), deps);
+    expect(res.removed).toBe(1);
+    expect(deps.deleted).toEqual(["orphan-x"]);
+  });
+
   it("never deletes an event a block still points at", async () => {
     const planId = addPlan({ blocks: 1 });
     setSetting(db, "pos_calendar_id", "POS_CAL");
