@@ -485,10 +485,20 @@ const NUM_PHRASE_RE = `${NUM_WORD_RE}(?:[ -](?:one|two|three|four|five|six|seven
 /** Every way an hour is written or said: "2h", "2 hr", "2hrs", "two hours". */
 const HOUR_UNIT_RE = `(?:hours?|hrs?|h)`;
 
+/**
+ * A written number, INCLUDING the leading-dot form. "\\b\\d+(?:\\.\\d+)?" cannot match ".5",
+ * so ".5 hours" matched only the 5 and became FIVE HOURS — a ten-fold error on a duration
+ * people really do type (audited 2026-08-08). The lookbehind stops "1.5" being re-read as
+ * ".5" and stops a version-like "1.5.5" contributing a second number.
+ */
+const DECIMAL_RE = `(?<![\\d.])(?:\\d+(?:\\.\\d+)?|\\.\\d+)`;
+
 /** "forty five" → 45, "twenty" → 20, "2" → 2. Null when `w` names no number. */
 function wordValue(w: string): number | null {
   const t = w.trim().toLowerCase().replace(/-/g, " ");
-  if (/^\d+(?:\.\d+)?$/.test(t)) return parseFloat(t);
+  // ".5" as well as "0.5" — the leading-dot form is what the duration regex now captures, and
+  // rejecting it here would silently drop the whole duration (2026-08-08).
+  if (/^(?:\d+(?:\.\d+)?|\.\d+)$/.test(t)) return parseFloat(t);
   if (t in NUMBER_WORDS) return NUMBER_WORDS[t];
   // "forty five" / "twenty two": tens + units, the way it is spoken.
   const m = t.match(/^(twenty|thirty|forty|fourty|fifty)\s+(one|two|three|four|five|six|seven|eight|nine)$/);
@@ -530,14 +540,34 @@ export function statedMinutes(text: string): number | null {
   // two durations out of one segment, but when it cannot, the duration the sentence states
   // FIRST is the one attached to the work it is next to. (Owner-visible as the film/edit task
   // scheduled at the gym's length, 2026-08-07.)
-  const hrs = low.match(new RegExp(`\\b(\\d+(?:\\.\\d+)?|${NUM_PHRASE_RE})\\s*${HOUR_UNIT_RE}\\b`));
-  const mins = low.match(new RegExp(`\\b(\\d+|${NUM_PHRASE_RE})\\s*min(?:ute)?s?\\b`));
+  const hrs = low.match(new RegExp(`(${DECIMAL_RE}|\\b${NUM_PHRASE_RE})\\s*${HOUR_UNIT_RE}\\b`));
+  const mins = low.match(new RegExp(`(${DECIMAL_RE}|\\b${NUM_PHRASE_RE})\\s*min(?:ute)?s?\\b`));
   const hrsVal = hrs ? wordValue(hrs[1]) : null;
   const minsVal = mins ? wordValue(mins[1]) : null;
   const hrsAt = hrs && hrsVal !== null ? hrs.index ?? Infinity : Infinity;
   const minsAt = mins && minsVal !== null ? mins.index ?? Infinity : Infinity;
   if (hrsAt === Infinity && minsAt === Infinity) return null;
-  return hrsAt <= minsAt ? Math.round((hrsVal as number) * 60) : Math.round(minsVal as number);
+  const stated = hrsAt <= minsAt ? Math.round((hrsVal as number) * 60) : Math.round(minsVal as number);
+  return usableStatedMinutes(stated);
+}
+
+/**
+ * A stated duration only counts when it describes a block a day could hold.
+ *
+ * "0 mins" is not a request for a zero-length block — it is a slip or a stray number, and
+ * treating it as stated wrote raw 0 / estimated 0 onto the task while the solver quietly
+ * gave it a 15-minute floor anyway, so the card and the calendar disagreed. Returning null
+ * hands it to the block-type default instead, which is what "he did not really say" means
+ * everywhere else in this parser.
+ *
+ * The ceiling is a day. Anything past that cannot be scheduled on a 1440-minute grid however
+ * the solver is asked, so a typo ("9999 hours" → 599,940 minutes) would otherwise sit in the
+ * database and the UI as a number nobody can act on. Clamping keeps it honest AND schedulable
+ * -adjacent: it still reports unplaced, but for a legible reason.
+ */
+export function usableStatedMinutes(minutes: number | null): number | null {
+  if (minutes === null || !Number.isFinite(minutes) || minutes <= 0) return null;
+  return Math.min(minutes, 1440);
 }
 
 // ── one sentence is one task ─────────────────────────────────────────────────

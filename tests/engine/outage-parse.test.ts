@@ -181,3 +181,55 @@ describe("titles after the duration is stripped", () => {
     }
   });
 });
+
+// ── durations that are malformed, degenerate or absurd ──────────────────────
+//
+// The random fuzzer draws from phrasings he actually uses, so it never reaches these. They
+// were found by handing the parser deliberately hostile numbers (2026-08-08), and one of them
+// was a ten-fold error on input people really do type.
+describe("hostile durations", () => {
+  it("'.5 hours' is thirty minutes, not five hours", () => {
+    // The number regex required a leading digit, so ".5" matched only the 5 — and wordValue
+    // rejected ".5" outright, which would have dropped the duration entirely once the regex
+    // was widened. Both halves had to move.
+    expect(statedMinutes("spend .5 hours on email")).toBe(30);
+    expect(statedMinutes("spend .25 hrs on email")).toBe(15);
+    expect(statedMinutes("spend 0.5 hrs on email")).toBe(30);
+    expect(statedMinutes("spend 1.5 hrs on email")).toBe(90);
+    // and the ordinary decimal he actually uses is untouched
+    expect(statedMinutes("1.25 hrs to gym")).toBe(75);
+  });
+
+  it("a zero duration means he did not really say one", () => {
+    // Taken literally it wrote raw 0 / estimated 0 to the task while the solver applied a
+    // 15-minute floor anyway, so the card and the calendar disagreed. Falls back to the
+    // block-type default instead.
+    for (const t of ["spend 0 mins on email", "gym for 00 mins", "0 hours of deep work"]) {
+      expect(statedMinutes(t), t).toBeNull();
+    }
+    const p = parse("spend 0 mins on email")[0];
+    expect(p.estimateSource).toBe("inferred");
+    expect(p.rawEstimateMinutes).toBeGreaterThan(0);
+  });
+
+  it("a duration longer than a day is clamped to one", () => {
+    // A 1440-minute grid cannot hold it however the solver is asked, and 599,940 in the UI
+    // is a number nobody can act on. It still reports unplaced — just legibly.
+    expect(statedMinutes("9999 hours of deep work")).toBe(1440);
+    expect(statedMinutes("spend 1000000 minutes on the deck")).toBe(1440);
+    expect(statedMinutes("24 hours of gym")).toBe(1440);
+  });
+
+  it("every task the parser emits still has a positive, finite estimate", () => {
+    for (const t of [
+      "spend 0 mins on email", "9999 hours of deep work", "-5 mins on email",
+      "1.5.5 hrs on email", "spend .5 hours on email", "gym for 00 mins",
+    ]) {
+      for (const p of parse(t)) {
+        expect(Number.isFinite(p.rawEstimateMinutes), t).toBe(true);
+        expect(p.rawEstimateMinutes, t).toBeGreaterThan(0);
+        expect(p.estimatedMinutes, t).toBeGreaterThan(0);
+      }
+    }
+  });
+});
