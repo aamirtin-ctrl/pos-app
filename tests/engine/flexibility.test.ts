@@ -582,3 +582,54 @@ describe("family dinner stays a dinner", () => {
     expect(overlaps(b, dentist)).toBe(false);
   });
 });
+
+// ── an anchor that describes no real span never becomes a block ─────────────
+//
+// The solver is where every calendar source converges, so it is where this invariant
+// belongs. Reached on 2026-08-07 by a Google event crossing midnight, read as raw wall-clock
+// hours: 23:00→01:00 arrived as startMin 1380 / endMin 60. The grid's overlap test cannot
+// match such a span, so it blocked nothing — and the malformed block was STILL emitted, which
+// is what would have been written to the DB and pushed to Google as an event ending before
+// it begins. The source is fixed (gcal/sync.dayWindowMinutes); this is the backstop.
+describe("solver — malformed anchors", () => {
+  it("drops an anchor whose end precedes its start instead of emitting it", () => {
+    const reversed: Anchor = {
+      startMin: 23 * 60, endMin: 1 * 60, blockType: "personal",
+      title: "Red-eye flight", flexibility: "fixed",
+    };
+    const r = solve([], doctrine, [reversed]);
+    expect(r.blocks.some((b) => b.title === "Red-eye flight")).toBe(false);
+    // and nothing corrupt survives anywhere in the output
+    for (const b of r.blocks) expect(b.endMin, b.title).toBeGreaterThan(b.startMin);
+  });
+
+  it("drops zero-length and out-of-range anchors too", () => {
+    const bad: Anchor[] = [
+      { startMin: 600, endMin: 600, blockType: "personal", title: "zero", flexibility: "fixed" },
+      { startMin: 1500, endMin: 1560, blockType: "personal", title: "past midnight", flexibility: "fixed" },
+      { startMin: -60, endMin: 30, blockType: "personal", title: "negative", flexibility: "fixed" },
+    ];
+    const r = solve([], doctrine, bad);
+    for (const t of ["zero", "past midnight", "negative"]) {
+      expect(r.blocks.some((b) => b.title === t), t).toBe(false);
+    }
+  });
+
+  it("a malformed anchor never strands work that the day has room for", () => {
+    const reversed: Anchor = {
+      startMin: 23 * 60, endMin: 1 * 60, blockType: "personal",
+      title: "Red-eye flight", flexibility: "fixed",
+    };
+    const t = mkTask({ blockType: "deep_work", estimatedMinutes: 120, title: "Ship the deck" });
+    const r = solve([t], doctrine, [reversed]);
+    expect(r.unplaced, `unplaced: ${JSON.stringify(r.unplaced.map((u) => u.reason))}`).toHaveLength(0);
+  });
+
+  it("a well-formed anchor is of course still honoured", () => {
+    const ok: Anchor = {
+      startMin: 18 * 60, endMin: 19 * 60, blockType: "personal", title: "Dinner", flexibility: "fixed",
+    };
+    const r = solve([], doctrine, [ok]);
+    expect(r.blocks.some((b) => b.title === "Dinner")).toBe(true);
+  });
+});

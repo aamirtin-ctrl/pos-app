@@ -9,6 +9,7 @@ import { describe, it, expect } from "vitest";
 import {
   mergeCalendarSources,
   isOwnWriteCalendar,
+  dayWindowMinutes,
   type MergeableAppleEvent,
   type MergeableGoogleAnchor,
 } from "../main/gcal/sync.ts";
@@ -187,5 +188,63 @@ describe("isOwnWriteCalendar", () => {
   it("works before either calendar has been created (both ids null)", () => {
     expect(isOwnWriteCalendar("anything", null, null)).toBe(false);
     expect(isOwnWriteCalendar(null, null, null)).toBe(true);
+  });
+});
+
+// ── events that cross midnight (owner-facing calendar corruption) ───────────
+//
+// Google is queried with a whole-day window, so it returns everything OVERLAPPING that day —
+// including an event that started yesterday evening and one that runs past tonight's
+// midnight. readAnchorsLive read wall-clock hours straight off the timestamps, which is only
+// correct when the event both starts and ends inside the day. A 23:00→01:00 flight arrived
+// as startMin 1380 / endMin 60: an anchor ending before it starts.
+//
+// Both consequences were measured on 2026-08-07. The grid's overlap test
+// (`a.startMin < endMin && a.endMin > startMin`) cannot be satisfied by such a span, so the
+// event blocked NO time; and the malformed block was still emitted, which is what would have
+// been stored and pushed to Google as an event ending before it begins. The Apple and ICS
+// readers already clamped to 1440; only Google did not.
+describe("dayWindowMinutes", () => {
+  const D = "2026-08-07";
+  const at = (iso: string) => new Date(iso);
+
+  it("clamps an event running past midnight to the end of the day", () => {
+    expect(dayWindowMinutes(at(`${D}T23:00:00`), at("2026-08-08T01:00:00"), D)).toEqual({
+      startMin: 23 * 60,
+      endMin: 1440,
+    });
+  });
+
+  it("clamps an event that began yesterday to the start of the day", () => {
+    expect(dayWindowMinutes(at("2026-08-06T22:00:00"), at(`${D}T02:00:00`), D)).toEqual({
+      startMin: 0,
+      endMin: 120,
+    });
+  });
+
+  it("keeps an ordinary same-day event exactly as it is", () => {
+    expect(dayWindowMinutes(at(`${D}T18:00:00`), at(`${D}T19:30:00`), D)).toEqual({
+      startMin: 18 * 60,
+      endMin: 19 * 60 + 30,
+    });
+  });
+
+  it("spans the whole day for a multi-day event", () => {
+    expect(dayWindowMinutes(at("2026-08-05T09:00:00"), at("2026-08-10T17:00:00"), D)).toEqual({
+      startMin: 0,
+      endMin: 1440,
+    });
+  });
+
+  it("returns null when nothing of the event lands on the day", () => {
+    // entirely before, entirely after, zero-length, and reversed (malformed upstream)
+    expect(dayWindowMinutes(at("2026-08-06T09:00:00"), at("2026-08-06T10:00:00"), D)).toBeNull();
+    expect(dayWindowMinutes(at("2026-08-08T09:00:00"), at("2026-08-08T10:00:00"), D)).toBeNull();
+    expect(dayWindowMinutes(at(`${D}T09:00:00`), at(`${D}T09:00:00`), D)).toBeNull();
+    expect(dayWindowMinutes(at(`${D}T11:00:00`), at(`${D}T09:00:00`), D)).toBeNull();
+  });
+
+  it("returns null on an unparseable timestamp rather than NaN minutes", () => {
+    expect(dayWindowMinutes(new Date("nonsense"), at(`${D}T10:00:00`), D)).toBeNull();
   });
 });

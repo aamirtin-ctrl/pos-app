@@ -246,12 +246,36 @@ export interface SolveOptions {
   floorMin?: number;
 }
 
+/**
+ * An anchor must describe a real span of the day. One that does not cannot be honoured by
+ * any placement, and carrying it further does active harm: the grid's overlap test can never
+ * match it (so it blocks nothing, which is already wrong), yet it is still copied into the
+ * output as a block — and a block whose end precedes its start gets stored and pushed to
+ * Google as an event ending before it begins.
+ *
+ * Reached on 2026-08-07 by a Google event crossing midnight, whose minutes were read as raw
+ * wall-clock hours: 23:00→01:00 arrived as 1380→60. That source is fixed
+ * (gcal/sync.dayWindowMinutes), but the solver is the one place EVERY source converges, so it
+ * is where the invariant belongs. Dropping is the honest outcome — an unhonourable anchor
+ * held no time in the plan either way; the difference is that the corrupt block stops here.
+ */
+function usableAnchor(a: Anchor): boolean {
+  return (
+    Number.isFinite(a.startMin) &&
+    Number.isFinite(a.endMin) &&
+    a.endMin > a.startMin &&
+    a.startMin >= 0 &&
+    a.startMin < 1440
+  );
+}
+
 export function solve(
   tasks: PlannerTask[],
   doctrine: Doctrine,
-  anchors: Anchor[],
+  anchorsIn: Anchor[],
   opts: SolveOptions = {}
 ): SolveResult {
+  const anchors = anchorsIn.filter(usableAnchor);
   const deferrable = new Set(tasks.filter(isDeferrable).map((t) => t.id));
 
   // No windows in play → the old function, unchanged, not one branch different.

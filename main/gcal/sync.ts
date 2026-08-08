@@ -558,6 +558,41 @@ export function isOwnWriteCalendar(
   return calendarId === posId || calendarId === mirrorId;
 }
 
+/**
+ * An event's footprint ON ONE DAY, in minutes from that day's midnight, clamped to [0,1440].
+ * Returns null when the event leaves nothing on the day.
+ *
+ * Google is queried with a whole-day window, so it returns anything OVERLAPPING that day —
+ * including an event that began yesterday evening and one that runs past tonight's midnight.
+ * Reading wall-clock hours straight off the timestamps (`getHours()*60+getMinutes()`) is only
+ * correct for an event that both starts and ends within the day, and silently corrupt
+ * otherwise: a 23:00→01:00 flight became startMin 1380 / endMin 60 — an anchor whose end
+ * precedes its start. Downstream that is not a small error. The grid's overlap test
+ * (`a.startMin < endMin && a.endMin > startMin`) can never be satisfied by such a span, so
+ * the event blocked NO time at all, and the malformed block was still emitted — and would be
+ * stored and pushed to Google as an event ending before it begins. Measured on 2026-08-07 it
+ * also stranded an otherwise placeable task.
+ *
+ * The Apple and ICS readers already clamp this way (`Math.min(1440, …)`); only the Google
+ * path did not.
+ */
+export function dayWindowMinutes(
+  start: Date,
+  end: Date,
+  dateISO: string
+): { startMin: number; endMin: number } | null {
+  const dayStart = new Date(`${dateISO}T00:00:00`).getTime();
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || !Number.isFinite(dayStart)) {
+    return null;
+  }
+  const startMin = Math.max(0, Math.round((start.getTime() - dayStart) / 60_000));
+  const endMin = Math.min(1440, Math.round((end.getTime() - dayStart) / 60_000));
+  // Nothing left on this day: the event ended before it began (malformed), or it sits
+  // entirely outside the window Google was asked about.
+  if (endMin <= startMin || startMin >= 1440 || endMin <= 0) return null;
+  return { startMin, endMin };
+}
+
 /** The actual Google round-trip; updates the in-process cache AND the persisted snapshot. */
 async function readAnchorsLive(db: Db, secrets: SecretStore, dateISO: string): Promise<ExternalAnchor[]> {
   const cal = calApi(secrets);
@@ -586,10 +621,12 @@ async function readAnchorsLive(db: Db, secrets: SecretStore, dateISO: string): P
       if (e.status === "cancelled" || !e.start?.dateTime || !e.end?.dateTime) continue; // skip all-day
       const s = new Date(e.start.dateTime);
       const en = new Date(e.end.dateTime);
+      const span = dayWindowMinutes(s, en, dateISO);
+      if (!span) continue; // nothing of this event lands on this day
       const blockType: "meeting" | "personal" = (e.attendees?.length ?? 0) > 0 ? "meeting" : "personal";
       anchors.push({
-        startMin: s.getHours() * 60 + s.getMinutes(),
-        endMin: en.getHours() * 60 + en.getMinutes(),
+        startMin: span.startMin,
+        endMin: span.endMin,
         title: e.summary ?? "(busy)",
         blockType,
         gcalEventId: e.id!,
