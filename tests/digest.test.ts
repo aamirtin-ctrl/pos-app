@@ -3,6 +3,7 @@
 // the send path is exercised with an injected runScript stub (no osascript) and a
 // no-Google secret store (no network).
 
+import { todayISO as localTodayISO, addDaysISO } from "../main/dates.ts";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
@@ -41,7 +42,11 @@ afterEach(() => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-const todayISO = () => new Date().toISOString().slice(0, 10);
+// The shared LOCAL helper, not a UTC-based copy. digest.ts computes "today" locally (as the
+// owner would), so a test helper thinking in UTC only agrees in zones where the two dates
+// happen to coincide — this suite failed outright at UTC-10 (found by running everything
+// under Pacific/Honolulu, 2026-08-08).
+const todayISO = () => localTodayISO();
 
 // `reconnectDueDaysAgo` must clear RECONNECT_GRACE_DAYS for the person to reach the digest:
 // since 2026-08-06 a name only surfaces once it is meaningfully past due, not the instant
@@ -332,7 +337,7 @@ describe("handleDigestReply", () => {
 
   it("falls back to yesterday's mapping and reports unknown numbers", async () => {
     const c1 = addCommitment("Send Raj the deck");
-    const yesterday = digestDateISO(new Date(Date.now() - 24 * 60 * 60 * 1000));
+    const yesterday = addDaysISO(new Date(), -1);
     setSetting(db, `digest_mapping:${yesterday}`, JSON.stringify([{ n: 1, kind: "commitment", id: c1 }]));
 
     const summary = await handleDigestReply(db, noGoogle, "confirm 1 7");

@@ -97,6 +97,33 @@ const localDateOf = (d: Date) =>
  * Date-only (all-day) events are skipped: like the Google and Apple paths,
  * all-day never blocks planning time.
  */
+/**
+ * node-ical steps a recurrence rule in UTC, which silently loses the meaning of a FLOATING
+ * DTSTART.
+ *
+ * A floating time ("DTSTART:20260701T200000", no zone, no Z) is a WALL CLOCK: every occurrence
+ * is at 20:00 wherever the reader is. node-ical resolves DTSTART to the right absolute instant
+ * at parse time, then advances the rule in UTC days — so once the local time is late enough
+ * that its UTC instant lands on the NEXT UTC date, every generated occurrence is a day early
+ * in local terms.
+ *
+ * Measured 2026-08-08 in his own timezone: a weekly "BYDAY=WE" event at 20:00 America/Chicago
+ * (01:00Z the following day) expanded to local TUESDAY 20:00, so asking for the Wednesday
+ * returned nothing at all. Afternoon events are unaffected in Chicago because 14:00 local is
+ * still the same UTC date — which is exactly why this hid: it only bites evening recurrences,
+ * and further west it bites earlier in the day.
+ *
+ * The offset is a whole number of days and constant for the rule: the difference between
+ * DTSTART's UTC date and its LOCAL date. Shifting each occurrence back by it restores the
+ * floating contract — same local wall clock, correct local weekday. Zero for the common case,
+ * so nothing moves for events that were already right.
+ */
+export function floatingDriftDays(dtstart: Date): number {
+  const utcDay = Date.UTC(dtstart.getUTCFullYear(), dtstart.getUTCMonth(), dtstart.getUTCDate());
+  const localDay = Date.UTC(dtstart.getFullYear(), dtstart.getMonth(), dtstart.getDate());
+  return Math.round((utcDay - localDay) / 86_400_000);
+}
+
 export function eventsFromParsed(parsed: CalendarResponse, dateISO: string): IcsEvent[] {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateISO)) throw new Error(`bad date: ${dateISO}`);
   const dayStart = new Date(`${dateISO}T00:00:00`);
@@ -118,13 +145,23 @@ export function eventsFromParsed(parsed: CalendarResponse, dateISO: string): Ics
     if (ev.datetype === "date" || ev.start?.dateOnly) continue; // all-day never blocks
     if (!(ev.start instanceof Date)) continue;
 
+    // Widened by the drift so the occurrence we want is inside the window BEFORE it is
+    // shifted back into place. See floatingDriftDays.
+    const drift = ev.rrule ? floatingDriftDays(ev.start) : 0;
+    const driftMs = drift * 86_400_000;
     let instances: ReturnType<typeof ical.expandRecurringEvent>;
     try {
-      instances = ical.expandRecurringEvent(ev, { from: dayStart, to: dayEnd });
+      instances = ical.expandRecurringEvent(ev, {
+        from: new Date(dayStart.getTime() - driftMs),
+        to: new Date(dayEnd.getTime() - driftMs),
+      });
     } catch {
       continue; // one malformed rule must not take the feed down
     }
-    for (const inst of instances) {
+    for (const raw of instances) {
+      const inst = drift === 0
+        ? raw
+        : { ...raw, start: new Date(raw.start.getTime() + driftMs), end: new Date(raw.end.getTime() + driftMs) };
       if (inst.isFullDay) continue;
       if (inst.event.status === "CANCELLED") continue; // cancelled single occurrence
       const startMin = inst.start.getHours() * 60 + inst.start.getMinutes();

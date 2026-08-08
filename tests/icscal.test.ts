@@ -10,6 +10,7 @@ import ical from "node-ical";
 import { openDb, getSetting, type Db } from "../main/db/db.ts";
 import { mergeCalendarSources, type MergeableAppleEvent } from "../main/gcal/sync.ts";
 import {
+  floatingDriftDays,
   normalizeIcsUrl,
   eventsFromParsed,
   icsBlockType,
@@ -318,5 +319,63 @@ describe("eventsFromParsed across DST", () => {
     const e = eventsFromParsed(parsed(), "2027-11-07").find((x) => x.uid === "fall-late@pos-tests");
     expect(e!.startMin).toBe(23 * 60);
     expect(e!.endMin).toBe(1440);
+  });
+});
+
+// ── floating recurrences must keep their local wall clock ───────────────────
+//
+// A floating DTSTART ("DTSTART:20260701T200000" — no zone, no Z) is a WALL CLOCK: every
+// occurrence is at 20:00 wherever the reader is. node-ical resolves DTSTART to the right
+// instant and then advances the RULE in UTC days, so once the local time is late enough that
+// its UTC instant lands on the next UTC date, every occurrence comes out a day early locally.
+//
+// Measured in HIS timezone on 2026-08-08: a weekly BYDAY=WE event at 20:00 America/Chicago
+// (01:00Z the next day) expanded to local TUESDAY, so asking for the Wednesday returned
+// nothing at all. It hid because afternoon events in Chicago are still the same UTC date —
+// only evening recurrences bite, and further west they bite earlier in the day. His Stanford
+// class schedule (September, recurring) is exactly the shape this breaks.
+const weeklyWed = (hhmm: string) =>
+  [
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//pos-tests//EN", "BEGIN:VEVENT",
+    "UID:weekly-drift@pos-tests", "DTSTAMP:20260801T000000Z",
+    `DTSTART:20260701T${hhmm}00`, `DTEND:20260701T${hhmm}00`,
+    "RRULE:FREQ=WEEKLY;BYDAY=WE", "SUMMARY:CS lecture", "END:VEVENT", "END:VCALENDAR",
+  ].join("\r\n");
+
+describe("weekly recurrence lands on the right LOCAL day", () => {
+  const WED = "2026-08-05";
+  const TUE = "2026-08-04";
+  const occurrencesOn = (hhmm: string, dateISO: string) =>
+    eventsFromParsed(ical.sync.parseICS(weeklyWed(hhmm)), dateISO).filter(
+      (e) => e.uid === "weekly-drift@pos-tests"
+    );
+
+  it("an EVENING weekly event is on Wednesday, not Tuesday — his timezone's failing case", () => {
+    const wed = occurrencesOn("2000", WED);
+    expect(wed, "20:00 weekly Wednesday must appear on the Wednesday").toHaveLength(1);
+    expect(wed[0].startMin).toBe(20 * 60);
+    expect(occurrencesOn("2000", TUE), "and must NOT appear on the Tuesday").toHaveLength(0);
+  });
+
+  it("holds at every hour of the day, including the edges", () => {
+    for (const [hhmm, min] of [["0000", 0], ["0900", 540], ["1400", 840], ["2300", 1380]] as const) {
+      const wed = occurrencesOn(hhmm, WED);
+      expect(wed, `DTSTART ${hhmm} on the Wednesday`).toHaveLength(1);
+      expect(wed[0].startMin, `DTSTART ${hhmm} keeps its local wall clock`).toBe(min);
+      expect(occurrencesOn(hhmm, TUE), `DTSTART ${hhmm} must not leak onto the Tuesday`).toHaveLength(0);
+    }
+  });
+
+  it("floatingDriftDays is zero when the local and UTC dates agree, ±1 when they do not", () => {
+    // A pure function so the correction is inspectable rather than magic.
+    const noon = new Date(2026, 6, 1, 12, 0); // local midday — same UTC date in every US zone
+    expect(Math.abs(floatingDriftDays(noon))).toBeLessThanOrEqual(1);
+    // Constructed so local and UTC dates provably differ: local 23:00 west of UTC.
+    const late = new Date(2026, 6, 1, 23, 0);
+    const expected = Math.round(
+      (Date.UTC(late.getUTCFullYear(), late.getUTCMonth(), late.getUTCDate()) -
+        Date.UTC(late.getFullYear(), late.getMonth(), late.getDate())) / 86_400_000
+    );
+    expect(floatingDriftDays(late)).toBe(expected);
   });
 });

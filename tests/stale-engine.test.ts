@@ -20,10 +20,15 @@ import path from "node:path";
 import { openDb, type Db } from "../main/db/db.ts";
 import { plansOnStaleEngine, STALE_ENGINE_WINDOW_DAYS } from "../main/workers.ts";
 import { ENGINE_VERSION } from "../main/engine/solver.ts";
+import { addDaysISO } from "../main/dates.ts";
 
 const NOW = new Date("2026-08-06T12:00:00Z");
-const iso = (offsetDays: number) =>
-  new Date(NOW.getTime() + offsetDays * 86_400_000).toISOString().slice(0, 10);
+// LOCAL dates, matching what plansOnStaleEngine now computes and what the owner would call
+// "today". Deriving them from toISOString() made the suite pass only in zones where the UTC
+// and local dates of NOW happen to agree — it failed outright at UTC+14 (found by running
+// the whole suite under Pacific/Kiritimati, 2026-08-08). The code was right; the helper was
+// still thinking in UTC.
+const iso = (offsetDays: number) => addDaysISO(NOW, offsetDays);
 
 let dir: string;
 let db: Db;
