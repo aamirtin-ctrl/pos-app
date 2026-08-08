@@ -73,13 +73,21 @@ export const ASSIGNABLE_TYPES: ReadonlySet<BlockType> = new Set([
   ...WORK_TYPES, "personal",
 ]);
 
+/** A real 24-hour clock time: 00:00 through 23:59. */
+const HHMM_RE = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+
 const curvePoint = z.object({ hours_after_wake: z.number().min(0), capacity: z.number().min(0).max(100) });
 
 const doctrineSchema = z.object({
   version: z.number(),
   chronotype: z.object({
-    wake_time: z.string().regex(/^\d{2}:\d{2}$/),
-    sleep_onset: z.string().regex(/^\d{2}:\d{2}$/),
+    // Range-checked, not just shaped. `\d{2}:\d{2}` accepted "99:99", which hhmmToMin turns
+    // into minute 6039 — past the end of any day — so the grid produced a day with no usable
+    // slots and every task came back unplaced with nothing on screen explaining why. The
+    // doctrine is hand-editable (Settings → Doctrine), so a slip here is reachable, and a
+    // loud parse failure beats a silently empty day (2026-08-08).
+    wake_time: z.string().regex(HHMM_RE, "must be a real 24-hour time, HH:MM"),
+    sleep_onset: z.string().regex(HHMM_RE, "must be a real 24-hour time, HH:MM"),
   }),
   energy_curve: z.array(curvePoint).min(2),
   physical_curve: z.object({
