@@ -283,7 +283,14 @@ export async function generatePlan(
   // `deps.anchors` exists so the re-plan path (and its tests) can hand the SAME anchor set
   // to the check and to the regeneration it triggers — reading the calendar twice could
   // otherwise re-plan the day around an event the new plan never sees.
-  const anchors: Anchor[] = await readExternal(db, secrets, dateISO, deps);
+  // COPY. `deps.anchors` deliberately hands the SAME array to the conflict check and to the
+  // regeneration it triggers (see above), and the two blocks below PUSH pinned and
+  // already-happened spans onto this list — so without a copy generatePlan mutates its
+  // caller's array. Found on 2026-08-08 by running the suite in shuffled order: a pinned
+  // anchor from one test reappeared inside a later, unrelated one, because both were handed
+  // the same module-level fixture. Harmless in production today only because no caller reads
+  // the array again afterwards, which is not a property worth depending on.
+  const anchors: Anchor[] = [...(await readExternal(db, secrets, dateISO, deps))];
 
   // What the day looked like OUTSIDE this app at generation time. Stored below so the
   // re-plan sweep can tell "the calendar changed since this plan was made" from "the

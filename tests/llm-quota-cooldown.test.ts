@@ -26,6 +26,7 @@ import {
   lastFailure,
   QUOTA_COOLDOWN_MS,
   FAILURE_WINDOW_MS,
+  resetFailureCache,
 } from "../main/llm/meter.ts";
 
 let dir: string;
@@ -34,6 +35,11 @@ let db: Db;
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "pos-quota-"));
   db = openDb(path.join(dir, "pos.db"));
+  // The failure state is cached in module scope so llmHealth and the hot call path do not
+  // hit SQLite on every check. That cache outlives a test's database, so without this the
+  // suite only passed in file order — a failure recorded elsewhere leaked in here (found by
+  // running with --sequence.shuffle, 2026-08-08). The seam exists for exactly this.
+  resetFailureCache();
 });
 afterEach(() => {
   db.close();

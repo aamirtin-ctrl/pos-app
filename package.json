@@ -19,7 +19,8 @@
     "migrate:from-postgres": "tsx scripts/migrate-from-postgres.ts",
     "package": "npm run build && electron-builder --mac --arm64",
     "test:tz": "for TZ in Pacific/Midway Pacific/Honolulu America/Chicago UTC Asia/Tokyo Pacific/Kiritimati; do echo \"== TZ=$TZ\"; TZ=$TZ npm run -s test:electron || exit 1; done",
-    "test:electron": "ELECTRON_RUN_AS_NODE=1 electron node_modules/vitest/vitest.mjs run"
+    "test:electron": "ELECTRON_RUN_AS_NODE=1 electron node_modules/vitest/vitest.mjs run",
+    "test:shuffle": "ELECTRON_RUN_AS_NODE=1 electron node_modules/vitest/vitest.mjs run --sequence.shuffle"
   },
   "dependencies": {
     "@google/genai": "^2.7.0",
