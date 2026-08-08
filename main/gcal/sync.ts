@@ -559,6 +559,26 @@ export function isOwnWriteCalendar(
 }
 
 /**
+ * Did the owner say no to this event?
+ *
+ * A declined invitation is not on his schedule, and it was blocking time anyway. Nothing in
+ * the anchor path looked at his own response — only `status === "cancelled"` (the ORGANISER
+ * calling it off) was skipped. So a meeting he declined still became an anchor, and because
+ * the event has other attendees inferFlexibility tiered it `fixed`: the one tier the solver
+ * will never move. He said no, and the planner reserved the hour and refused to schedule
+ * over it.
+ *
+ * Only an explicit "declined" is dropped. "needsAction" and "tentative" keep their time —
+ * an unanswered invitation is a real claim on the hour until he answers it.
+ */
+export function selfDeclined(
+  attendees: readonly { self?: boolean | null; responseStatus?: string | null }[] | null | undefined
+): boolean {
+  const me = (attendees ?? []).find((a) => a?.self === true);
+  return (me?.responseStatus ?? "").toLowerCase() === "declined";
+}
+
+/**
  * An event's footprint ON ONE DAY, in minutes from that day's midnight, clamped to [0,1440].
  * Returns null when the event leaves nothing on the day.
  *
@@ -619,6 +639,7 @@ async function readAnchorsLive(db: Db, secrets: SecretStore, dateISO: string): P
     });
     for (const e of events.data.items ?? []) {
       if (e.status === "cancelled" || !e.start?.dateTime || !e.end?.dateTime) continue; // skip all-day
+      if (selfDeclined(e.attendees)) continue; // he said no — it is not his hour to lose
       const s = new Date(e.start.dateTime);
       const en = new Date(e.end.dateTime);
       const span = dayWindowMinutes(s, en, dateISO);

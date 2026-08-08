@@ -10,6 +10,7 @@ import {
   mergeCalendarSources,
   isOwnWriteCalendar,
   dayWindowMinutes,
+  selfDeclined,
   type MergeableAppleEvent,
   type MergeableGoogleAnchor,
 } from "../main/gcal/sync.ts";
@@ -246,5 +247,37 @@ describe("dayWindowMinutes", () => {
 
   it("returns null on an unparseable timestamp rather than NaN minutes", () => {
     expect(dayWindowMinutes(new Date("nonsense"), at(`${D}T10:00:00`), D)).toBeNull();
+  });
+});
+
+// ── a declined invitation is not his hour to lose ───────────────────────────
+//
+// The anchor path only ever skipped `status === "cancelled"` — the ORGANISER calling the
+// meeting off. It never looked at the owner's own response. So an invitation he DECLINED
+// still became an anchor, and since the event has other attendees inferFlexibility tiered it
+// `fixed`, the one tier the solver will never move. He said no in Google and POS reserved
+// the hour anyway, immovably.
+describe("selfDeclined", () => {
+  it("is true only when HIS response is declined", () => {
+    expect(selfDeclined([{ self: true, responseStatus: "declined" }])).toBe(true);
+    expect(selfDeclined([{ self: false, responseStatus: "accepted" }, { self: true, responseStatus: "declined" }])).toBe(true);
+    expect(selfDeclined([{ self: true, responseStatus: "DECLINED" }])).toBe(true); // Google casing varies
+  });
+
+  it("someone ELSE declining does not free his time", () => {
+    expect(selfDeclined([{ self: true, responseStatus: "accepted" }, { self: false, responseStatus: "declined" }])).toBe(false);
+  });
+
+  it("an unanswered or tentative invitation keeps its time", () => {
+    // Until he answers, the hour is still claimed — silently freeing it would be its own bug.
+    expect(selfDeclined([{ self: true, responseStatus: "needsAction" }])).toBe(false);
+    expect(selfDeclined([{ self: true, responseStatus: "tentative" }])).toBe(false);
+  });
+
+  it("an event with no attendee list at all is not declined", () => {
+    expect(selfDeclined([])).toBe(false);
+    expect(selfDeclined(null)).toBe(false);
+    expect(selfDeclined(undefined)).toBe(false);
+    expect(selfDeclined([{ self: false, responseStatus: "declined" }])).toBe(false); // no self entry
   });
 });
