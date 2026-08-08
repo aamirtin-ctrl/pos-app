@@ -9,6 +9,7 @@
 
 import type { Db } from "../db/db.ts";
 import { parseWhen } from "./when.ts";
+import { isTapback } from "../connectors/common.ts";
 
 const DAY = 86_400_000;
 const RECENCY_DAYS = 45; // an undated action item only counts if the message itself is recent
@@ -91,8 +92,10 @@ export function detectMessageFollowUp(
   now: Date
 ): MessageFollowUp | null {
   if (!text) return null;
-  // iMessage tapback reactions ("Liked …", "Loved …") aren't plans — skip them.
-  if (/^\s*(liked|loved|laughed at|disliked|emphasi[sz]ed|questioned)\s+["“]/i.test(text)) return null;
+  // A tapback is a reaction to a message already ingested, never a plan of its own. Uses the
+  // shared detector — the local copy this replaced was missing "you …", the removal forms and
+  // the sticker reaction, which is how "Reacted with a sticker to …" became a commitment.
+  if (isTapback(text)) return null;
 
   const low = text.toLowerCase();
   if (AUTOMATED.test(low)) return null; // appointment reminders, OTPs, etc. aren't follow-ups

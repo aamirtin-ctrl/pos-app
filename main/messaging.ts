@@ -14,7 +14,7 @@ import type { Db } from "./db/db.ts";
 import type { SecretStore } from "./secrets.ts";
 import { listMailAccounts, type MailAccount, type MailProvider } from "./connectors/gmail.ts";
 import { imapTlsOptions } from "./connectors/tls-ca.ts";
-import { insertInteraction, snippet } from "./connectors/common.ts";
+import { insertInteraction, snippet, isTapback } from "./connectors/common.ts";
 
 type SecretsLike = Pick<SecretStore, "get" | "set" | "delete">;
 
@@ -91,13 +91,9 @@ export const EMAIL_CHANNELS = ["gmail", "outlook", "icloud", "mailfile"] as cons
  * They are never a real message: a tapback must not represent a conversation. They
  * are NOT deleted — the row stays in the thread, it just can't be the headline.
  */
-const TAPBACK_RE =
-  /^\s*(?:you\s+)?(?:liked|loved|laughed at|emphasi[sz]ed|questioned|disliked|removed (?:a|an) [a-z]+ from)\s+[“"”'‘’]/i;
-
-/** True when this message text is an iMessage tapback/reaction rather than a message. */
-export function isTapback(text: string | null | undefined): boolean {
-  return !!text && TAPBACK_RE.test(text);
-}
+// Defined once in connectors/common.ts and re-exported here, where callers already look for
+// it. Two copies is what let the sticker reaction slip past one of them.
+export { isTapback } from "./connectors/common.ts";
 
 type InboxRow = Omit<
   InboxItem,

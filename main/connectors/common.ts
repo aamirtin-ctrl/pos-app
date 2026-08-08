@@ -30,6 +30,30 @@ export interface SyncReport {
   error?: string;
 }
 
+/**
+ * iMessage tapbacks are delivered as ordinary messages whose TEXT describes the reaction:
+ * `Liked "…"`, `Loved "…"`, `You laughed at "…"`, `Reacted with a sticker to "…"`. The
+ * connector does not store chat.db's associated_message_type, so the text shape is the only
+ * signal available.
+ *
+ * A tapback is never new intent — it is a reaction to a message already ingested and already
+ * reasoned about. Treating one as content produces nonsense downstream: two of his open
+ * commitments on 2026-08-08 read "EURO 26 — Reacted with a sticker to …", and 831 of his
+ * interactions are tapbacks.
+ *
+ * This lives here, in the module both the messaging inbox and the follow-up extractor already
+ * depend on, because it previously existed TWICE — messaging.ts had the fuller pattern and
+ * crm/followups.ts a weaker hand-rolled copy missing "you …" and the removal forms. They then
+ * drifted, and neither had learned the sticker reaction iOS added later. One definition.
+ */
+const TAPBACK_RE =
+  /^\s*(?:you\s+)?(?:liked|loved|laughed at|emphasi[sz]ed|questioned|disliked|reacted with (?:a|an)[^"“”'‘’]{0,24}?to|removed (?:a|an) [a-z]+ from)\s*[“"”'‘’]/i;
+
+/** True when this message text is an iMessage tapback/reaction rather than a message. */
+export function isTapback(text: string | null | undefined): boolean {
+  return !!text && TAPBACK_RE.test(text);
+}
+
 export const SNIPPET_MAX = 200;
 
 /** Collapse whitespace and cap at SNIPPET_MAX. Null when there's no usable text. */
