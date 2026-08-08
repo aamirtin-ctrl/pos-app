@@ -269,7 +269,15 @@ describe("generatePlan advances a deferred task into its window", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  const calendar = (anchors: Anchor[]): ReplanDeps => ({ anchors: async () => anchors });
+  // The clock is PINNED to THU morning. generatePlan floors today's plan at the current
+  // time, so without this the suite's result depended on the hour it ran: once the real
+  // wall clock passed midday on the calendar date these constants happen to name, the
+  // 120-minute task no longer fit and "tomorrow picks it up" failed (2026-08-07, 23:29).
+  // Same class of time bomb as the gtasks `updated` stamps fixed earlier the same day.
+  const calendar = (anchors: Anchor[]): ReplanDeps => ({
+    anchors: async () => anchors,
+    now: new Date(`${THU}T07:00:00`),
+  });
 
   const addTask = (p: { title: string; minutes: number; windowEnd?: string | null }): number => {
     const { lastInsertRowid } = db

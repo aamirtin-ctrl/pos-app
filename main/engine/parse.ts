@@ -520,17 +520,23 @@ export function statedMinutes(text: string): number | null {
   if (new RegExp(`\\ba few ${HOUR_UNIT_RE}\\b`).test(low)) return 180;
   if (/\ba couple(?: of)? min(?:ute)?s?\b/.test(low)) return 10;
 
+  // Hours and minutes are read TOGETHER and the EARLIEST one in the text wins.
+  //
+  // Checking hours first and returning on the first hit made unit precedence override word
+  // order, which is not how anyone writes. "30 mins to edit insta and 1.25 hrs to gym" gave
+  // the insta clause 75 minutes — the gym's duration — because the hours rule ran first and
+  // never looked at where in the sentence each number actually sat. Segmentation should keep
+  // two durations out of one segment, but when it cannot, the duration the sentence states
+  // FIRST is the one attached to the work it is next to. (Owner-visible as the film/edit task
+  // scheduled at the gym's length, 2026-08-07.)
   const hrs = low.match(new RegExp(`\\b(\\d+(?:\\.\\d+)?|${NUM_PHRASE_RE})\\s*${HOUR_UNIT_RE}\\b`));
-  if (hrs) {
-    const n = wordValue(hrs[1]);
-    if (n !== null) return Math.round(n * 60);
-  }
   const mins = low.match(new RegExp(`\\b(\\d+|${NUM_PHRASE_RE})\\s*min(?:ute)?s?\\b`));
-  if (mins) {
-    const n = wordValue(mins[1]);
-    if (n !== null) return Math.round(n);
-  }
-  return null;
+  const hrsVal = hrs ? wordValue(hrs[1]) : null;
+  const minsVal = mins ? wordValue(mins[1]) : null;
+  const hrsAt = hrs && hrsVal !== null ? hrs.index ?? Infinity : Infinity;
+  const minsAt = mins && minsVal !== null ? mins.index ?? Infinity : Infinity;
+  if (hrsAt === Infinity && minsAt === Infinity) return null;
+  return hrsAt <= minsAt ? Math.round((hrsVal as number) * 60) : Math.round(minsVal as number);
 }
 
 // ── one sentence is one task ─────────────────────────────────────────────────
@@ -565,13 +571,49 @@ const SCHEDULING_WORDS = new Set([
   "tomorrow", "tonight", "tonite", "yesterday", "noon", "midday", "evening", "afternoon",
   "night", "weekend", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
   "sunday", "early", "late", "sometime", "eventually",
+  // Recurrence language is scheduling, not work. "…and 1.25 hrs to gym everyday" left a bare
+  // "everyday" behind once the gym was lifted out, and it became its own 75-minute task
+  // (2026-08-07). parseRecurrence still reads these off the segment; they just cannot BE one.
+  "everyday", "every", "daily", "each", "weekly", "always", "usually", "regularly",
   ...Object.keys(NUMBER_WORDS),
 ]);
 
 /** Does this fragment name any actual work, or only when work should happen? */
+/**
+ * Grammar with no content: pronouns, copulas, articles, bare prepositions. A fragment built
+ * only from these plus scheduling words names nothing to do.
+ *
+ * SCHEDULING_WORDS alone was too thin a filter — it made "work" mean "any word I have not
+ * listed", so "this can be whenever" became a 75-minute focused_work task purely because
+ * "be" was missing from the list (owner-visible 2026-08-07: a trailing clause of his own
+ * sentence turned into a phantom block, the same shape as the "Just woke up" phantom).
+ * Listing every function word is whack-a-mole; the fix is to require a word that carries
+ * MEANING, not merely one that is unlisted.
+ */
+const FUNCTION_WORDS = new Set([
+  "be", "is", "am", "are", "was", "were", "been", "being", "do", "does", "did", "done",
+  "it", "its", "he", "she", "they", "them", "we", "us", "you", "your", "his", "her", "their",
+  "our", "my", "me", "mine", "myself", "who", "what", "which", "when", "where", "why", "how",
+  "an", "of", "to", "on", "in", "at", "by", "with", "from", "into", "over", "up", "down",
+  "if", "then", "than", "but", "or", "nor", "yet", "so", "as", "too", "also", "not", "no",
+  "there", "here", "these", "those", "such", "very", "much", "many", "own", "same", "other",
+  "get", "got", "getting", "let", "lets", "please", "ok", "okay", "yeah", "yes", "well",
+  // Evaluative filler — the whole predicate of a throwaway clause ("it should be fine",
+  // "that's cool"). A fragment whose only content-looking word is one of these describes a
+  // feeling about the plan, not a thing to do. Safe because a real task needs just ONE other
+  // substantive word: "fine tune the model" still keeps "tune" and "model".
+  "fine", "good", "great", "cool", "alright", "ready", "easy", "hard", "quick", "soon",
+  "sure", "right", "wrong", "bad", "better", "best", "nice",
+]);
+
+/**
+ * Does this fragment name actual work? True only when it contains at least one word that is
+ * neither scheduling language nor bare grammar — i.e. something a calendar card could be
+ * about. A fragment that fails is a modifier for the work beside it, never a task.
+ */
 function namesWork(fragment: string): boolean {
   const words = fragment.toLowerCase().match(/[a-z]{2,}/g) ?? [];
-  return words.some((w) => !SCHEDULING_WORDS.has(w));
+  return words.some((w) => !SCHEDULING_WORDS.has(w) && !FUNCTION_WORDS.has(w));
 }
 
 export interface WorkSegment {
@@ -598,8 +640,13 @@ export interface WorkSegment {
  * sleep-floor rule — to earn one targeted rule regardless of what the model is doing.
  */
 function extractGymFragment(text: string): { rest: string; gym: string | null } {
+  // The connector between the duration and the word "gym" is whatever he happened to type:
+  // "1.25 hrs TO gym", "45 min OF gym", "an hour AT the gym". Accepting only "for"/"the" left
+  // the duration ungrabbed for the most common phrasing he actually uses, so the gym fragment
+  // carried no duration of its own and inherited a neighbouring clause's instead — his gym
+  // came out at the insta task's 30 minutes (2026-08-07).
   const m = text.match(
-    /,?\s*(?:and\s+)?((?:\d+(?:\.\d+)?|an?|half an?|a\s+couple(?:\s+of)?)\s*(?:h(?:ou)?rs?|min(?:ute)?s?)\s*)?(?:for\s+)?(?:the\s+)?\b(?:gym|work\s*out|workout)\b/i
+    /,?\s*(?:and\s+)?((?:\d+(?:\.\d+)?|an?|half an?|a\s+couple(?:\s+of)?)\s*(?:h(?:ou)?rs?|min(?:ute)?s?)\s*)?(?:(?:for|to|of|at|in)\s+)?(?:the\s+)?\b(?:gym|work\s*out|workout)\b/i
   );
   if (!m) return { rest: text, gym: null };
   const duration = (m[1] ?? "").trim();
@@ -614,7 +661,21 @@ export function workSegments(text: string): WorkSegment[] {
     // without this it is one task that takes the FIRST day it sees. The lookarounds keep
     // "2.5 hours" and "a.m." intact: only a period between a word and a capitalised word ends
     // a sentence here.
-    .split(/\n|;|(?<!\d),(?!\d)| and (?=[a-z])|(?<=[a-z0-9])\.\s+(?=[A-Z])/i)
+    // The " and " rule splits a conjoined instruction into its two halves. Two corrections,
+    // both from real input (2026-08-07):
+    //
+    //   (?=[a-z0-9]) — it required a LETTER after "and", so "…30 mins to edit insta and
+    //   1.25 hrs to gym" never split: the two clauses stayed fused, and the insta half was
+    //   scheduled at the gym's duration. A digit starts a conjoined clause just as often.
+    //
+    //   (?!a\s+(?:half|quarter)\b) — "an hour and a half" was being split into "an hour" and
+    //   "a half on the deck", turning one 90-minute intent into a 60-minute task PLUS a
+    //   90-minute task, and "two and a half hours" into a severed "a half hours…" that lost
+    //   its number entirely and fell back to a 50-minute default. "and a half" is part of the
+    //   duration, never a conjunction.
+    .split(
+      /\n|;|(?<!\d),(?!\d)| and (?!a\s+(?:half|quarter)\b)(?=[a-z0-9])|(?<=[a-z0-9])\.\s+(?=[A-Z])/i
+    )
     .map((s) => s.trim())
     .filter((s) => s.length > 1);
 
@@ -646,9 +707,22 @@ const TITLE_STRIP = [
   /^(?:i\s+)?(?:should|must|will|can|could|would|might)\s+/i,
   /^(?:maybe|about|around|like|roughly|approximately|probably)\s+/i,
   /^(?:set|find|block|carve|reserve|schedule)\s+(?:aside\s+|out\s+)?(?:some\s+)?time\s+(?:to|for)\s+/i,
+  // Same scheduling verbs WITHOUT the word "time" — "slot 30 mins to edit insta" strips its
+  // duration and was left titled "Slot to edit/film insta content".
+  /^(?:slot|set|block|carve|reserve|schedule|spend|dedicate|allocate)\s+(?:aside\s+|out\s+)?(?:some\s+)?(?:to|for|on)\s+/i,
+  /^(?:slot|carve|reserve|dedicate|allocate)\s+/i,
   /^(?:spend\s+)?(?:some\s+)?time\s+(?:to|for|on)\s+/i,
   /^in\s+total\s+/i,
+  // Addressed-to-the-assistant phrasing: "can u dedicate 30 mins a day to learning agentic
+  // coding" left a title of "U dedicate a day to learning agentic coding".
+  /^(?:can\s+|could\s+|pls\s+|please\s+)?(?:u|you)\s+/i,
+  // The recurrence remnant after "30 mins a day" loses its duration to the strip above.
+  /^a\s+day\s+(?:to|for|on)\s+/i,
   /^to\s+(?=[a-z])/i,
+  // A leading preposition is what is left when the duration in front of it is removed
+  // ("45 minutes ON email" → "On email", "two and a half hours OF deep work" → "Of deep
+  // work"). Last in the list so the more specific rules above get first refusal.
+  /^(?:on|of|in|at|with|for)\s+(?=[a-z])/i,
 ];
 
 /** Turn a spoken fragment into something readable on a calendar card. */
@@ -656,9 +730,24 @@ export function titleFromFragment(fragment: string): string {
   let t = fragment.trim();
   // Durations are captured as a number; repeating them in the title is noise.
   t = t
+    // Compound forms FIRST, as a unit. Stripping "an hour" out of "an hour and a half" left
+    // the orphan behind — "spend an hour and a half on the deck" titled a block "Spend and a
+    // half on the deck" (2026-08-07).
+    .replace(
+      new RegExp(
+        `\\b(?:\\d+(?:\\.\\d+)?|${NUM_PHRASE_RE})\\s+(?:${HOUR_UNIT_RE}\\s+and\\s+a\\s+half|and\\s+a\\s+half\\s+${HOUR_UNIT_RE})\\b`,
+        "gi"
+      ),
+      " "
+    )
     .replace(new RegExp(`\\b(?:\\d+(?:\\.\\d+)?|${NUM_PHRASE_RE})\\s*${HOUR_UNIT_RE}\\b`, "gi"), " ")
     .replace(new RegExp(`\\b(?:\\d+|${NUM_PHRASE_RE})\\s*min(?:ute)?s?\\b`, "gi"), " ")
     .replace(new RegExp(`\\bhalf an hour\\b|\\ba couple(?: of)? ${HOUR_UNIT_RE}\\b|\\ba few ${HOUR_UNIT_RE}\\b`, "gi"), " ")
+    // Any "and a half" the compound rule could not reach (the number sat in a clause that was
+    // split away), plus recurrence adverbs — parseRecurrence already captured those, and a
+    // block called "… everyday" reads wrong on a calendar that shows one day.
+    .replace(/\band\s+a\s+(?:half|quarter)\b/gi, " ")
+    .replace(/\b(?:every\s*day|everyday|daily|each\s+day)\b/gi, " ")
     .replace(/\s{2,}/g, " ")
     .trim();
   // Strip repeatedly: speech stacks these ("maybe about like to go through…").
@@ -700,9 +789,16 @@ export function deterministicParse(
         break;
       }
     }
-    // The duration is read from the merged segment: he states it in the scheduling clause at
-    // least as often as in the work clause ("later this week, maybe two hours in total").
-    const stated = statedMinutes(p);
+    // The work clause's OWN duration wins; the merged scheduling context is only a fallback,
+    // for when he states it there instead ("later this week, maybe two hours in total").
+    //
+    // Reading `full` first was wrong for any segment whose merged context is the whole
+    // sentence — the gym fragment, which extractGymFragment lifts out with its own duration
+    // attached ("1.25 hrs gym") but carries the entire text as context so surrounding
+    // "everyday" still reaches it. With earliest-duration-wins that handed the gym the insta
+    // clause's 30 minutes. A duration sitting inside the work clause is the least ambiguous
+    // signal available and must outrank one borrowed from a neighbour.
+    const stated = statedMinutes(seg.work) ?? statedMinutes(p);
     const rawEst = stated ?? BLOCK_DEFAULTS[blockType].minutes;
     const window = parseWindow(p, refISO);
     out.push({
