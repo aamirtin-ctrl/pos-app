@@ -607,15 +607,30 @@ export function dayWindowMinutes(
   end: Date,
   dateISO: string
 ): { startMin: number; endMin: number } | null {
-  const dayStart = new Date(`${dateISO}T00:00:00`).getTime();
-  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || !Number.isFinite(dayStart)) {
-    return null;
-  }
-  const startMin = Math.max(0, Math.round((start.getTime() - dayStart) / 60_000));
-  const endMin = Math.min(1440, Math.round((end.getTime() - dayStart) / 60_000));
-  // Nothing left on this day: the event ended before it began (malformed), or it sits
-  // entirely outside the window Google was asked about.
-  if (endMin <= startMin || startMin >= 1440 || endMin <= 0) return null;
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) return null;
+
+  // WALL CLOCK, not elapsed milliseconds. The grid is a wall-clock line of 1440 minutes, so
+  // "18:00" must be minute 1080 on every date. Deriving minutes from (timestamp - midnight)
+  // is only equivalent on a 24-hour day: across a DST boundary it shifts everything after the
+  // transition by an hour — on US spring-forward a 6pm meeting landed at minute 1020 (5pm),
+  // on fall-back at 1140 (7pm) — and on the 25-hour day a 23:00 event computed startMin 1440
+  // and was dropped from the calendar entirely. Two days a year, silently wrong all day.
+  const localDate = (d: Date) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const wallMin = (d: Date) => d.getHours() * 60 + d.getMinutes();
+
+  const startDay = localDate(start);
+  const endDay = localDate(end);
+  // Entirely outside the day. (An event ending exactly at this day's 00:00 belongs to the
+  // previous day, which `endDay <= dateISO` with the equality case handled below covers.)
+  if (endDay < dateISO || startDay > dateISO) return null;
+
+  const startMin = startDay === dateISO ? wallMin(start) : 0;
+  // Ends on a later date → it runs through this day's midnight, so it occupies to 1440.
+  const endMin = endDay === dateISO ? wallMin(end) : 1440;
+
+  // Nothing left on this day: zero-length, or malformed with the end before the start.
+  if (endMin <= startMin) return null;
   return { startMin, endMin };
 }
 
@@ -738,6 +753,15 @@ export function clearICalUidCache(): void {
  * and an event we mirrored last week is still an event Google has.
  */
 export async function googleICalUids(db: Db, secrets: SecretStore, dateISO: string): Promise<Set<string>> {
+  // DO NOT give this loop the per-calendar try/catch that readAnchorsLive has. The two look
+  // identical and want opposite failure behavior.
+  //
+  // There, a missing calendar means "I could not see those events", and carrying on with the
+  // rest is strictly better than losing the day. Here, this set answers "does Google ALREADY
+  // have this event?" and a missing UID is read as NO — so a partial set would tell the Apple
+  // mirror to create events Google already holds, duplicating them in his real calendar. The
+  // absent answer is safe (mirrorAppleSweep catches per-day and skips that day); the confident
+  // wrong answer is not. Fail closed.
   if (!isGoogleConnected(secrets)) return new Set();
   const hit = icalUidCache.get(dateISO);
   if (hit && Date.now() - hit.at < ICAL_UID_TTL_MS) return hit.uids;

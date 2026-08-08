@@ -338,3 +338,53 @@ describe("healPartialAnchorScan", () => {
     expect(out.map((x) => x.title).sort()).toEqual(["Fam", "School"]);
   });
 });
+
+// ── DST: the grid is a wall clock, not an elapsed-time line ─────────────────
+//
+// Deriving minutes from (timestamp − midnight) is equivalent to reading the wall clock only
+// on a 24-hour day. Across a DST boundary it shifts everything after the transition by an
+// hour, and on the 25-hour day it pushed a 23:00 event to startMin 1440, dropping it from the
+// calendar completely. Two days a year, silently wrong for the whole day — exactly the class
+// of failure this system keeps producing, so it is pinned here.
+//
+// These run in whatever zone the machine is in; in a no-DST zone they simply assert the
+// ordinary answer, which is the same answer.
+describe("dayWindowMinutes across DST", () => {
+  it("keeps wall-clock minutes on the 23-hour (spring forward) day", () => {
+    const D = "2027-03-14"; // US spring forward
+    expect(dayWindowMinutes(new Date(`${D}T18:00:00`), new Date(`${D}T19:00:00`), D)).toEqual({
+      startMin: 18 * 60,
+      endMin: 19 * 60,
+    });
+  });
+
+  it("keeps wall-clock minutes on the 25-hour (fall back) day", () => {
+    const D = "2027-11-07"; // US fall back
+    expect(dayWindowMinutes(new Date(`${D}T18:00:00`), new Date(`${D}T19:00:00`), D)).toEqual({
+      startMin: 18 * 60,
+      endMin: 19 * 60,
+    });
+  });
+
+  it("a late event on the 25-hour day is not dropped", () => {
+    const D = "2027-11-07";
+    expect(dayWindowMinutes(new Date(`${D}T23:00:00`), new Date("2027-11-08T00:00:00"), D)).toEqual({
+      startMin: 23 * 60,
+      endMin: 1440,
+    });
+  });
+
+  it("an event ending exactly at the next midnight occupies to the end of the day", () => {
+    const D = "2026-08-07";
+    expect(dayWindowMinutes(new Date(`${D}T22:00:00`), new Date("2026-08-08T00:00:00"), D)).toEqual({
+      startMin: 22 * 60,
+      endMin: 1440,
+    });
+  });
+
+  it("an event ending exactly at THIS midnight belongs to the previous day", () => {
+    expect(
+      dayWindowMinutes(new Date("2026-08-06T22:00:00"), new Date("2026-08-07T00:00:00"), "2026-08-07")
+    ).toBeNull();
+  });
+});
