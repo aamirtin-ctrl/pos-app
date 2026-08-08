@@ -323,11 +323,21 @@ describe("generatePlan advances a deferred task into its window", () => {
   it("a task the owner PINNED for today is never moved, however much window it has", async () => {
     const advId = addTask({ title: "Go through Stanford academic advising", minutes: 120, windowEnd: SUN });
     addTask({ title: "Stanford math test", minutes: 120 });
-    // His own pin: a locked block for this task on this date.
+    // His own pin: a locked block for this task on this date, belonging to the plan it was
+    // pinned in — as production always writes it. A block with no plan is an orphan, and the
+    // planner deliberately ignores those: an invisible row must not reserve his time.
+    const priorPlan = Number(
+      db
+        .prepare(
+          `INSERT INTO plan (plan_date, engine_version, doctrine_snapshot, narration, unplaced_tasks)
+           VALUES (?, 'test', '{}', '', '[]')`
+        )
+        .run(THU).lastInsertRowid
+    );
     db.prepare(
-      `INSERT INTO block (task_id, block_type, title, starts_at, ends_at, is_locked)
-       VALUES (?, 'focused_work', 'Advising (pinned)', ?, ?, 1)`
-    ).run(advId, `${THU}T13:00:00`, `${THU}T15:00:00`);
+      `INSERT INTO block (task_id, block_type, title, starts_at, ends_at, is_locked, plan_id)
+       VALUES (?, 'focused_work', 'Advising (pinned)', ?, ?, 1, ?)`
+    ).run(advId, `${THU}T13:00:00`, `${THU}T15:00:00`, priorPlan);
 
     await generatePlan(db, doctrineDir, secrets, null, THU, calendar(roomForOne));
     expect(taskRow(advId).plan_date).toBe(THU);

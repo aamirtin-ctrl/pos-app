@@ -290,8 +290,18 @@ export async function generatePlan(
   // calendar is exactly what this plan was already built around" — see anchorFingerprint.
   const externalFingerprint = anchorFingerprint(anchors);
 
+  // The join to `plan` is load-bearing, not decoration. A pinned span read from a block whose
+  // plan no longer exists would reserve that time on every future solve, invisibly: nothing
+  // in the UI can show a block that belongs to no plan, so nothing could ever un-pin it.
+  // The app enables PRAGMA foreign_keys, so its own deletes cascade — but ten such orphans
+  // were found in the live database on 2026-08-08, left by a manual `DELETE FROM plan` in a
+  // sqlite3 CLI session, where the pragma defaults to OFF. "From ANY plan" means from a plan.
   const lockedRows = db
-    .prepare("SELECT task_id, block_type, title, starts_at, ends_at FROM block WHERE is_locked = 1 AND date(starts_at) = ?")
+    .prepare(
+      `SELECT b.task_id, b.block_type, b.title, b.starts_at, b.ends_at
+         FROM block b JOIN plan p ON b.plan_id = p.id
+        WHERE b.is_locked = 1 AND date(b.starts_at) = ?`
+    )
     .all(dateISO) as {
     task_id: number | null; block_type: string; title: string; starts_at: string; ends_at: string;
   }[];
@@ -577,7 +587,7 @@ export async function generatePlan(
       `UPDATE task SET plan_date = ?, window_start = COALESCE(window_start, ?)
         WHERE id = ? AND plan_date = ?
           AND NOT EXISTS (
-            SELECT 1 FROM block b
+            SELECT 1 FROM block b JOIN plan p ON b.plan_id = p.id
              WHERE b.task_id = task.id AND b.is_locked = 1 AND date(b.starts_at) = ?
           )`
     );
