@@ -11,7 +11,7 @@
 // messaging.ts, so a minimal equivalent lives here with the identical
 // automation_denied mapping. Tests inject `runScript` — no osascript, no network.
 
-import { todayISO } from "./dates.ts";
+import { todayISO, addDaysISO } from "./dates.ts";
 import { execFile } from "node:child_process";
 import type { Db } from "./db/db.ts";
 import { getSetting, setSetting } from "./db/db.ts";
@@ -280,7 +280,9 @@ export function parseDigestReply(text: string): DigestReplyCmd[] | null {
 
 function loadMapping(db: Db, now: Date): DigestMappingEntry[] | null {
   const today = digestDateISO(now);
-  const yesterday = digestDateISO(new Date(now.getTime() - 24 * 60 * 60 * 1000));
+  // Calendar day back, not 24h of milliseconds: on the 25-hour DST day subtracting 24h lands
+  // on the SAME date, so a reply to yesterday's digest would find no mapping and be ignored.
+  const yesterday = addDaysISO(now, -1);
   for (const key of [today, yesterday]) {
     const raw = getSetting(db, `digest_mapping:${key}`);
     if (!raw) continue;
