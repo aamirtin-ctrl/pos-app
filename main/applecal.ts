@@ -109,10 +109,21 @@ interface DateParts {
 
 const ISO_RE = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/;
 
+/** True when that calendar day really exists (rejects 30 February and friends). */
+function dayExists(y: number, mo: number, d: number): boolean {
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+}
+
 /**
- * Parse a wall-clock timestamp emitted by the AppleScript. Strict ISO first; falls
- * back to Date parsing for AppleScript-style strings ("Tuesday, August 4, 2026 at
- * 9:00:00 AM"). Returns null for anything unparseable so the row can be skipped.
+ * Parse a wall-clock timestamp emitted by the AppleScript. Strict ISO first; the script
+ * itself always emits ISO, so the second branch is pure defence for a locale-coerced string
+ * that slipped through ("August 4, 2026 9:00:00 AM"). Returns null for anything unparseable
+ * so the caller can skip the row.
+ *
+ * The example this comment used to give — "Tuesday, August 4, 2026 at 9:00:00 AM" — has in
+ * fact never parsed: Date.parse rejects the " at ". Corrected rather than made to work,
+ * because the script does not emit that form (2026-08-08).
  */
 export function parseAppleDate(raw: string): DateParts | null {
   const s = (raw ?? "").trim();
@@ -125,8 +136,17 @@ export function parseAppleDate(raw: string): DateParts | null {
     };
     if (parts.mo < 1 || parts.mo > 12 || parts.d < 1 || parts.d > 31) return null;
     if (parts.hh > 23 || parts.mm > 59 || parts.ss > 59) return null;
+    // …and the day must exist in that month. "2026-02-30" passes every range check above and
+    // then rolls to March when it reaches wallEpoch, which would place an event on a day it
+    // was never on. A row we cannot read is skipped by the caller; a row we read WRONG is not.
+    if (!dayExists(parts.y, parts.mo, parts.d)) return null;
     return parts;
   }
+  // Date.parse is extremely lenient — it accepts "-1" (→ 2001-01-01), "5", "Jan" and other
+  // fragments, turning garbage into a confident date. The AppleScript always emits ISO via
+  // isoOf(), so this branch is pure defence; requiring a four-digit year keeps it defensive
+  // instead of inventive (2026-08-08).
+  if (!/\d{4}/.test(s)) return null;
   const t = Date.parse(s);
   if (Number.isNaN(t)) return null;
   const d = new Date(t);

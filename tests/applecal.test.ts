@@ -343,3 +343,44 @@ describe("parseAppleScan / healPartialScan", () => {
     expect(healed).toHaveLength(1);
   });
 });
+
+// ── garbage in must not become a confident date (audited 2026-08-08) ────────
+//
+// parseAppleDate feeds the anchor set: whatever it returns becomes time blocked out on his
+// real calendar. A row it cannot read is SKIPPED by the caller, which is safe. A row it reads
+// WRONG is not, and two shapes did exactly that.
+describe("parseAppleDate — hostile input", () => {
+  it("rejects a day that does not exist in its month", () => {
+    // Every range check passed (month 1-12, day 1-31) and then wallEpoch rolled it into
+    // March, placing an event on a day it was never on.
+    expect(parseAppleDate("2026-02-30T10:00:00")).toBeNull();
+    expect(parseAppleDate("2026-04-31T10:00:00")).toBeNull();
+    expect(parseAppleDate("2027-02-29T10:00:00")).toBeNull(); // 2027 is not a leap year
+    // …and the real leap day is fine
+    expect(parseAppleDate("2028-02-29T10:00:00")).toMatchObject({ y: 2028, mo: 2, d: 29 });
+  });
+
+  it("does not let Date.parse invent a date out of a fragment", () => {
+    // Date.parse is extremely lenient: "-1" came back as 2001-01-01. The AppleScript always
+    // emits ISO, so this branch is defence — it must stay defensive, not inventive.
+    for (const t of ["-1", "5", "Jan", "12", "true", "-"]) {
+      expect(parseAppleDate(t), t).toBeNull();
+    }
+  });
+
+  it("still reads everything the script actually emits", () => {
+    expect(parseAppleDate("2026-08-07T18:00:00")).toMatchObject({ y: 2026, mo: 8, d: 7, hh: 18 });
+    expect(parseAppleDate("2026-08-07 18:30:15")).toMatchObject({ hh: 18, mm: 30, ss: 15 });
+    // The locale-coerced long form the fallback exists for. Note the doc comment used to
+    // claim "Tuesday, August 4, 2026 at 9:00:00 AM" worked — Date.parse rejects the " at ",
+    // so it never did. The script emits ISO, so nothing depends on it.
+    expect(parseAppleDate("August 4, 2026 9:00:00 AM")).toMatchObject({ y: 2026, mo: 8, d: 4 });
+    expect(parseAppleDate("Tuesday, August 4, 2026 at 9:00:00 AM")).toBeNull();
+  });
+
+  it("still rejects the obviously unreadable", () => {
+    for (const t of ["", "   ", "garbage", "9999-99-99T99:99:99"]) {
+      expect(parseAppleDate(t), t).toBeNull();
+    }
+  });
+});
