@@ -93,8 +93,20 @@ interface FakeCalls {
  * the 403 exactly where the real one lands (calendars.insert, or events.insert once the
  * calendar already exists).
  */
+/**
+ * Event ids are unique across the whole run, not per fake. Google never reissues an id, and a
+ * per-instance counter made a RETRY hand out the same ids as the interrupted attempt — which
+ * looks exactly like the duplicate-event bug the retry test exists to rule out.
+ */
+let eventSeq = 0;
+
 function fakeDeps(
-  opts: { throwOn?: keyof FakeCalls; error?: () => Error } = {}
+  /**
+   * `throwOnNth` fails the Nth call of that kind rather than the first, so a push can be
+   * interrupted PART WAY — the state a crash actually leaves behind, and the state that
+   * produced "Call family" three times on 2026-08-07.
+   */
+  opts: { throwOn?: keyof FakeCalls; throwOnNth?: number; error?: () => Error } = {}
 ): GcalPushDeps & { calls: FakeCalls; deleted: string[]; listed: { id: string; summary: string }[]; taskBodies: any[] } {
   const calls: FakeCalls = {
     calendarsGet: 0, calendarsInsert: 0, eventsInsert: 0, eventsUpdate: 0, eventsDelete: 0, tasksInsert: 0,
@@ -108,9 +120,8 @@ function fakeDeps(
   const boom = opts.error ?? insufficientPermission;
   const guard = (k: keyof FakeCalls) => {
     calls[k]++;
-    if (opts.throwOn === k) throw boom();
+    if (opts.throwOn === k && (opts.throwOnNth === undefined || calls[k] === opts.throwOnNth)) throw boom();
   };
-  let eventSeq = 0;
   const calendar: PushCalendarApi = {
     calendars: {
       async get() {
@@ -737,5 +748,59 @@ describe("pushTasks stamps pos:task markers", () => {
     const notes = deps.taskBodies.map((b) => String(b.notes));
     expect(notes.some((n) => n === `person: family\npos:task:${withNotes}`)).toBe(true);
     expect(notes.some((n) => n === `pos:task:${bare}`)).toBe(true);
+  });
+});
+
+// ── a push interrupted PART WAY must be recoverable ─────────────────────────
+//
+// This is not hypothetical. On 2026-08-07 the app was quit mid-push: Google had created the
+// tasks, the local gtasks_id writes never landed, the next run re-inserted them, and the pull
+// then imported the orphans back as new work — "Call family" three times on his screen. The
+// task path was fixed with an idempotency marker; this pins the equivalent property for the
+// CALENDAR path, which had never been exercised at all.
+describe("pushPlan interrupted mid-flight", () => {
+  it("keeps what it already wrote, leaves the rest unwritten, and does not mark the plan pushed", async () => {
+    const planId = addPlan({ blocks: 3 });
+    setSetting(db, "pos_calendar_id", "POS_CAL");
+
+    await expect(pushPlan(db, connected, planId, fakeDeps({ throwOn: "eventsInsert", throwOnNth: 2 })))
+      .rejects.toThrow();
+
+    const rows = db
+      .prepare("SELECT gcal_event_id FROM block WHERE plan_id = ? ORDER BY starts_at")
+      .all(planId) as { gcal_event_id: string | null }[];
+    const written = rows.filter((r) => r.gcal_event_id !== null);
+    expect(written, "the first block's event id was recorded before the failure").toHaveLength(1);
+
+    const plan = db.prepare("SELECT pushed_at FROM plan WHERE id = ?").get(planId) as { pushed_at: string | null };
+    expect(plan.pushed_at, "an incomplete push must not look complete").toBeNull();
+  });
+
+  it("the retry finishes the job without duplicating what already went out", async () => {
+    const planId = addPlan({ blocks: 3 });
+    setSetting(db, "pos_calendar_id", "POS_CAL");
+
+    await expect(pushPlan(db, connected, planId, fakeDeps({ throwOn: "eventsInsert", throwOnNth: 2 })))
+      .rejects.toThrow();
+
+    // Second attempt, nothing failing this time.
+    const retry = fakeDeps();
+    await pushPlan(db, connected, planId, retry);
+
+    // The block that already had an event is UPDATED, not inserted again; the other two are
+    // inserted. Three events for three blocks — no duplicates in his calendar.
+    expect(retry.calls.eventsInsert, "only the two that never made it").toBe(2);
+    expect(retry.calls.eventsUpdate, "the one that did is updated in place").toBe(1);
+
+    const ids = (
+      db.prepare("SELECT gcal_event_id FROM block WHERE plan_id = ?").all(planId) as {
+        gcal_event_id: string | null;
+      }[]
+    ).map((r) => r.gcal_event_id);
+    expect(ids.every((id) => id !== null), "every block ends up with an event").toBe(true);
+    expect(new Set(ids).size, "and every event id is distinct").toBe(3);
+
+    const plan = db.prepare("SELECT pushed_at FROM plan WHERE id = ?").get(planId) as { pushed_at: string | null };
+    expect(plan.pushed_at, "now it really is pushed").not.toBeNull();
   });
 });
