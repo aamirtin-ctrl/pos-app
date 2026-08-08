@@ -394,7 +394,7 @@ export async function generatePlan(
   // must not be offered to the solver again. Offering it is what duplicated his math test.
   // "Everyday" work for THIS date gets its instance now, before the pool below is read — so
   // a recurring template behaves as an ordinary task from here on, with no separate path.
-  materializeRecurringTasks(db, dateISO, (deps?.now ?? new Date()).toISOString().slice(0, 10));
+  materializeRecurringTasks(db, dateISO, (deps?.now ?? new Date()).toISOString().slice(0, 10), doctrine);
   const allTaskRows = listTasks(db, dateISO);
   const taskRows = allTaskRows.filter((r: any) => !pinnedTaskIds.has(r.id as number));
 

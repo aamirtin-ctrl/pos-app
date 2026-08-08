@@ -627,4 +627,29 @@ UPDATE task
 ALTER TABLE task ADD COLUMN gtasks_list TEXT;
 `,
   },
+  {
+    version: 18,
+    name: "stated_estimates_unbuffered_templates",
+    sql: `
+-- Migration 16 recomputed stated estimates but scoped itself to status IN
+-- ('inbox','planned','in_progress'). Recurring TEMPLATES are frequently outside that set —
+-- his gym template had been completed — so the one row every future day is copied from kept
+-- its pre-fix value: raw 75, estimated 105.
+--
+-- The consequence was visible the same evening. Aug 7 and Aug 8 had been repaired by 16, then
+-- Aug 9 and Aug 10 materialized from the untouched template and came back at 105 — his
+-- 1.25-hour gym scheduled as 1h45m again, the exact complaint that started the day.
+--
+-- This finishes the job at every status, and crm/recurring.ts now DERIVES each instance's
+-- estimate from raw minutes so a stale cached value on a template can never propagate again.
+-- 'done' rows are included deliberately: a template is not history, it is the source every
+-- future instance is copied from.
+UPDATE task
+   SET estimated_minutes = ((raw_estimate_minutes + 14) / 15) * 15
+ WHERE estimate_source = 'stated'
+   AND raw_estimate_minutes IS NOT NULL
+   AND estimated_minutes <> ((raw_estimate_minutes + 14) / 15) * 15
+   AND (recurrence = 'daily' OR recurrence_parent_id IS NOT NULL);
+`,
+  },
 ];

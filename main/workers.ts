@@ -1214,7 +1214,8 @@ export function startWorkers(
       if (secrets.get("NOTION_TOKEN")) {
         try {
           const today = new Date().toISOString().slice(0, 10);
-          for (const d of upcomingDates(today, sweepDays)) materializeRecurringTasks(db, d, today);
+          const doc = loadDoctrine(resolveDoctrineDir());
+          for (const d of upcomingDates(today, sweepDays)) materializeRecurringTasks(db, d, today, doc);
           const c = await enrichAgenticCurriculumTasks(db, secrets, today);
           if (c.enriched > 0) {
             notify?.(`Filled in ${c.enriched} agentic-coding session${c.enriched === 1 ? "" : "s"} from Notion`);

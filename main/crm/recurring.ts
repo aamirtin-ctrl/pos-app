@@ -8,13 +8,36 @@
 // path for recurring work; it is a regular task that appears on time.
 
 import type { Db } from "../db/db.ts";
+import { bufferedMinutes, type Doctrine, type BlockType } from "../engine/doctrine.ts";
 
 /**
  * Ensure every 'daily' template has an instance for `dateISO`. The template's OWN row already
  * counts as its first day's instance, so nothing is created for that date. Never touches a
  * date in the past — a recurring task does not retroactively appear on days already lived.
  */
-export function materializeRecurringTasks(db: Db, dateISO: string, today: string): number {
+export function materializeRecurringTasks(
+  db: Db,
+  dateISO: string,
+  today: string,
+  /**
+   * When given, each instance RECOMPUTES its estimated_minutes from the template's raw
+   * estimate instead of copying the template's cached one.
+   *
+   * A template is long-lived and its cached estimate can be stale for reasons that have
+   * nothing to do with today: a doctrine change, or a bug fixed after the template was
+   * created. His gym template is the real case (2026-08-07). It was written when stated
+   * durations were still inflated by the planning-fallacy multiplier, so it holds raw 75 /
+   * estimated 105. Migration 16 recomputed the live rows but skipped the template itself
+   * (it only touched status inbox/planned/in_progress, and the template had been completed),
+   * so every day materialized afterwards inherited 105 and his 1.25-hour gym came back as
+   * 1h45m — the exact complaint that started the day, reappearing on Aug 9 and Aug 10 after
+   * Aug 7 and Aug 8 had been repaired.
+   *
+   * Deriving from raw makes the template's cached value irrelevant, which is the only way
+   * this stops recurring.
+   */
+  doctrine?: Doctrine
+): number {
   if (dateISO < today) return 0;
 
   const templates = db
@@ -45,9 +68,14 @@ export function materializeRecurringTasks(db: Db, dateISO: string, today: string
     // The template's own row already IS today's-of-its-creation instance.
     if (t.plan_date === dateISO) continue;
     if (hasInstance.get(t.id, dateISO)) continue;
+    const raw = t.raw_estimate_minutes ?? t.estimated_minutes ?? 30;
+    const source = t.estimate_source ?? "stated";
+    const estimated = doctrine
+      ? bufferedMinutes(doctrine, t.block_type as BlockType, raw, source === "stated" ? "stated" : "inferred")
+      : t.estimated_minutes ?? 30;
     insert.run(
-      t.title, t.block_type, t.cognitive_load ?? 3, t.estimated_minutes ?? 30, t.raw_estimate_minutes ?? 30,
-      t.splittable, t.estimate_source ?? "stated", dateISO, t.day_part, t.id
+      t.title, t.block_type, t.cognitive_load ?? 3, estimated, raw,
+      t.splittable, source, dateISO, t.day_part, t.id
     );
     created++;
   }

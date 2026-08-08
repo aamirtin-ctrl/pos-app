@@ -899,7 +899,14 @@ function solvePass(
 //        over the classification bug at the wrong layer, and let a real fixed appointment
 //        sit half-overlapping a personal placeholder in the output. Back to: ANY overlap
 //        with a fixed anchor displaces a preferred one (owner correction, 2026-08-07).
-export const ENGINE_VERSION = "1.2.2";
+// 1.2.3: not a solver change — a DATA correction that the solver's answer depends on.
+//        Migration 18 unbuffered stated estimates on recurring templates and their
+//        instances (his gym: 105 → 75), and crm/recurring now derives instance estimates
+//        from raw minutes. Already-stored plans still hold the 105-minute block, and
+//        neither the anchor fingerprint nor anything else would notice, so the correction
+//        would never reach his calendar. This is the documented mechanism for exactly that:
+//        bump when the SOLVER'S ANSWER to the same day would change, whatever moved.
+export const ENGINE_VERSION = "1.2.3";
 // 1.1.0: deadline windows (deferred_within_window)
 // 1.2.0: shutdown closes the day for assigned `personal` work too; unsplittable deep work
 //        over the block cap is placed whole instead of dropped; the morning routine expands
