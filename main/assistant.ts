@@ -687,7 +687,13 @@ Command: """${t.slice(0, 600)}"""`,
         { metToday }
       );
       if (!metToday) {
-        db.prepare("UPDATE person SET last_contact_at = COALESCE(last_contact_at, datetime('now')) WHERE id = ?").run(hit.id);
+        // ISO-8601, matching every other writer of this column (interaction.occurred_at and
+        // reconnect's copy of it). datetime('now') renders "YYYY-MM-DD HH:MM:SS" with a
+        // space, and this is the one path that would have put that shape into an otherwise
+        // ISO column — where reconnect compares it against occurred_at as TEXT. One column,
+        // one format (audited 2026-08-08).
+        db.prepare("UPDATE person SET last_contact_at = COALESCE(last_contact_at, ?) WHERE id = ?")
+          .run(new Date().toISOString(), hit.id);
       }
       const followUp = res.detectedFollowUp ? ` Follow-up tracked: "${res.detectedFollowUp.description}".` : "";
       return {

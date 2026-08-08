@@ -104,7 +104,12 @@ export function unansweredInbound(db: Db, limit = 25) {
       `SELECT i.id, i.person_id, i.channel, i.subject, i.body_summary, i.occurred_at,
               p.display_name AS who
        FROM interaction i JOIN person p ON p.id = i.person_id
-       WHERE i.direction = 'inbound' AND i.occurred_at >= datetime('now', '-14 days')
+       -- julianday(), not a string >=. occurred_at is ISO-8601 with a 'T' and a trailing Z;
+       -- datetime('now', …) renders "YYYY-MM-DD HH:MM:SS" with a SPACE. Comparing those as
+       -- text compares 'T' (0x54) against ' ' (0x20) once the date halves match, so every
+       -- interaction on the boundary day counted as inside the window whatever its hour.
+       -- julianday parses both shapes and compares instants (audited 2026-08-08).
+       WHERE i.direction = 'inbound' AND julianday(i.occurred_at) >= julianday('now', '-14 days')
          AND NOT EXISTS (SELECT 1 FROM draft d WHERE d.interaction_id = i.id)
          AND NOT EXISTS (
            SELECT 1 FROM interaction o WHERE o.person_id = i.person_id
