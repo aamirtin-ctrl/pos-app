@@ -15,6 +15,7 @@
 // unless the text itself says so, which the deterministic pass would already have caught if it
 // did.
 
+import { localDateISO } from "../dates.ts";
 import type { Db } from "../db/db.ts";
 import type { LlmClient } from "../llm/provider.ts";
 import { extractJson } from "../llm/provider.ts";
@@ -76,7 +77,7 @@ export async function dateUndatedTasks(
     .all(TASK_DATE_BATCH) as UndatedTask[];
   if (rows.length === 0) return { dated: 0, skipped: "empty" };
 
-  const todayISO = now.toISOString().slice(0, 10);
+  const todayISO = localDateISO(now);
   const about = contextBlock(db);
   let prefs = "";
   try {

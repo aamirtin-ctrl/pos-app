@@ -69,6 +69,7 @@
 //      post-hoc layer (workers.resolveFromThreads) closes already-open commitments
 //      when NEW messages resolve them.
 
+import { localDateISO } from "../dates.ts";
 import { createHash } from "node:crypto";
 import type { Db } from "../db/db.ts";
 import { contextBlock, resolveNamedDate } from "../context.ts";
@@ -1220,7 +1221,7 @@ export function rehydrateCommitmentDates(db: Db, now: Date = new Date()): number
   if (rows.length === 0) return 0;
 
   const set = db.prepare("UPDATE commitment SET due_at = ? WHERE id = ? AND due_at IS NULL");
-  const today = now.toISOString().slice(0, 10);
+  const today = localDateISO(now);
   let dated = 0;
   for (const r of rows) {
     // ANCHOR ON THE MESSAGE, not on today. "Tomorrow" in a text sent on the 5th means the

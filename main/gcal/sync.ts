@@ -12,6 +12,7 @@
 // Tasks: open planner tasks + confirmed commitments push to a "POS" Google Tasks list
 // so they appear on the phone.
 
+import { todayISO as todayLocalISO } from "../dates.ts";
 import { google, type calendar_v3, type tasks_v1 } from "googleapis";
 import type { Db } from "../db/db.ts";
 import { getSetting, setSetting } from "../db/db.ts";
@@ -1318,7 +1319,7 @@ export async function commitmentToTask(
     // with Europe trip credit card charges", dated 2026-07-01 by extraction and therefore
     // invisible from the moment it was created. Overdue work belongs on today.
     const rawDue = c.due_at ? c.due_at.slice(0, 10) : null;
-    const todayISO = new Date().toISOString().slice(0, 10);
+    const todayISO = todayLocalISO();
     const due = rawDue && rawDue < todayISO ? todayISO : rawDue;
     // …unless the description names a date the app actually knows (main/context.ts):
     // "meetup at the start of school" lands on the user's term-start anchor. This is the

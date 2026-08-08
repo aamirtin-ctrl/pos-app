@@ -18,6 +18,7 @@
 // Rows are seeded ONCE (only when the table is empty) with a deliberately SHORT list of
 // editable defaults — a starting point the owner can correct, never a claim of truth.
 
+import { localDateISO } from "./dates.ts";
 import type { Db } from "./db/db.ts";
 import { getSetting, setSetting } from "./db/db.ts";
 import { parseWhen } from "./crm/when.ts";
@@ -278,7 +279,7 @@ export function resolveNamedDateFromFacts(
   if (UPCOMING_TERM.test(text)) {
     const start = anchorDay(byKey(facts, "school_term_start"));
     if (!start) return null;
-    const today = new Date(now.getTime()).toISOString().slice(0, 10);
+    const today = localDateISO(now);
     return start > today ? start : null; // a term already under way is not "next semester"
   }
   return null;

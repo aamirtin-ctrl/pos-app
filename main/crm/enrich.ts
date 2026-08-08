@@ -26,6 +26,7 @@
 //   10 still means "10 people a day", exactly as it did when that cost 10 calls.
 // Degrade contract: no LLM key (llm === null) → zero calls, zero writes, zero counts.
 
+import { localDateISO } from "../dates.ts";
 import type { Db } from "../db/db.ts";
 import { getSetting } from "../db/db.ts";
 import { extractJson, type LlmClient } from "../llm/provider.ts";
@@ -133,7 +134,7 @@ export function dailyBudget(db: Db, override?: number): number {
 
 /** LLM calls already spent today on `source` (the enrichment_attempt ledger). */
 export function usedToday(db: Db, source: string, now: Date): number {
-  const day = now.toISOString().slice(0, 10);
+  const day = localDateISO(now);
   return (
     db
       .prepare("SELECT COUNT(*) AS n FROM enrichment_attempt WHERE source = ? AND attempted_at >= ?")

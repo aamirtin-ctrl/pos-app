@@ -3,6 +3,7 @@
 // Buffers are applied in code after parsing, not in the prompt.
 // Degrades to a deterministic keyword parser when the LLM is unavailable.
 
+import { todayISO } from "../dates.ts";
 import { BLOCK_DEFAULTS, BLOCK_TYPES, bufferedMinutes, type BlockType, type Doctrine } from "./doctrine.ts";
 import { extractJson, type LlmClient } from "../llm/provider.ts";
 import { parseWhen } from "../crm/when.ts";
@@ -350,7 +351,7 @@ export async function parseBraindump(
   doctrine: Doctrine,
   llm: LlmClient | null,
   /** The day being planned — the anchor every relative window phrase resolves against. */
-  refISO: string = new Date().toISOString().slice(0, 10)
+  refISO: string = todayISO()
 ): Promise<{ tasks: ParsedTask[]; usedLlm: boolean }> {
   if (llm) {
     const res = await llm.call("plan_parse", "fast", PARSE_PROMPT(text, refISO), { json: true });
@@ -773,7 +774,7 @@ const KEYWORDS: [RegExp, BlockType, number][] = [
 export function deterministicParse(
   text: string,
   doctrine: Doctrine,
-  refISO: string = new Date().toISOString().slice(0, 10)
+  refISO: string = todayISO()
 ): ParsedTask[] {
   const out: ParsedTask[] = [];
   for (const seg of workSegments(text)) {

@@ -15,6 +15,7 @@
 //       (same shape ipc's commitments.toTask inserts) — type a task in Notion on the
 //       phone and it feeds the planner within 15 minutes.
 
+import { todayISO } from "./dates.ts";
 import type { Db } from "./db/db.ts";
 import { getSetting, setSetting } from "./db/db.ts";
 import type { SecretStore } from "./secrets.ts";
@@ -438,7 +439,7 @@ export async function pushToNotion(db: Db, secrets: SecretStore): Promise<PushCo
   }
 
   // today's plan → one journal page (body written on create only)
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayISO();
   const plan = db
     .prepare("SELECT id, narration FROM plan WHERE plan_date = ? ORDER BY id DESC LIMIT 1")
     .get(today) as { id: number; narration: string | null } | undefined;
@@ -473,7 +474,7 @@ export async function pullNotionTasks(db: Db, secrets: SecretStore): Promise<num
     body: { filter: { property: "Status", select: { equals: "inbox" } }, page_size: 100 },
   });
   const fresh = unmappedRows((res.results ?? []) as { id: string }[], mappedPageIds(db, "task"));
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayISO();
   const insert = db.prepare(
     `INSERT INTO task (title, block_type, cognitive_load, estimated_minutes, raw_estimate_minutes,
        status, plan_date, estimate_source)
