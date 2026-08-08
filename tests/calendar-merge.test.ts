@@ -11,6 +11,8 @@ import {
   isOwnWriteCalendar,
   dayWindowMinutes,
   selfDeclined,
+  healPartialAnchorScan,
+  type ExternalAnchor,
   type MergeableAppleEvent,
   type MergeableGoogleAnchor,
 } from "../main/gcal/sync.ts";
@@ -279,5 +281,60 @@ describe("selfDeclined", () => {
     expect(selfDeclined(null)).toBe(false);
     expect(selfDeclined(undefined)).toBe(false);
     expect(selfDeclined([{ self: false, responseStatus: "declined" }])).toBe(false); // no self entry
+  });
+});
+
+// ── one flaky calendar must not empty the day ───────────────────────────────
+//
+// readAnchorsLive calls events.list once PER CALENDAR. That call had no isolation, so a
+// single failing shared calendar threw the whole read away — every calendar's anchors for
+// the date, not just its own — and the planner then treated a full day as free. This is the
+// Google shape of the bug that dropped a three-hour family dinner out of the Apple path on
+// 2026-08-07, where a failed shared iCloud calendar reported as an empty scan.
+//
+// A failed calendar means "unknown", never "empty".
+describe("healPartialAnchorScan", () => {
+  const a = (over: Partial<ExternalAnchor> = {}): ExternalAnchor => ({
+    startMin: 9 * 60, endMin: 10 * 60, title: "Standup", blockType: "meeting",
+    gcalEventId: "e1", iCalUID: "u1", calendarId: "work", ...over,
+  });
+
+  it("restores the events of exactly the calendars that failed", () => {
+    const fresh = [a({ title: "Standup", calendarId: "work" })];
+    const snapshot = [
+      a({ title: "Standup (stale)", calendarId: "work" }),
+      a({ title: "Family dinner", calendarId: "fam", startMin: 19 * 60, endMin: 22 * 60 }),
+    ];
+    const out = healPartialAnchorScan(fresh, ["fam"], snapshot);
+    expect(out.map((x) => x.title).sort()).toEqual(["Family dinner", "Standup"]);
+    // the calendar that ANSWERED keeps its fresh copy, not the stale one
+    expect(out.some((x) => x.title === "Standup (stale)")).toBe(false);
+  });
+
+  it("changes nothing on a clean scan", () => {
+    const fresh = [a()];
+    expect(healPartialAnchorScan(fresh, [], [a({ title: "Old" })])).toEqual(fresh);
+  });
+
+  it("returns the fresh set when there is no snapshot to heal from", () => {
+    const fresh = [a()];
+    expect(healPartialAnchorScan(fresh, ["fam"], null)).toEqual(fresh);
+  });
+
+  it("restores nothing from a snapshot predating per-calendar attribution", () => {
+    // Guessing which un-attributed events belonged to the failed calendar would be worse
+    // than restoring none: it could resurrect events the owner has since deleted.
+    const legacy = [{ startMin: 60, endMin: 120, title: "Legacy", blockType: "personal" as const, gcalEventId: "x", iCalUID: "y" }];
+    expect(healPartialAnchorScan([], ["fam"], legacy)).toEqual([]);
+  });
+
+  it("heals several failed calendars at once", () => {
+    const snapshot = [
+      a({ title: "Fam", calendarId: "fam" }),
+      a({ title: "School", calendarId: "school" }),
+      a({ title: "Work", calendarId: "work" }),
+    ];
+    const out = healPartialAnchorScan([], ["fam", "school"], snapshot);
+    expect(out.map((x) => x.title).sort()).toEqual(["Fam", "School"]);
   });
 });

@@ -436,6 +436,12 @@ export interface ExternalAnchor {
    */
   iCalUID: string;
   /**
+   * Which Google calendar this came from. Absent on snapshots persisted before this shipped,
+   * which is handled where it is read (healPartialAnchorScan). Its only job is to let a
+   * partial scan restore the events of exactly the calendars that failed.
+   */
+  calendarId?: string;
+  /**
    * Tier from `inferFlexibility`. Absent on snapshots persisted before this shipped —
    * consumers apply the `fixed` default (grid.flexibilityOf), i.e. the old behavior.
    */
@@ -613,6 +619,31 @@ export function dayWindowMinutes(
   return { startMin, endMin };
 }
 
+/**
+ * Restore the events of calendars that failed mid-scan from the last known-good snapshot.
+ *
+ * The Apple reader learned this the hard way on 2026-08-07: a shared iCloud calendar failed
+ * during a scan, the scan reported success with the surviving events, and a three-hour family
+ * dinner simply was not in the day — so the planner treated the evening as free. Google had
+ * the same hole in a different shape. `events.list` runs once PER CALENDAR inside a loop with
+ * no isolation, so one flaky shared calendar threw the whole read away — every calendar's
+ * anchors for that date, not just its own.
+ *
+ * A failed calendar means "unknown", never "empty". Its last-known events are restored; the
+ * calendars that answered keep their fresh ones. A snapshot predating `calendarId` cannot be
+ * attributed per-calendar, so nothing is restored from it rather than guessing wrong.
+ */
+export function healPartialAnchorScan(
+  fresh: readonly ExternalAnchor[],
+  erroredCalendarIds: readonly string[],
+  snapshot: readonly ExternalAnchor[] | null
+): ExternalAnchor[] {
+  if (erroredCalendarIds.length === 0 || !snapshot) return [...fresh];
+  const errored = new Set(erroredCalendarIds);
+  const restored = snapshot.filter((a) => a.calendarId != null && errored.has(a.calendarId));
+  return [...fresh, ...restored];
+}
+
 /** The actual Google round-trip; updates the in-process cache AND the persisted snapshot. */
 async function readAnchorsLive(db: Db, secrets: SecretStore, dateISO: string): Promise<ExternalAnchor[]> {
   const cal = calApi(secrets);
@@ -626,17 +657,29 @@ async function readAnchorsLive(db: Db, secrets: SecretStore, dateISO: string): P
   const dayEnd = new Date(`${dateISO}T23:59:59`);
   const list = await cal.calendarList.list({ maxResults: 250 });
   const anchors: ExternalAnchor[] = [];
+  // One calendar failing must not lose the others. `events.list` runs once per calendar, and
+  // an unguarded throw here discarded EVERY calendar's anchors for the date — the same
+  // "partial scan reads as an empty day" hole that dropped a family dinner out of the Apple
+  // path on 2026-08-07. Each failure is recorded and healed from the snapshot below.
+  const erroredCalendarIds: string[] = [];
   for (const c of list.data.items ?? []) {
     if (!c.id || isOwnWriteCalendar(c.id, posId, mirrorId)) continue;
-    const events = await cal.events.list({
-      calendarId: c.id,
-      timeMin: dayStart.toISOString(),
-      timeMax: dayEnd.toISOString(),
-      singleEvents: true,
-      orderBy: "startTime",
-      maxResults: 100,
-      fields: EVENT_FIELDS,
-    });
+    let events;
+    try {
+      events = await cal.events.list({
+        calendarId: c.id,
+        timeMin: dayStart.toISOString(),
+        timeMax: dayEnd.toISOString(),
+        singleEvents: true,
+        orderBy: "startTime",
+        maxResults: 100,
+        fields: EVENT_FIELDS,
+      });
+    } catch (e) {
+      erroredCalendarIds.push(c.id);
+      console.warn(`gcal: calendar "${c.summary ?? c.id}" failed for ${dateISO}: ${(e as Error).message}`);
+      continue;
+    }
     for (const e of events.data.items ?? []) {
       if (e.status === "cancelled" || !e.start?.dateTime || !e.end?.dateTime) continue; // skip all-day
       if (selfDeclined(e.attendees)) continue; // he said no — it is not his hour to lose
@@ -652,6 +695,7 @@ async function readAnchorsLive(db: Db, secrets: SecretStore, dateISO: string): P
         blockType,
         gcalEventId: e.id!,
         iCalUID: e.iCalUID ?? "",
+        calendarId: c.id,
         flexibility: inferFlexibility({
           title: e.summary,
           attendees: e.attendees,
@@ -661,13 +705,18 @@ async function readAnchorsLive(db: Db, secrets: SecretStore, dateISO: string): P
       });
     }
   }
-  anchorsCache.set(dateISO, { at: Date.now(), anchors });
-  try {
-    persistDayCache(db, ANCHORS_CACHE_PREFIX, dateISO, JSON.stringify(anchors));
-  } catch (e) {
-    console.warn(`gcal: persisting anchors snapshot failed: ${(e as Error).message}`);
+  const healed = healPartialAnchorScan(anchors, erroredCalendarIds, cachedAnchors(db, dateISO));
+  anchorsCache.set(dateISO, { at: Date.now(), anchors: healed });
+  // Only a CLEAN scan becomes the new known-good snapshot. Persisting a partial one would
+  // bake the gap in permanently and heal every later failure from an already-wrong baseline.
+  if (erroredCalendarIds.length === 0) {
+    try {
+      persistDayCache(db, ANCHORS_CACHE_PREFIX, dateISO, JSON.stringify(anchors));
+    } catch (e) {
+      console.warn(`gcal: persisting anchors snapshot failed: ${(e as Error).message}`);
+    }
   }
-  return anchors;
+  return healed;
 }
 
 // ── cross-calendar identity ──────────────────────────────────────────────────
