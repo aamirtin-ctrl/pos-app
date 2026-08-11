@@ -92,6 +92,14 @@ contextBridge.exposeInMainWorld("pos", {
   },
   // Cross-source calendar ops used by the day view (delete the selected event).
   calendar: { deleteEvent: call("calendar.deleteEvent") },
+  // Apple Reminders as the task source (iOS detects the plan, he taps once, POS imports).
+  reminders: {
+    available: call("reminders.available"),
+    lists: call("reminders.lists"),
+    list: call("reminders.list"),
+    sync: call("reminders.sync"),
+    complete: call("reminders.complete"),
+  },
   ics: { list: call("ics.list"), add: call("ics.add"), remove: call("ics.remove") },
   notion: {
     available: call("notion.available"),

@@ -125,6 +125,8 @@ declare global {
         rows: Call; updateBlock: Call; deleteBlock: Call;
       };
       applecal: { available: Call; calendars: Call; events: Call; mirror: Call; deleteEvent: Call };
+      calendar: { deleteEvent: Call };
+      reminders: { available: Call; lists: Call; list: Call; sync: Call; complete: Call };
       /** Cross-source calendar ops for the day view (Google + Apple aware). */
       calendar: { deleteEvent: Call };
       settings: {

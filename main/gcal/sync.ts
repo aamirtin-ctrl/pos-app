@@ -1375,6 +1375,17 @@ export async function commitmentToTask(
             tasklist: listId,
             requestBody: {
               title: `Tentative: ${t.title}`,
+              // The pos:task marker is what tells the pull side this row is OUR output.
+              // Omitting it (as this push did until 2026-08-10) meant that whenever the
+              // local gtasks_id write below did not land — a crash or a timed-out insert
+              // that actually succeeded — syncFromGoogle could not relink the stray and
+              // imported it as a brand-new task instead, titled "Tentative: …" and with no
+              // commitment_id. That ran every sync: 220 duplicate tasks and 31 duplicate
+              // Google rows for a single commitment before it was caught.
+              // (literal, not gtasks-sync's TASK_MARKER_PREFIX: that module imports
+              // this one, so referencing it here would close an import cycle — same
+              // reason pushTasks builds its marker literally.)
+              notes: `pos:task:${taskId}`,
               due: t.hard_deadline_at ? new Date(t.hard_deadline_at).toISOString() : undefined,
             },
           }),

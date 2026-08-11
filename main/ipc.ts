@@ -115,6 +115,13 @@ import {
   excludedCalendarNames,
   deleteAppleEvent,
 } from "./applecal.ts";
+import {
+  remindersAvailable,
+  listReminderLists,
+  readReminders,
+  syncReminders,
+  completeReminder,
+} from "./connectors/reminders.ts";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -671,6 +678,15 @@ export function registerIpc(deps: IpcDeps) {
     }
     return { ok: false, error: "This event is a read-only subscription and can't be deleted from POS." };
   });
+
+  // ── apple reminders (Reminders.app) ──
+  // Owner directive 2026-08-10: iOS's own detection in Messages + a one-tap reminder is
+  // the task source now; POS imports what HE chose instead of inferring tasks from text.
+  h("reminders.available", () => remindersAvailable());
+  h("reminders.lists", () => listReminderLists());
+  h("reminders.list", () => readReminders(false));
+  h("reminders.sync", () => syncReminders(db, todayISO()));
+  h("reminders.complete", (id: string) => completeReminder(id));
 
   // ── subscribed calendars (webcal/ICS) ──
   h("ics.list", () => listSubscriptions(db));

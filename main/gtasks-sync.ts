@@ -442,6 +442,13 @@ function pullFromGoogle(
     if (g.deleted === true || g.status === "completed") continue;
     const title = (g.title ?? "").trim();
     if (!title) continue; // Google keeps empty draft rows; they are not tasks yet
+    // POS's own tentative pushes carry this prefix. Until 2026-08-10 they went out with
+    // NO pos:task marker, so neither check above can recognize them, and they arrived
+    // here looking exactly like something the owner typed on his phone — which is how a
+    // single commitment became 31 Google rows and 220 local "Tentative: …" duplicates,
+    // one per sync. The marker is now written at the source, but the unmarked rows are
+    // already in his account, so importing this prefix stays refused: he never types it.
+    if (/^tentative:\s/i.test(title)) continue;
     const due = dueDateOf(g.due);
     // due is DATE-only in Google Tasks: it names the day (plan_date), never a clock time.
     // Writing `${due}T00:00:00` here used to hand the solver a deadline that was already

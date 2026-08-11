@@ -652,4 +652,28 @@ UPDATE task
    AND (recurrence = 'daily' OR recurrence_parent_id IS NOT NULL);
 `,
   },
+  {
+    version: 19,
+    name: "reminder_id_on_task",
+    sql: `
+-- Owner directive 2026-08-10: iOS already detects a plan in Messages and offers a one-tap
+-- reminder, and unlike POS's own extraction HE chose it. Reminders.app therefore becomes an
+-- input; message text stops being mined for tasks (it keeps feeding the CRM half).
+--
+-- Identity is a COLUMN, not a notes marker, and the reason is the bug this same session
+-- fixed: the tentative Google push omitted its pos:task marker, the pull side could not
+-- recognize POS's own row, and one commitment became 31 Google rows and 220 local
+-- duplicates. Import idempotency must not depend on free text a user can edit or a sync can
+-- strip. A UNIQUE index makes a second import of the same reminder impossible at the
+-- storage layer rather than by convention.
+-- Deliberately NOT a partial index. "... WHERE reminder_id IS NOT NULL" reads tidier, but
+-- SQLite then refuses "ON CONFLICT(reminder_id) DO NOTHING" — the conflict target has to
+-- restate the predicate — and importReminders would have thrown on its first duplicate,
+-- which is precisely the case the index exists to survive. A plain UNIQUE index is correct
+-- here anyway: SQLite treats NULLs as distinct, so every task that has no reminder (the
+-- overwhelming majority) is unaffected.
+ALTER TABLE task ADD COLUMN reminder_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_reminder_id ON task(reminder_id);
+`,
+  },
 ];
