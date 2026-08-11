@@ -183,7 +183,15 @@ export async function runSync(
           db.prepare("SELECT COALESCE(MAX(id), 0) AS m FROM commitment").get() as { m: number }
         ).m;
         await extractCommitmentsLlm(db, llm, ids);
-        await autoTentativeTasks(db, secrets, beforeMax);
+        // Message→TASK auto-conversion, same directive as msgplans above and same default
+        // (off unless explicitly enabled). Extraction itself still runs: commitments are
+        // CRM state — what someone owes him and what he owes them — and they still surface
+        // in the review queue and on people's profiles. What stops is a message silently
+        // becoming a task, which is the path that produced 220 duplicate "Tentative: …"
+        // rows. Reminders.app is the task source now; he taps once, POS imports it.
+        if (getSetting(db, AUTO_TASKS_ENABLED_KEY) === "1") {
+          await autoTentativeTasks(db, secrets, beforeMax);
+        }
       }
       // Thread-resolution pass AFTER extraction: new messages that fulfill or cancel
       // an already-open commitment close it (and its task). Counts land on the report.
@@ -462,6 +470,20 @@ export async function resolveFromThreads(
 
   return out;
 }
+
+/**
+ * Settings key gating the message→calendar path (runMsgPlans). Unset means OFF: the owner
+ * turned this direction off entirely on 2026-08-10. Message INGESTION is untouched — it
+ * still feeds people, bios and commitments; only "text becomes a calendar event" stopped.
+ */
+export const MSGPLANS_ENABLED_KEY = "msgplans_enabled";
+
+/**
+ * Settings key gating message→task auto-conversion (autoTentativeTasks). Unset means OFF,
+ * for the same reason and on the same date. Commitments are still extracted and still shown
+ * for review; they just no longer become tasks on their own.
+ */
+export const AUTO_TASKS_ENABLED_KEY = "auto_tasks_from_messages";
 
 /** Autonomy threshold: only commitments at or above this confidence auto-convert. */
 export const AUTO_CONVERT_CONFIDENCE = 0.8;
@@ -1285,9 +1307,16 @@ export function startWorkers(
         // FDA can still be revoked between the precheck and the copy — announce() stays
         // quiet on any error, so that failure mode is silent too.
         announce(await runSync(db, secrets, llm, "imessage"));
-        // Plans from messages. Same precheck (unreadable chat.db / missing FDA is skipped
-        // silently); the connector itself reports 'full_disk_access' if it's revoked mid-run.
-        announce(await runSync(db, secrets, llm, "msgplans"));
+        // Plans from messages: OFF unless explicitly enabled (owner directive 2026-08-10,
+        // "the calendar doesn't take any information from messages directly"). The iMessage
+        // sync above still runs — it feeds the CRM half (people, bios, commitments), which
+        // he kept. What stops is text becoming calendar events: iOS already detects a plan
+        // in Messages and offers a one-tap reminder, and the anchor for a day is now the one
+        // event HE adds to Apple Calendar the night before. Everything POS schedules is
+        // arranged around that anchor.
+        if (getSetting(db, MSGPLANS_ENABLED_KEY) === "1") {
+          announce(await runSync(db, secrets, llm, "msgplans"));
+        }
       }
       // Notion — gated on token + parent page so an unconfigured integration never
       // writes error rows to sync_run.
