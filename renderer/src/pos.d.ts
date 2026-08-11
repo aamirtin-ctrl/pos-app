@@ -127,6 +127,7 @@ declare global {
       applecal: { available: Call; calendars: Call; events: Call; mirror: Call; deleteEvent: Call };
       calendar: { deleteEvent: Call };
       reminders: { available: Call; lists: Call; list: Call; sync: Call; complete: Call };
+      gtasks: { purgePreview: Call; purgeApply: Call };
       /** Cross-source calendar ops for the day view (Google + Apple aware). */
       calendar: { deleteEvent: Call };
       settings: {

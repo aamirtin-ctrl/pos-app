@@ -80,6 +80,8 @@ export interface GoogleTasksDeps {
   listTasks(args: { tasklist: string; pageToken?: string }): Promise<GoogleTasksPage>;
   patchTask(args: { tasklist: string; task: string; body: Partial<GoogleTaskLite> }): Promise<void>;
   insertTask(args: { tasklist: string; body: Partial<GoogleTaskLite> }): Promise<GoogleTaskLite>;
+  /** Hard-delete one row. Only purgeOrphanedGoogleTasks uses this; the sync never deletes. */
+  deleteTask(args: { tasklist: string; task: string }): Promise<void>;
   /** Local → Google. Defaults to gcal/sync.pushTasks; never reimplemented here. */
   pushTasks(): Promise<{ pushed: number; completed: number }>;
   now(): Date;
@@ -123,6 +125,9 @@ export function realGoogleTasksDeps(db: Db, secrets: SecretStore): GoogleTasksDe
     },
     async patchTask({ tasklist, task, body }) {
       await tasksApi(secrets).tasks.patch({ tasklist, task, requestBody: body });
+    },
+    async deleteTask({ tasklist, task }) {
+      await tasksApi(secrets).tasks.delete({ tasklist, task });
     },
     async insertTask({ tasklist, body }) {
       const res = await tasksApi(secrets).tasks.insert({ tasklist, requestBody: body });
@@ -460,6 +465,104 @@ function pullFromGoogle(
     ).run(title.slice(0, 200), g.notes ?? null, due, g.id, listOf.get(g.id) ?? null);
     result.pulled++;
   }
+}
+
+export interface PurgeResult {
+  scanned: number;
+  deleted: number;
+  kept: number;
+  /** Deleted titles, capped — enough for the UI to show what went without a wall of text. */
+  samples: string[];
+  error?: string;
+}
+
+/**
+ * One-shot cleanup of the POS Google Tasks list (owner report 2026-08-11: "there are
+ * literally 1200 POS entries; the only ones really needed are the ones that came from my
+ * personalcrm system").
+ *
+ * Those 1200 are the wreckage of the tentative-push duplicate loop plus the local cleanup
+ * that followed it: rows POS created whose local task no longer exists. Deleting the whole
+ * list in Google would take the good ones with it AND make reconcileGoogleTasks read every
+ * surviving local task as "deleted on the phone" (it defers them and clears gtasks_id), so
+ * this deletes row by row instead, keeping anything still backed by POS.
+ *
+ * Deleted:
+ *   - titles starting with "Tentative:" — POS's own prefix, which the owner never types;
+ *   - pos:task rows whose local task is gone;
+ *   - pos:commitment rows whose commitment is gone or already dropped.
+ * Kept: everything still backed by a live local row, and everything with no POS marker at
+ * all (those are his own, typed on the phone — this must never touch them).
+ *
+ * Dry-run by default. Nothing is deleted unless `apply` is true.
+ */
+export async function purgeOrphanedGoogleTasks(
+  db: Db,
+  secrets: SecretStore,
+  opts: { apply?: boolean } = {},
+  deps: GoogleTasksDeps = realGoogleTasksDeps(db, secrets)
+): Promise<PurgeResult> {
+  const out: PurgeResult = { scanned: 0, deleted: 0, kept: 0, samples: [] };
+  if (!deps.isConnected(secrets)) return { ...out, error: "not_connected" };
+
+  let tasklist: string;
+  try {
+    tasklist = await deps.ensureTasklist();
+  } catch (e) {
+    return { ...out, error: (e as Error).message };
+  }
+
+  const liveTask = db.prepare("SELECT 1 FROM task WHERE id = ?");
+  const liveCommitment = db.prepare(
+    "SELECT 1 FROM commitment WHERE id = ? AND status IN ('open','scheduled')"
+  );
+
+  let pageToken: string | undefined;
+  do {
+    let page;
+    try {
+      page = await deps.listTasks({ tasklist, pageToken });
+    } catch (e) {
+      return { ...out, error: (e as Error).message };
+    }
+    for (const g of page.items ?? []) {
+      if (!g.id) continue;
+      out.scanned++;
+      if (g.deleted === true) continue; // already gone; nothing to do
+
+      const title = (g.title ?? "").trim();
+      let doomed = false;
+      if (/^tentative:\s/i.test(title)) {
+        doomed = true;
+      } else {
+        const taskId = taskIdFromNotes(g.notes);
+        const commitmentId = commitmentIdFromNotes(g.notes);
+        if (taskId != null) doomed = !liveTask.get(taskId);
+        else if (commitmentId != null) doomed = !liveCommitment.get(commitmentId);
+        // no marker at all → his own row, never touched
+      }
+
+      if (!doomed) {
+        out.kept++;
+        continue;
+      }
+      if (!opts.apply) {
+        out.deleted++;
+        if (out.samples.length < 15) out.samples.push(title || "(untitled)");
+        continue;
+      }
+      try {
+        await deps.deleteTask({ tasklist, task: g.id });
+        out.deleted++;
+        if (out.samples.length < 15) out.samples.push(title || "(untitled)");
+      } catch (e) {
+        console.warn(`gtasks purge: ${g.id} failed: ${(e as Error).message}`);
+      }
+    }
+    pageToken = page.nextPageToken ?? undefined;
+  } while (pageToken);
+
+  return out;
 }
 
 /** Close a commitment the Google side reports done. Returns true when a row changed. */

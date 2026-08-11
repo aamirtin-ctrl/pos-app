@@ -122,6 +122,7 @@ import {
   syncReminders,
   completeReminder,
 } from "./connectors/reminders.ts";
+import { purgeOrphanedGoogleTasks } from "./gtasks-sync.ts";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -678,6 +679,12 @@ export function registerIpc(deps: IpcDeps) {
     }
     return { ok: false, error: "This event is a read-only subscription and can't be deleted from POS." };
   });
+
+  // ── google tasks maintenance ──
+  // One-shot purge of rows POS orphaned in its Google list (the tentative-push duplicate
+  // loop left ~1200). Dry-run unless apply=true; never touches rows he created himself.
+  h("gtasks.purgePreview", () => purgeOrphanedGoogleTasks(db, secrets, { apply: false }));
+  h("gtasks.purgeApply", () => purgeOrphanedGoogleTasks(db, secrets, { apply: true }));
 
   // ── apple reminders (Reminders.app) ──
   // Owner directive 2026-08-10: iOS's own detection in Messages + a one-tap reminder is
