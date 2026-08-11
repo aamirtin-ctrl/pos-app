@@ -32,7 +32,7 @@ import { google, type tasks_v1 } from "googleapis";
 import type { Db } from "./db/db.ts";
 import type { SecretStore } from "./secrets.ts";
 import { isGoogleConnected, oauthClient } from "./gcal/auth.ts";
-import { ensurePosTasklist, pushTasks } from "./gcal/sync.ts";
+import { ensurePosTasklist, pushTasks, DEFAULT_TASKLIST_ID } from "./gcal/sync.ts";
 
 /** Whole reconciliation is time-boxed — it runs on a cron and must never wedge. */
 export const RECONCILE_TIMEOUT_MS = 60_000;
@@ -505,62 +505,73 @@ export async function purgeOrphanedGoogleTasks(
   const out: PurgeResult = { scanned: 0, deleted: 0, kept: 0, samples: [] };
   if (!deps.isConnected(secrets)) return { ...out, error: "not_connected" };
 
-  let tasklist: string;
+  let posList: string;
   try {
-    tasklist = await deps.ensureTasklist();
+    posList = await deps.ensureTasklist();
   } catch (e) {
     return { ...out, error: (e as Error).message };
   }
+  // Both lists POS can write to since routing landed (gcal/sync.targetTasklistFor): its own
+  // list and the owner's default "Tasks" tab. Scanning the default one is safe precisely
+  // because the rules below only ever delete rows carrying a POS marker or POS's own
+  // "Tentative:" prefix — a task he typed on his phone has neither and is never touched.
+  const lists = [posList, DEFAULT_TASKLIST_ID];
 
   const liveTask = db.prepare("SELECT 1 FROM task WHERE id = ?");
   const liveCommitment = db.prepare(
     "SELECT 1 FROM commitment WHERE id = ? AND status IN ('open','scheduled')"
   );
 
-  let pageToken: string | undefined;
-  do {
-    let page;
-    try {
-      page = await deps.listTasks({ tasklist, pageToken });
-    } catch (e) {
-      return { ...out, error: (e as Error).message };
-    }
-    for (const g of page.items ?? []) {
-      if (!g.id) continue;
-      out.scanned++;
-      if (g.deleted === true) continue; // already gone; nothing to do
-
-      const title = (g.title ?? "").trim();
-      let doomed = false;
-      if (/^tentative:\s/i.test(title)) {
-        doomed = true;
-      } else {
-        const taskId = taskIdFromNotes(g.notes);
-        const commitmentId = commitmentIdFromNotes(g.notes);
-        if (taskId != null) doomed = !liveTask.get(taskId);
-        else if (commitmentId != null) doomed = !liveCommitment.get(commitmentId);
-        // no marker at all → his own row, never touched
-      }
-
-      if (!doomed) {
-        out.kept++;
-        continue;
-      }
-      if (!opts.apply) {
-        out.deleted++;
-        if (out.samples.length < 15) out.samples.push(title || "(untitled)");
-        continue;
-      }
+  const seenIds = new Set<string>(); // '@default' may resolve to a list already scanned
+  for (const tasklist of lists) {
+    let pageToken: string | undefined;
+    do {
+      let page;
       try {
-        await deps.deleteTask({ tasklist, task: g.id });
-        out.deleted++;
-        if (out.samples.length < 15) out.samples.push(title || "(untitled)");
+        page = await deps.listTasks({ tasklist, pageToken });
       } catch (e) {
-        console.warn(`gtasks purge: ${g.id} failed: ${(e as Error).message}`);
+        // One unreadable list must not lose the other's cleanup.
+        console.warn(`gtasks purge: listing ${tasklist} failed: ${(e as Error).message}`);
+        break;
       }
-    }
-    pageToken = page.nextPageToken ?? undefined;
-  } while (pageToken);
+      for (const g of page.items ?? []) {
+        if (!g.id || seenIds.has(g.id)) continue;
+        seenIds.add(g.id);
+        out.scanned++;
+        if (g.deleted === true) continue; // already gone; nothing to do
+
+        const title = (g.title ?? "").trim();
+        let doomed = false;
+        if (/^tentative:\s/i.test(title)) {
+          doomed = true;
+        } else {
+          const taskId = taskIdFromNotes(g.notes);
+          const commitmentId = commitmentIdFromNotes(g.notes);
+          if (taskId != null) doomed = !liveTask.get(taskId);
+          else if (commitmentId != null) doomed = !liveCommitment.get(commitmentId);
+          // no marker at all → his own row, never touched
+        }
+
+        if (!doomed) {
+          out.kept++;
+          continue;
+        }
+        if (!opts.apply) {
+          out.deleted++;
+          if (out.samples.length < 15) out.samples.push(title || "(untitled)");
+          continue;
+        }
+        try {
+          await deps.deleteTask({ tasklist, task: g.id });
+          out.deleted++;
+          if (out.samples.length < 15) out.samples.push(title || "(untitled)");
+        } catch (e) {
+          console.warn(`gtasks purge: ${g.id} failed: ${(e as Error).message}`);
+        }
+      }
+      pageToken = page.nextPageToken ?? undefined;
+    } while (pageToken);
+  }
 
   return out;
 }

@@ -25,6 +25,43 @@ import type { Flexibility } from "../engine/grid.ts";
 export const POS_CALENDAR_NAME = "POS — Planned";
 export const POS_TASKLIST_NAME = "POS";
 
+/**
+ * Google's own default list — the "Tasks" tab he actually looks at on the phone. Addressable
+ * by this alias, so it needs no lookup and no creation.
+ */
+export const DEFAULT_TASKLIST_ID = "@default";
+
+/** A dated task this many days out or nearer counts as near-term. */
+export const NEAR_TERM_DAYS = 7;
+
+/**
+ * Which Google list a task belongs in (owner directive 2026-08-11: "all daily/near-time
+ * tasks to my Tasks tab, long term people commitments to the POS tab").
+ *
+ * The split is by WHEN, not by origin, because that is what he reads the lists for: the
+ * Tasks tab is what he is doing now, the POS list is the pile of obligations to people that
+ * has no date yet. So a recurring habit instance, a reminder he tapped through from
+ * Messages, and anything dated inside NEAR_TERM_DAYS all land in Tasks — including a
+ * commitment that has come due. Everything else — undated work, and people-commitments
+ * scheduled further out than a week — stays in POS.
+ *
+ * Pure and exported so the routing can be tested without Google.
+ */
+export function targetTasklistFor(
+  t: { plan_date: string | null; recurrence_parent_id?: number | null; reminder_id?: string | null },
+  todayISO: string,
+  posListId: string
+): string {
+  if (t.recurrence_parent_id != null) return DEFAULT_TASKLIST_ID; // daily habit instance
+  if (t.reminder_id) return DEFAULT_TASKLIST_ID; // he chose it in Reminders — it's live work
+  if (t.plan_date) {
+    const horizon = new Date(`${todayISO}T00:00:00Z`);
+    horizon.setUTCDate(horizon.getUTCDate() + NEAR_TERM_DAYS);
+    if (t.plan_date <= horizon.toISOString().slice(0, 10)) return DEFAULT_TASKLIST_ID;
+  }
+  return posListId;
+}
+
 function calApi(secrets: SecretStore): calendar_v3.Calendar {
   return google.calendar({ version: "v3", auth: oauthClient(secrets) });
 }
@@ -92,6 +129,8 @@ export interface PushTasksApi {
     }>;
     insert(args: { tasklist: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
     update(args: { tasklist: string; task: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
+    /** Google Tasks has no move, so re-routing a task between lists is delete-then-insert. */
+    delete(args: { tasklist: string; task: string }): Promise<unknown>;
   };
 }
 
@@ -1179,13 +1218,14 @@ async function pushTasksInner(
   // Google Tasks with no due date at all, which is what he saw.
   const open = db
     .prepare(
-      `SELECT id, title, notes, plan_date, hard_deadline_at, gtasks_id, gtasks_list
+      `SELECT id, title, notes, plan_date, hard_deadline_at, gtasks_id, gtasks_list,
+              recurrence_parent_id, reminder_id
          FROM task WHERE status IN ('inbox','planned','in_progress')`
     )
     .all() as {
     id: number; title: string; notes: string | null;
     plan_date: string | null; hard_deadline_at: string | null; gtasks_id: string | null;
-    gtasks_list: string | null;
+    gtasks_list: string | null; recurrence_parent_id: number | null; reminder_id: string | null;
   }[];
   for (const t of open) {
     // A clock-time deadline is more specific than a plain day, so it wins when both exist.
@@ -1202,27 +1242,44 @@ async function pushTasksInner(
     const marker = `pos:task:${t.id}`;
     const notes = t.notes ? `${t.notes}\n${marker}` : marker;
     const body = { title: t.title, notes, due };
+    const target = targetTasklistFor(t, todayLocalISO(), listId);
+    const currentList = t.gtasks_list ?? listId;
     if (t.gtasks_id) {
-      try {
-        // A task imported from another list ('@default' — the phone's "My Tasks") lives
-        // there; updating it against the POS list is a 404 that would then re-insert it
-        // into the POS list as a duplicate the owner never asked to move.
-        await api.tasks.update({
-          tasklist: t.gtasks_list ?? listId,
-          task: t.gtasks_id,
-          requestBody: { ...body, id: t.gtasks_id },
-        });
-        continue;
-      } catch (e) {
-        // Only a MISSING task justifies re-inserting. A scope refusal would fail the
-        // insert identically, so surface it instead of doubling the failed calls.
-        if (needsReconsent(e)) throw e;
-        /* fall through to insert */
+      // Already in the right list: update in place. A task imported from another list
+      // ('@default' — the phone's "My Tasks") lives there; updating it against the POS
+      // list is a 404 that would then re-insert it as a duplicate he never asked for.
+      if (currentList === target) {
+        try {
+          await api.tasks.update({
+            tasklist: currentList,
+            task: t.gtasks_id,
+            requestBody: { ...body, id: t.gtasks_id },
+          });
+          continue;
+        } catch (e) {
+          // Only a MISSING task justifies re-inserting. A scope refusal would fail the
+          // insert identically, so surface it instead of doubling the failed calls.
+          if (needsReconsent(e)) throw e;
+          /* fall through to insert */
+        }
+      } else {
+        // Wrong list — a task crossed the near-term horizon, or was pushed before routing
+        // existed. Google Tasks has no move, so this is delete-then-insert. The delete is
+        // best-effort: if it fails the row is left behind as an orphan, which the purge
+        // cleans, and that is strictly better than skipping the move and leaving it
+        // permanently in the list he does not read.
+        try {
+          await api.tasks.delete({ tasklist: currentList, task: t.gtasks_id });
+        } catch (e) {
+          if (needsReconsent(e)) throw e;
+          /* fall through and insert into the target list anyway */
+        }
       }
     }
-    const created = await api.tasks.insert({ tasklist: listId, requestBody: body });
-    // The re-insert landed in the POS list wherever the row lived before.
-    db.prepare("UPDATE task SET gtasks_id = ?, gtasks_list = NULL WHERE id = ?").run(created.data.id ?? null, t.id);
+    const created = await api.tasks.insert({ tasklist: target, requestBody: body });
+    // NULL means "the POS list" (see gtasks-sync); anything else is stored explicitly.
+    db.prepare("UPDATE task SET gtasks_id = ?, gtasks_list = ? WHERE id = ?")
+      .run(created.data.id ?? null, target === listId ? null : target, t.id);
     pushed++;
   }
 
