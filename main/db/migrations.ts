@@ -676,4 +676,21 @@ ALTER TABLE task ADD COLUMN reminder_id TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_task_reminder_id ON task(reminder_id);
 `,
   },
+  {
+    version: 20,
+    name: "extraction_recency_index",
+    sql: `
+-- Commitment extraction now bounds itself to the last two days (EXTRACT_LOOKBACK). Its
+-- selection filters and orders on occurred_at, and there was no index on that column: the
+-- owner's interaction table holds 23,457 unextracted rows going back to 2023-07-05, so
+-- every worker tick would scan all of them to find the handful that are recent.
+--
+-- Why the bound exists at all, recorded here because the evidence is worth keeping: the old
+-- query ordered by row id — insertion order — with no age limit, so an imported message
+-- history presented itself as "newest". Measured in his database, commitments were being
+-- created 23, 36, 63, even 83 days after the message was sent. "Do Kumail and Hasan's
+-- tasks" was extracted 2026-08-10 from a message sent 2026-05-20.
+CREATE INDEX IF NOT EXISTS idx_interaction_extract_scan ON interaction(extracted_at, occurred_at);
+`,
+  },
 ];

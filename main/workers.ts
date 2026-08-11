@@ -77,6 +77,15 @@ export type ConnectorFn = (deps: ConnectorDeps, extra?: string) => Promise<SyncR
 /** Cap on interactions fed to commitment extraction per run (newest first). */
 const EXTRACT_CAP = 50;
 
+/**
+ * How far back extraction may look, as a SQLite datetime modifier. Nothing older than this
+ * is ever mined, at any point, on any run — see the query in the post-ingest hook for why
+ * (a backfilled three-year message history read as "newest" and produced commitments from
+ * conversations long finished). Sized to cover the app having been closed for a couple of
+ * days; it is a bound on staleness, not a backlog to work through.
+ */
+export const EXTRACT_LOOKBACK = "-2 days";
+
 const CONNECTORS: Record<SyncSource, ConnectorFn> = {
   gmail: (deps) => syncAllMail(deps), // every configured mail account (gmail/outlook/imap)
   imessage: (deps) => syncImessage(deps),
@@ -171,12 +180,31 @@ export async function runSync(
       // One-shot duplicate backfill, on the first sync after the upgrade. The setting
       // guard makes every later call a single indexed lookup.
       await cleanupDuplicateCommitments(db, secrets);
+      // Recency window (owner directive 2026-08-10). Extraction used to select purely on
+      // `extracted_at IS NULL ORDER BY id DESC`, with no bound on how OLD a message could
+      // be. That ordering is by row id — insertion order — not by when the message was
+      // sent, so a backfill of three years of iMessage history (23,457 rows reaching back
+      // to 2023-07-05, measured in his database) presented itself as "newest" and was mined
+      // as though it were today's traffic. That is where tasks he could not place came
+      // from: "collect the international block from Papa", Tara/Ethan's-mom logistics from
+      // months ago, all extracted long after they mattered.
+      //
+      // Two days is deliberately the ONLY lookback, and it is what makes the reboot case
+      // and the steady-state case the same code path: running continuously, nothing older
+      // than the last tick is ever new; after the app has been off for a while, this is
+      // exactly the catch-up he asked for and no more. Rows older than the window keep
+      // extracted_at NULL forever, which is correct — they are history, not a backlog.
       const ids = (
         db
           .prepare(
-            "SELECT id FROM interaction WHERE extracted_at IS NULL ORDER BY id DESC LIMIT ?"
+            `SELECT id FROM interaction
+              WHERE extracted_at IS NULL
+                AND occurred_at IS NOT NULL
+                AND occurred_at >= datetime('now', ?)
+              ORDER BY occurred_at DESC
+              LIMIT ?`
           )
-          .all(EXTRACT_CAP) as { id: number }[]
+          .all(EXTRACT_LOOKBACK, EXTRACT_CAP) as { id: number }[]
       ).map((r) => r.id);
       if (llm && ids.length) {
         const beforeMax = (
