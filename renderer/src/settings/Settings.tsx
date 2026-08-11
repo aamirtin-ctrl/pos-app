@@ -905,6 +905,40 @@ function GoogleCard({
     setBusy(null);
   };
 
+  // Two-step on purpose: the first click only counts, and the button becomes the confirm.
+  // Deleting Google rows is not undoable from here, and the count is the whole reassurance
+  // — 1200 scanned, 38 kept — so it has to be seen before anything goes.
+  const [purge, setPurge] = useState<PurgePreview | null>(null);
+
+  const previewPurge = async () => {
+    setBusy("purge");
+    setMsg(null);
+    setPurge(null);
+    const r = await window.pos.gtasks.purgePreview();
+    if (r.ok) {
+      const d = (r.data ?? {}) as PurgePreview;
+      setPurge(d);
+      setMsg(
+        d.deleted === 0
+          ? `Nothing to clean — all ${d.kept} POS task${d.kept === 1 ? "" : "s"} in Google are still live.`
+          : `${d.deleted} orphaned row${d.deleted === 1 ? "" : "s"} to delete, ${d.kept} kept. Click again to confirm.`
+      );
+    } else setMsg(r.error ?? "preview failed");
+    setBusy(null);
+  };
+
+  const applyPurge = async () => {
+    setBusy("purge");
+    setMsg(null);
+    const r = await window.pos.gtasks.purgeApply();
+    if (r.ok) {
+      const d = (r.data ?? {}) as PurgePreview;
+      setMsg(`Deleted ${d.deleted} orphaned Google task${d.deleted === 1 ? "" : "s"}. ${d.kept} kept.`);
+    } else setMsg(r.error ?? "purge failed");
+    setPurge(null);
+    setBusy(null);
+  };
+
   const status: IntegrationStatus =
     gcal?.connected ? "connected" : gcal?.hasCreds ? "ready" : "needs-setup";
 
@@ -995,14 +1029,38 @@ function GoogleCard({
             On: accepting a plan sends it straight to Google, and anything that didn&rsquo;t get
             through is retried in the background every 15 minutes.
           </p>
-          <button
-            onClick={reconcile}
-            disabled={busy === "reconcile"}
-            className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-50"
-            style={{ borderColor: "var(--line)" }}
-          >
-            {busy === "reconcile" ? "Checking…" : "Re-check moved events"}
-          </button>
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              onClick={reconcile}
+              disabled={busy === "reconcile"}
+              className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-50"
+              style={{ borderColor: "var(--line)" }}
+            >
+              {busy === "reconcile" ? "Checking…" : "Re-check moved events"}
+            </button>
+            <button
+              onClick={purge && purge.deleted > 0 ? applyPurge : previewPurge}
+              disabled={busy === "purge"}
+              className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-50"
+              style={
+                purge && purge.deleted > 0
+                  ? { borderColor: "var(--danger)", color: "var(--danger)" }
+                  : { borderColor: "var(--line)" }
+              }
+            >
+              {busy === "purge"
+                ? "Working…"
+                : purge && purge.deleted > 0
+                  ? `Delete ${purge.deleted} orphaned task${purge.deleted === 1 ? "" : "s"}`
+                  : "Clean up orphaned tasks"}
+            </button>
+          </div>
+          {purge && purge.deleted > 0 && purge.samples.length > 0 && (
+            <p className="text-[11px] mt-1.5 leading-relaxed" style={{ color: "var(--muted)" }}>
+              e.g. {purge.samples.slice(0, 4).join(" · ")}
+              {purge.deleted > 4 ? " …" : ""}
+            </p>
+          )}
         </>
       )}
       {msg && <p className="text-xs mt-2" style={{ color: "var(--muted)" }}>{msg}</p>}
@@ -1016,6 +1074,9 @@ function GoogleCard({
  */
 type AppleAvailability = { ok: boolean; error?: string; calendars?: number };
 type MirrorCounts = { created?: number; updated?: number; deleted?: number; skipped?: number; events?: number };
+
+/** gtasks.purgePreview / purgeApply result (main/gtasks-sync.PurgeResult). */
+type PurgePreview = { scanned: number; deleted: number; kept: number; samples: string[] };
 
 const EXCLUDED_KEY = "apple_calendars_excluded";
 const parseExcluded = (raw: unknown): string[] =>
