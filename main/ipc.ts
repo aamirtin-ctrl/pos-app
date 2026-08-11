@@ -100,7 +100,7 @@ import {
   RECONSENT_REQUIRED,
 } from "./gcal/auth.ts";
 import { google } from "googleapis";
-import { reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent, dropCommitmentCascade } from "./gcal/sync.ts";
+import { reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent, dropCommitmentCascade, deleteGoogleEvent } from "./gcal/sync.ts";
 import { listSubscriptions, addSubscription, removeSubscription, eventsForDate as icsEventsForDate, icsBlockType } from "./icscal.ts";
 import {
   notionAvailable, searchTargets, syncNotion, PARENT_PAGE_KEY,
@@ -113,6 +113,7 @@ import {
   mirrorToGoogle,
   listAppleCalendars,
   excludedCalendarNames,
+  deleteAppleEvent,
 } from "./applecal.ts";
 import fs from "node:fs";
 import path from "node:path";
@@ -649,6 +650,28 @@ export function registerIpc(deps: IpcDeps) {
     return out;
   });
 
+  // Delete an event shown on the day view (select → ⌫). The events the day shows are
+  // real Google-calendar events (POS's own calendars are excluded from anchors), so the
+  // primary path is a Google delete by (calendarId, eventId). If the event is flagged as
+  // Apple-sourced we also remove the Calendar.app original so the mirror can't re-create it.
+  // ICS-feed rows have no gcalEventId — those are read-only subscriptions, reported as such.
+  h("calendar.deleteEvent", async (ev: {
+    gcalEventId?: string; calendarId?: string; iCalUID?: string; source?: string;
+  }) => {
+    if (!ev || typeof ev !== "object") return { ok: false, error: "no event given" };
+    if (ev.gcalEventId && ev.calendarId) {
+      const g = await deleteGoogleEvent(secrets, ev.calendarId, ev.gcalEventId);
+      if (!g.ok) return { ok: false, error: g.error };
+      if (ev.source === "apple" && ev.iCalUID) await deleteAppleEvent(ev.iCalUID);
+      return { ok: true };
+    }
+    if (ev.source === "apple" && ev.iCalUID) {
+      const a = await deleteAppleEvent(ev.iCalUID);
+      return a.ok ? { ok: true } : { ok: false, error: a.error.message };
+    }
+    return { ok: false, error: "This event is a read-only subscription and can't be deleted from POS." };
+  });
+
   // ── subscribed calendars (webcal/ICS) ──
   h("ics.list", () => listSubscriptions(db));
   h("ics.add", (url: string, name?: string) => addSubscription(db, url, name));
@@ -683,6 +706,9 @@ export function registerIpc(deps: IpcDeps) {
   // names for the Settings picker; POS's own mirror calendars are never listed
   h("applecal.calendars", () => listAppleCalendars());
   h("applecal.events", (dateISO: string) => readAppleEvents(dateISO, { exclude: excludedCalendarNames(db), db }));
+  // Per-event delete from the day view (select an event → ⌫). Removes it from
+  // Calendar.app by UID; the next scan/refresh reflects it. Returns {ok, deleted}.
+  h("applecal.deleteEvent", (uid: string, calendar?: string) => deleteAppleEvent(uid, calendar));
   // The mirror writes to Google too, so it hits the same stale-scope wall — map it to the
   // one typed string the UI knows how to act on. (applecal.ts stays free of auth policy.)
   h("applecal.mirror", async (dateISO: string) => {

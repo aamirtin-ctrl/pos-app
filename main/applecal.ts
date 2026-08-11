@@ -566,6 +566,42 @@ export async function appleCalendarAvailable(): Promise<{ ok: boolean; error?: s
   return { ok: true, calendars: parseCalendarNames(res.stdout).length };
 }
 
+/**
+ * Delete a Calendar.app event by its UID. Powers the renderer's per-event delete
+ * (select an event → ⌫). `calendarName`, when supplied, restricts the (slow)
+ * `whose uid` scan to the one calendar the event was read from; otherwise every
+ * calendar is checked. A per-calendar `try` keeps one unreadable calendar from
+ * aborting the delete. Returns how many matching events were removed (0 = the UID
+ * was already gone, treated as success by the caller).
+ */
+export async function deleteAppleEvent(
+  uid: string,
+  calendarName?: string
+): Promise<{ ok: true; deleted: number } | { ok: false; error: AppleCalError }> {
+  const guardOpen = calendarName ? `if (name of c) is ${asString(calendarName)} then` : "if true then";
+  const script = [
+    'tell application "Calendar"',
+    "  set n to 0",
+    "  repeat with c in calendars",
+    `    ${guardOpen}`,
+    "      try",
+    `        set matches to (every event of c whose uid is ${asString(uid)})`,
+    "        repeat with e in matches",
+    "          delete e",
+    "          set n to n + 1",
+    "        end repeat",
+    "      end try",
+    "    end if",
+    "  end repeat",
+    "  return n",
+    "end tell",
+  ].join("\n");
+  const res = await runOsascript(script, 60_000);
+  if (!res.ok) return { ok: false, error: res.error };
+  const deleted = parseInt((res.stdout || "0").trim(), 10);
+  return { ok: true, deleted: Number.isFinite(deleted) ? deleted : 0 };
+}
+
 // ── mirror into Google ───────────────────────────────────────────────────────
 
 function calApi(secrets: SecretStore): calendar_v3.Calendar {

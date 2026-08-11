@@ -90,6 +90,8 @@ contextBridge.exposeInMainWorld("pos", {
     reconcile: call("gcal.reconcile"),
     events: call("gcal.events"),
   },
+  // Cross-source calendar ops used by the day view (delete the selected event).
+  calendar: { deleteEvent: call("calendar.deleteEvent") },
   ics: { list: call("ics.list"), add: call("ics.add"), remove: call("ics.remove") },
   notion: {
     available: call("notion.available"),
@@ -111,6 +113,7 @@ contextBridge.exposeInMainWorld("pos", {
     calendars: call("applecal.calendars"),
     events: call("applecal.events"),
     mirror: call("applecal.mirror"),
+    deleteEvent: call("applecal.deleteEvent"),
   },
   // System-wide voice-capture shortcut (main/index.ts globalShortcut).
   hotkey: { get: call("hotkey.get"), set: call("hotkey.set") },

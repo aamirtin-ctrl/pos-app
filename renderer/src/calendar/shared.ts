@@ -18,7 +18,7 @@ export type PlanView = {
   push?: { pushed: number; tasks: number; withdrawn: number; error?: string };
 };
 /** `source` is absent for Google anchors, "ics" for subscribed feeds, "apple" for Calendar.app. */
-export type ExternalEvent = { startMin: number; endMin: number; title: string; blockType: string; source?: string };
+export type ExternalEvent = { startMin: number; endMin: number; title: string; blockType: string; source?: string; gcalEventId?: string; iCalUID?: string; calendarId?: string };
 
 export type Item = {
   key: string; startMin: number; endMin: number; title: string; type: string;
@@ -29,6 +29,11 @@ export type Item = {
   taskId?: number | null;
   capacityScore?: number | null;
   source?: string;
+  /** Calendar-event identity, carried through so a shown event can be deleted
+   * precisely (select → ⌫). Present only on external calendar events. */
+  gcalEventId?: string;
+  iCalUID?: string;
+  calendarId?: string;
 };
 
 /** Everything one day's view needs — cached per date so flips render instantly. */
@@ -419,7 +424,7 @@ export function buildItems(plan: PlanView | null, external: ExternalEvent[]): It
   const fromGcal: Item[] = externalsToShow.map((e, i) => ({
     key: `x${i}`, startMin: e.startMin, endMin: e.endMin, title: e.title,
     type: e.blockType || "event", external: true, anchor: false, locked: false,
-    source: e.source,
+    source: e.source, gcalEventId: e.gcalEventId, iCalUID: e.iCalUID, calendarId: e.calendarId,
   }));
   return [...fromPlan, ...fromGcal].sort((a, b) => a.startMin - b.startMin || a.endMin - b.endMin);
 }

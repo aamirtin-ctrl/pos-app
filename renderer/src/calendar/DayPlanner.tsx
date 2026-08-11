@@ -545,6 +545,7 @@ export default function DayPlanner() {
                 onDropOnDate={moveToDate}
                 onCarryHover={setCarryTarget}
                 onDragStart={closePopover}
+                onDeleted={refresh}
                 task={(it.taskId != null && tasksById.get(it.taskId)) || null} />
             ))}
 
@@ -638,12 +639,14 @@ function GapHint({ startMin, endMin, dim }: { startMin: number; endMin: number; 
  * own rect. Only one popover is open at a time — the open card's key lives in
  * DayPlanner, not here.
  */
-function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task, onMove, onResize, onDropOnDate, onCarryHover, dragOffset, onDragStart }: {
+function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task, onMove, onResize, onDropOnDate, onCarryHover, dragOffset, onDragStart, onDeleted }: {
   item: LaidOutItem; height: number; status: "past" | "current" | "future"; nowMin: number;
   open: boolean;
   onToggle: () => void;
   onClose: () => void;
   task: { title: string; status: string } | null;
+  /** Refresh the day after an external event was deleted from the popover. */
+  onDeleted?: () => void;
   /** Commit a drag: the block is pinned here and the day re-solves around it. */
   onMove?: (blockId: number, startMin: number) => void;
   /** Commit an edge drag: the block keeps its other edge and the day re-solves. */
@@ -925,7 +928,7 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
           </div>,
           document.body
         )}
-      {open && <EventPopover item={item} anchorRef={cardRef} task={task} onClose={onClose} />}
+      {open && <EventPopover item={item} anchorRef={cardRef} task={task} onClose={onClose} onDeleted={onDeleted} />}
     </div>
   );
 }

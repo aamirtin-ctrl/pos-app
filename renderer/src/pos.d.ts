@@ -124,7 +124,9 @@ declare global {
         pages: Call; page: Call; append: Call; check: Call; createPage: Call;
         rows: Call; updateBlock: Call; deleteBlock: Call;
       };
-      applecal: { available: Call; calendars: Call; events: Call; mirror: Call };
+      applecal: { available: Call; calendars: Call; events: Call; mirror: Call; deleteEvent: Call };
+      /** Cross-source calendar ops for the day view (Google + Apple aware). */
+      calendar: { deleteEvent: Call };
       settings: {
         keys: Call; setKey: Call; doctrineGet: Call; doctrineSet: Call;
         spend: Call; setCeiling: Call; get: Call; set: Call;

@@ -28,6 +28,28 @@ export const POS_TASKLIST_NAME = "POS";
 function calApi(secrets: SecretStore): calendar_v3.Calendar {
   return google.calendar({ version: "v3", auth: oauthClient(secrets) });
 }
+
+/**
+ * Delete a single Google Calendar event (powers the day view's select→⌫). A 404/410
+ * means it is already gone, which we report as success. This deletes the event the
+ * user is looking at; if it is the Apple-mirror copy, the caller also deletes the
+ * Apple source so the next mirror pass does not re-create it.
+ */
+export async function deleteGoogleEvent(
+  secrets: SecretStore,
+  calendarId: string,
+  eventId: string
+): Promise<{ ok: boolean; error?: string }> {
+  if (!calendarId || !eventId) return { ok: false, error: "missing calendar or event id" };
+  try {
+    await calApi(secrets).events.delete({ calendarId, eventId });
+    return { ok: true };
+  } catch (e) {
+    const msg = (e as Error).message || "delete failed";
+    if (/\b(404|410)\b|already deleted|not found|has been deleted/i.test(msg)) return { ok: true };
+    return { ok: false, error: msg };
+  }
+}
 function tasksApi(secrets: SecretStore): tasks_v1.Tasks {
   return google.tasks({ version: "v1", auth: oauthClient(secrets) });
 }
