@@ -561,13 +561,30 @@ export async function purgeOrphanedGoogleTasks(
           if (out.samples.length < 15) out.samples.push(title || "(untitled)");
           continue;
         }
-        try {
-          await deps.deleteTask({ tasklist, task: g.id });
-          out.deleted++;
-          if (out.samples.length < 15) out.samples.push(title || "(untitled)");
-        } catch (e) {
-          console.warn(`gtasks purge: ${g.id} failed: ${(e as Error).message}`);
+        // Paced, with backoff. The first apply run fired deletes as fast as the network
+        // allowed (~300-600/min), blew through the Tasks API's per-100s rate window, and
+        // 2,593 of 11,135 deletes came back "Quota Exceeded" — the quota is a RATE, not a
+        // budget, so the fix is patience: ~3/s steady, and on a quota refusal sleep 45s
+        // and retry the same row up to 3 times before giving up on the run.
+        let done = false;
+        for (let attempt = 0; attempt < 3 && !done; attempt++) {
+          try {
+            await deps.deleteTask({ tasklist, task: g.id });
+            done = true;
+            out.deleted++;
+            if (out.samples.length < 15) out.samples.push(title || "(untitled)");
+          } catch (e) {
+            const msg = (e as Error).message;
+            if (/quota|rate ?limit|429/i.test(msg) && attempt < 2) {
+              await new Promise((r) => setTimeout(r, 45_000));
+              continue;
+            }
+            console.warn(`gtasks purge: ${g.id} failed: ${msg}`);
+            if (/quota|rate ?limit|429/i.test(msg)) return { ...out, error: "quota exhausted — re-run later to finish" };
+            break;
+          }
         }
+        await new Promise((r) => setTimeout(r, 350));
       }
       pageToken = page.nextPageToken ?? undefined;
     } while (pageToken);
