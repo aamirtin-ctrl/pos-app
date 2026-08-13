@@ -139,6 +139,14 @@ contextBridge.exposeInMainWorld("pos", {
     ipcRenderer.on("pos:voice-capture", listener);
     return () => { ipcRenderer.removeListener("pos:voice-capture", listener); };
   },
+  // Main fires this when a background calendar refresh discovers the snapshot it served was
+  // stale (e.g. an event deleted on another device). Payload is the affected date (ISO).
+  // Same bridge rules as onVoiceCapture: no raw event crosses; returns the unsubscribe.
+  onDayChanged: (cb: (dateISO: string) => void) => {
+    const listener = (_e: unknown, dateISO: string) => cb(dateISO);
+    ipcRenderer.on("pos:day-changed", listener);
+    return () => { ipcRenderer.removeListener("pos:day-changed", listener); };
+  },
   settings: {
     keys: call("settings.keys"),
     setKey: call("settings.setKey"),

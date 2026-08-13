@@ -582,6 +582,27 @@ export function clearAnchorsCache(): void {
   anchorsLiveOnlyUntil = Date.now() + ANCHORS_TTL_MS;
 }
 
+// The stale-while-revalidate read below serves a persisted snapshot and refreshes in the
+// background. Without this hook the refresh corrected the caches but nobody told the renderer,
+// so an event deleted in Apple/Google Calendar stayed on screen until some unrelated re-fetch
+// (owner report 2026-08-13). main/index.ts registers a callback that pings the day view.
+let anchorsRefreshedNotifier: ((dateISO: string) => void) | null = null;
+
+export function setAnchorsRefreshedNotifier(fn: (dateISO: string) => void): void {
+  anchorsRefreshedNotifier = fn;
+}
+
+/**
+ * Did a background refresh materially change what the renderer was shown? Compared on the
+ * fields the day view renders (identity, span, title) — order-insensitive. Pure, for tests.
+ */
+export function anchorsDiffer(a: readonly ExternalAnchor[], b: readonly ExternalAnchor[]): boolean {
+  if (a.length !== b.length) return true;
+  const key = (x: ExternalAnchor) => `${x.gcalEventId}|${x.startMin}|${x.endMin}|${x.title}`;
+  const seen = new Set(a.map(key));
+  return b.some((x) => !seen.has(key(x)));
+}
+
 /**
  * Read anchors for a date from ALL calendars except the POS calendar.
  * External events are immovable by definition. Cached per-date for 60s;
@@ -601,6 +622,11 @@ export async function readAnchors(db: Db, secrets: SecretStore, dateISO: string)
       if (!anchorsRefreshing.has(dateISO)) {
         anchorsRefreshing.add(dateISO);
         void readAnchorsLive(db, secrets, dateISO)
+          .then((fresh) => {
+            // The snapshot we just served may be stale (e.g. an event deleted on another
+            // device). If the live read disagrees, tell the renderer to re-pull this day.
+            if (anchorsDiffer(persisted, fresh)) anchorsRefreshedNotifier?.(dateISO);
+          })
           .catch((e) => console.warn(`gcal: background anchors refresh failed: ${(e as Error).message}`))
           .finally(() => anchorsRefreshing.delete(dateISO));
       }

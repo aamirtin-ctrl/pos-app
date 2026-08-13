@@ -217,6 +217,12 @@ export default function DayPlanner() {
     prefetchNeighbors(forDate); // never awaited — previews fill in silently
   }, [date, refreshLocal, refreshExternal, prefetchNeighbors]);
 
+  // Main pings this when a background calendar refresh finds the snapshot it served was stale
+  // (e.g. an event deleted from Apple/Google on another device). Without it the deleted event
+  // sat on screen until some unrelated re-fetch. refreshExternal's own stale-response guard
+  // handles the case where the user has since navigated away from that date.
+  useEffect(() => window.pos.onDayChanged((dateISO) => void refreshExternal(dateISO)), [refreshExternal]);
+
   // ── drag to move: pin, then let the day rebuild around the pin ──
   //
   // Owner ask 2026-08-06: "when I move around the events, the breaks and whatever else can

@@ -146,6 +146,7 @@ declare global {
        * window, which treats each one as a toggle. Returns its unsubscribe.
        */
       onVoiceCapture: (cb: () => void) => () => void;
+      onDayChanged: (cb: (dateISO: string) => void) => () => void;
       /** Provider reachability — see LlmHealth above. */
       llm: { health: Call<LlmHealth> };
       msgplans: { run: Call; list: Call };
