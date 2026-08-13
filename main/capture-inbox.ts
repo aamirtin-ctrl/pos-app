@@ -24,7 +24,7 @@
 import type { Db } from "./db/db.ts";
 
 /** Where he said it. Every surface that can carry an instruction writes one of these. */
-export type CaptureSource = "sparkle" | "self_email" | "imessage" | "alexa";
+export type CaptureSource = "sparkle" | "self_email" | "imessage" | "alexa" | "apple_notes";
 
 export interface CaptureRow {
   id: number;
