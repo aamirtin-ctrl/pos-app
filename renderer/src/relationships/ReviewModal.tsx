@@ -72,14 +72,25 @@ type AmbiguousItem = {
   candidates: { id: number; display_name: string; org: string | null; role: string | null }[];
 };
 
+type NoteChunk = { name?: string; org?: string; role?: string; phone?: string; email?: string; facts: string[] };
+
+type NoteChunkItem = {
+  key: string;
+  chunk: NoteChunk;
+  text: string;
+  firstSeenAt: string;
+  candidates: { id: number; display_name: string; org: string | null; role: string | null }[];
+};
+
 type Queue = {
   contacts: PendingContact[];
   duplicates: DuplicateCluster[];
   ambiguous: AmbiguousItem[];
-  counts: { contacts: number; duplicates: number; ambiguous: number; total: number };
+  notes: NoteChunkItem[];
+  counts: { contacts: number; duplicates: number; ambiguous: number; notes: number; total: number };
 };
 
-type Tab = "contacts" | "duplicates" | "ambiguous";
+type Tab = "contacts" | "duplicates" | "ambiguous" | "notes";
 
 const sub = (role: string | null, org: string | null) => [role, org].filter(Boolean).join(" · ");
 
@@ -154,7 +165,15 @@ export default function ReviewModal() {
     setError(null);
     if (pick) {
       setTab(
-        q.counts.contacts > 0 ? "contacts" : q.counts.duplicates > 0 ? "duplicates" : q.counts.ambiguous > 0 ? "ambiguous" : "contacts"
+        q.counts.contacts > 0
+          ? "contacts"
+          : q.counts.duplicates > 0
+            ? "duplicates"
+            : q.counts.ambiguous > 0
+              ? "ambiguous"
+              : q.counts.notes > 0
+                ? "notes"
+                : "contacts"
       );
     }
   }, []);
@@ -231,7 +250,7 @@ export default function ReviewModal() {
   };
 
   const ids = useMemo(() => [...selected], [selected]);
-  const counts = queue?.counts ?? { contacts: 0, duplicates: 0, ambiguous: 0, total: 0 };
+  const counts = queue?.counts ?? { contacts: 0, duplicates: 0, ambiguous: 0, notes: 0, total: 0 };
 
   if (!open) return null;
 
@@ -239,6 +258,7 @@ export default function ReviewModal() {
     { key: "contacts", label: "New contacts", count: counts.contacts },
     { key: "duplicates", label: "Possible duplicates", count: counts.duplicates },
     { key: "ambiguous", label: "Ambiguous", count: counts.ambiguous },
+    { key: "notes", label: "Notes", count: counts.notes },
   ];
 
   return (
@@ -480,6 +500,68 @@ export default function ReviewModal() {
             ) : (
               <p className="text-sm py-2" style={{ color: "var(--muted)" }}>
                 Nothing ambiguous right now.
+              </p>
+            ))}
+
+          {/* ── Notes — chunks the Apple Notes gleaner held for a decision ── */}
+          {tab === "notes" &&
+            (queue && queue.notes.length > 0 ? (
+              <div className="space-y-2.5">
+                {queue.notes.map((n) => (
+                  <div key={n.key} className="rounded-xl border bg-white px-3 py-2.5" style={{ borderColor: "var(--line)" }}>
+                    <div className="flex items-center gap-2">
+                      <span className="font-display text-[14.5px]" style={{ color: "var(--ink)" }}>
+                        {n.chunk.name || "(no name)"}
+                      </span>
+                      {sub(n.chunk.role ?? null, n.chunk.org ?? null) && (
+                        <span className="text-[11.5px]" style={{ color: "var(--muted)" }}>
+                          {sub(n.chunk.role ?? null, n.chunk.org ?? null)}
+                        </span>
+                      )}
+                    </div>
+                    {n.chunk.facts.length > 0 && (
+                      <div className="text-[11.5px] mt-0.5 whitespace-pre-line" style={{ color: "var(--ink-gray)" }}>
+                        {n.chunk.facts.join("\n")}
+                      </div>
+                    )}
+                    {(n.chunk.phone || n.chunk.email) && (
+                      <div className="text-[11.5px] mt-0.5" style={{ color: "var(--muted)" }}>
+                        {[n.chunk.phone, n.chunk.email].filter(Boolean).join(" · ")}
+                      </div>
+                    )}
+                    <div className="flex gap-1.5 mt-2 flex-wrap">
+                      {n.candidates.map((c) => (
+                        <Btn
+                          key={c.id}
+                          variant="solid"
+                          disabled={busy}
+                          title={`File this under ${c.display_name}`}
+                          onClick={() => act(() => window.pos.review.resolveNoteChunk(n.key, c.id))}
+                        >
+                          {c.display_name}
+                          {c.org ? ` · ${c.org}` : ""}
+                        </Btn>
+                      ))}
+                      {n.chunk.name && (
+                        <Btn
+                          variant={n.candidates.length === 0 ? "solid" : "ghost"}
+                          disabled={busy}
+                          title={`Create a new contact named ${n.chunk.name}`}
+                          onClick={() => act(() => window.pos.review.resolveNoteChunk(n.key, "new"))}
+                        >
+                          New contact
+                        </Btn>
+                      )}
+                      <Btn disabled={busy} onClick={() => act(() => window.pos.review.dismissNoteChunk(n.key))}>
+                        Dismiss
+                      </Btn>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm py-2" style={{ color: "var(--muted)" }}>
+                Nothing from your notes needs a decision.
               </p>
             ))}
         </div>

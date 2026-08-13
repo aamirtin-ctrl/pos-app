@@ -459,6 +459,12 @@ function Integrations() {
           onToggle={() => toggle("imessage")}
           refetchSync={refetchSync}
         />
+        <AppleNotesCard
+          row={syncRow("applenotes")}
+          open={openCard === "applenotes"}
+          onToggle={() => toggle("applenotes")}
+          refetchSync={refetchSync}
+        />
         <MsgPlansCard
           row={syncRow("msgplans")}
           open={openCard === "msgplans"}
@@ -846,6 +852,108 @@ function MorningCaptureCard({
           </pre>
         )}
       </div>
+    </IntegrationCard>
+  );
+}
+
+// Apple Notes people drop-box (main/connectors/applenotes.ts): one designated note the
+// owner dumps people-info into; POS files it and clears the note. Empty title = off.
+function AppleNotesCard({
+  row,
+  open,
+  onToggle,
+  refetchSync,
+}: {
+  row: SyncRow;
+  open: boolean;
+  onToggle: () => void;
+  refetchSync: () => void;
+}) {
+  const [title, setTitle] = useState("");
+  const [savedTitle, setSavedTitle] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      const r = await window.pos.settings.get("applenotes_capture_note");
+      if (r.ok && typeof r.data === "string") {
+        setTitle(r.data);
+        setSavedTitle(r.data);
+      }
+      setLoaded(true);
+    })();
+  }, []);
+
+  const save = async () => {
+    if (saving) return;
+    setSaving(true);
+    const v = title.trim();
+    const r = await window.pos.settings.set("applenotes_capture_note", v);
+    if (r.ok) setSavedTitle(v);
+    else setMsg(r.error ?? "could not save");
+    setSaving(false);
+  };
+
+  const scan = async () => {
+    setBusy(true);
+    setMsg(null);
+    const r = await window.pos.sync.run("applenotes");
+    const d = r.data as (RawSyncRow & { ingested?: unknown }) | undefined;
+    const err = r.ok ? str(d?.error) : (r.error ?? "scan failed");
+    if (err) setMsg(err);
+    else setMsg(num(d?.ingested) ? "Captured — it'll be filed within a few minutes." : "Nothing new in the note.");
+    setBusy(false);
+    refetchSync();
+  };
+
+  const status: IntegrationStatus = savedTitle.trim() ? "connected" : "needs-setup";
+
+  return (
+    <IntegrationCard
+      name="People notes"
+      description="An Apple Note you dump people-info into — POS files it and clears the note"
+      status={status}
+      open={open}
+      onToggle={onToggle}
+      steps={[
+        "Create a note in Apple Notes (any account that syncs to this Mac) and enter its exact title below.",
+        "Dump anything about people you've met — names, loose facts, numbers. No format needed.",
+        "POS reads it each sync once you've left it alone for 5 minutes, files the facts, and clears the note. Unsure matches show up in Review.",
+      ]}
+    >
+      <div className="flex gap-2 mb-2">
+        <input
+          type="text"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") save(); }}
+          disabled={!loaded}
+          placeholder="POS Inbox"
+          className="flex-1 border rounded-md px-2 py-1 text-sm bg-white"
+          style={{ borderColor: "var(--line)" }}
+        />
+        <button
+          onClick={save}
+          disabled={saving || !loaded || title.trim() === savedTitle.trim()}
+          className="px-3 py-1 rounded-md text-sm border bg-white disabled:opacity-40"
+          style={{ borderColor: "var(--line)" }}
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+      </div>
+      <button
+        onClick={scan}
+        disabled={busy || !savedTitle.trim()}
+        className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-40"
+        style={{ borderColor: "var(--line)" }}
+      >
+        {busy ? "Scanning…" : "Scan now"}
+      </button>
+      <LastRunLine row={row} />
+      {msg && <p className="text-xs mt-1" style={{ color: "var(--muted)" }}>{msg}</p>}
     </IntegrationCard>
   );
 }
