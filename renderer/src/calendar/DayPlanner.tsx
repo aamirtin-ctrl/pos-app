@@ -231,6 +231,24 @@ export default function DayPlanner() {
   // recovery breaks, meeting transitions and everything else from doctrine.
   const [moving, setMoving] = useState(false);
   const [moveNote, setMoveNote] = useState<string | null>(null);
+
+  // Drag-commit for EXTERNAL events: patch the Google event itself. This is the owner's
+  // real calendar being edited from POS — the one direction that used to be refused
+  // ("moved in Google, the sync picks it up") while his whole schedule lived in Google.
+  const moveExternal = useCallback(async (it: Item, newStartMin: number) => {
+    setMoveNote(null);
+    const r = await window.pos.calendar.moveEvent({
+      gcalEventId: it.gcalEventId,
+      calendarId: it.calendarId,
+      dateISO: date,
+      startMin: newStartMin,
+      durationMin: it.endMin - it.startMin,
+    });
+    const payload = (r && typeof r === "object" && "data" in r ? (r as any).data : r) as
+      | { ok?: boolean; error?: string } | undefined;
+    if (!payload?.ok) setMoveNote(payload?.error || "Could not move that event.");
+    await refresh();
+  }, [date, refresh]);
   // The date cell being hovered while a card is carried — drives the strip highlight.
   const [carryTarget, setCarryTarget] = useState<string | null>(null);
   const moveToDate = useCallback(async (blockId: number, target: string) => {
@@ -547,6 +565,7 @@ export default function DayPlanner() {
                 onToggle={() => setOpenKey((k) => (k === it.key ? null : it.key))}
                 onClose={closePopover}
                 onMove={moveBlock}
+                onMoveExternal={moveExternal}
                 onResize={resizeBlock}
                 onDropOnDate={moveToDate}
                 onCarryHover={setCarryTarget}
@@ -645,7 +664,7 @@ function GapHint({ startMin, endMin, dim }: { startMin: number; endMin: number; 
  * own rect. Only one popover is open at a time — the open card's key lives in
  * DayPlanner, not here.
  */
-function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task, onMove, onResize, onDropOnDate, onCarryHover, dragOffset, onDragStart, onDeleted }: {
+function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task, onMove, onMoveExternal, onResize, onDropOnDate, onCarryHover, dragOffset, onDragStart, onDeleted }: {
   item: LaidOutItem; height: number; status: "past" | "current" | "future"; nowMin: number;
   open: boolean;
   onToggle: () => void;
@@ -653,6 +672,7 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
   task: { title: string; status: string } | null;
   /** Refresh the day after an external event was deleted from the popover. */
   onDeleted?: () => void;
+  onMoveExternal?: (item: Item, newStartMin: number) => void;
   /** Commit a drag: the block is pinned here and the day re-solves around it. */
   onMove?: (blockId: number, startMin: number) => void;
   /** Commit an edge drag: the block keeps its other edge and the day re-solves. */
@@ -675,7 +695,9 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
   // therefore undraggable — including the blocks he had just moved. An anchor he PINNED is his
   // own placement and must stay draggable; an anchor that is an external calendar event (or
   // already behind him) is not ours to move.
-  const movable = !item.external && item.blockId != null && !!onMove && (!item.anchor || item.locked);
+  const extMovable = item.external && !!item.gcalEventId && !!item.calendarId && !!onMoveExternal;
+  const movable =
+    (!item.external && item.blockId != null && !!onMove && (!item.anchor || item.locked)) || extMovable;
   const c = COLORS[item.type] ?? FALLBACK_COLOR;
   const dur = item.endMin - item.startMin;
   const progress = status === "current" ? Math.min(100, Math.max(0, ((nowMin - item.startMin) / Math.max(1, dur)) * 100)) : 0;
@@ -690,7 +712,7 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
   const onPointerDown = (e: React.PointerEvent) => {
     if (!movable) return; // NOT gated on `open`: an open popover used to make the card
                           // undraggable, so one stray click disabled dragging until it closed.
-    drag.current = { id: item.blockId!, x0: e.clientX, y0: e.clientY, start0: item.startMin, live: false };
+    drag.current = { id: item.blockId ?? -1, x0: e.clientX, y0: e.clientY, start0: item.startMin, live: false };
     // Capture NOW, not once the threshold is crossed. A quick drag leaves a short card (a
     // 45-minute block is 54px tall) before the 4px is measured, and without capture the
     // pointermove events then go to whatever is underneath and the drag never starts.
@@ -746,7 +768,7 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
     const iso = cellUnder(e.clientX, e.clientY);
     if (iso) {
       setGhost(0);
-      void onDropOnDate?.(d.id, iso);
+      if (!extMovable) void onDropOnDate?.(d.id, iso); // externals: same-day moves only
       return;
     }
     if (wasCarrying) {
@@ -757,6 +779,12 @@ function EventCard({ item, height, status, nowMin, open, onToggle, onClose, task
     const dy = e.clientY - d.y0;
     const deltaMin = Math.round(dy / PX_PER_MIN / MOVE_SNAP_MIN) * MOVE_SNAP_MIN;
     if (deltaMin === 0) { setGhost(0); return; }
+    if (extMovable) {
+      // Hold the dragged position; refresh() lands with the event at its new time and
+      // this card re-renders from fresh anchors (cache is cleared main-side).
+      void onMoveExternal?.(item, Math.max(0, d.start0 + deltaMin));
+      return;
+    }
     // HOLD the dragged position while the day re-solves. Clearing it here is what made the
     // move feel broken (owner report 2026-08-06: "it didn't update in real time, it went back
     // to how it was then a minute later updated") — the card snapped home the instant the

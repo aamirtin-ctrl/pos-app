@@ -91,7 +91,7 @@ contextBridge.exposeInMainWorld("pos", {
     events: call("gcal.events"),
   },
   // Cross-source calendar ops used by the day view (delete the selected event).
-  calendar: { deleteEvent: call("calendar.deleteEvent") },
+  calendar: { deleteEvent: call("calendar.deleteEvent"), moveEvent: call("calendar.moveEvent") },
   // Google Tasks maintenance: preview then apply the orphan purge.
   gtasks: { purgePreview: call("gtasks.purgePreview"), purgeApply: call("gtasks.purgeApply") },
   // Apple Reminders as the task source (iOS detects the plan, he taps once, POS imports).

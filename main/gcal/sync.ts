@@ -80,11 +80,49 @@ export async function deleteGoogleEvent(
   if (!calendarId || !eventId) return { ok: false, error: "missing calendar or event id" };
   try {
     await calApi(secrets).events.delete({ calendarId, eventId });
+    // Without this, the next day-refresh reads the ≤60s anchors cache and the event
+    // REAPPEARS after its own deletion — which read as "delete is stuck" to the owner.
+    clearAnchorsCache();
     return { ok: true };
   } catch (e) {
     const msg = (e as Error).message || "delete failed";
-    if (/\b(404|410)\b|already deleted|not found|has been deleted/i.test(msg)) return { ok: true };
+    if (/\b(404|410)\b|already deleted|not found|has been deleted/i.test(msg)) {
+      clearAnchorsCache();
+      return { ok: true };
+    }
     return { ok: false, error: msg };
+  }
+}
+
+/**
+ * Move (or re-day) a Google event — the day view's drag-an-external-event commit.
+ * External events used to be undraggable on principle ("moved in Google, the sync picks it
+ * up"); the owner's actual calendar IS Google, so from where he sits POS just refused to
+ * reorder his day (2026-08-13). A patch of start/end is exactly what the Calendar UI would
+ * do, POS reads it back like any other external edit, and the cache clear makes the next
+ * read live so the card does not snap back.
+ */
+export async function moveGoogleEvent(
+  secrets: SecretStore,
+  calendarId: string,
+  eventId: string,
+  startISO: string,
+  endISO: string
+): Promise<{ ok: boolean; error?: string }> {
+  if (!calendarId || !eventId) return { ok: false, error: "missing calendar or event id" };
+  try {
+    await calApi(secrets).events.patch({
+      calendarId,
+      eventId,
+      requestBody: {
+        start: { dateTime: new Date(startISO).toISOString() },
+        end: { dateTime: new Date(endISO).toISOString() },
+      },
+    });
+    clearAnchorsCache();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message || "move failed" };
   }
 }
 function tasksApi(secrets: SecretStore): tasks_v1.Tasks {

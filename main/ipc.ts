@@ -100,7 +100,7 @@ import {
   RECONSENT_REQUIRED,
 } from "./gcal/auth.ts";
 import { google } from "googleapis";
-import { reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent, dropCommitmentCascade, deleteGoogleEvent } from "./gcal/sync.ts";
+import { reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent, dropCommitmentCascade, deleteGoogleEvent, moveGoogleEvent } from "./gcal/sync.ts";
 import { listSubscriptions, addSubscription, removeSubscription, eventsForDate as icsEventsForDate, icsBlockType } from "./icscal.ts";
 import {
   notionAvailable, searchTargets, syncNotion, PARENT_PAGE_KEY,
@@ -670,7 +670,16 @@ export function registerIpc(deps: IpcDeps) {
     if (ev.gcalEventId && ev.calendarId) {
       const g = await deleteGoogleEvent(secrets, ev.calendarId, ev.gcalEventId);
       if (!g.ok) return { ok: false, error: g.error };
-      if (ev.source === "apple" && ev.iCalUID) await deleteAppleEvent(ev.iCalUID);
+      // Apple-original cleanup is a full-calendar AppleScript scan — 30-90s on a cold
+      // Calendar.app. Awaiting it here held the IPC reply hostage and the popover just
+      // said "Deleting…" until the owner gave up ("it gets stuck", 2026-08-13). The
+      // Google copy — the one he can see — is already gone; the Apple original can go
+      // in its own time, and a failure only means the next mirror pass re-mirrors one
+      // event, which the delete button can remove again.
+      if (ev.source === "apple" && ev.iCalUID) {
+        void deleteAppleEvent(ev.iCalUID).catch((e) =>
+          console.warn(`applecal: background delete of ${ev.iCalUID} failed: ${(e as Error).message}`));
+      }
       return { ok: true };
     }
     if (ev.source === "apple" && ev.iCalUID) {
@@ -678,6 +687,21 @@ export function registerIpc(deps: IpcDeps) {
       return a.ok ? { ok: true } : { ok: false, error: a.error.message };
     }
     return { ok: false, error: "This event is a read-only subscription and can't be deleted from POS." };
+  });
+
+  // Drag-to-move for external calendar events: patch the Google event's times. Minutes are
+  // local wall-clock on dateISO; the Date constructor makes them absolute in this machine's
+  // timezone, which is the same convention the anchors reader parses back.
+  h("calendar.moveEvent", async (ev: {
+    gcalEventId?: string; calendarId?: string; dateISO?: string; startMin?: number; durationMin?: number;
+  }) => {
+    if (!ev?.gcalEventId || !ev.calendarId || !ev.dateISO || ev.startMin == null || !ev.durationMin) {
+      return { ok: false, error: "missing event, date, or time" };
+    }
+    const [y, mo, d] = ev.dateISO.split("-").map(Number);
+    const start = new Date(y, mo - 1, d, 0, ev.startMin);
+    const end = new Date(y, mo - 1, d, 0, ev.startMin + ev.durationMin);
+    return moveGoogleEvent(secrets, ev.calendarId, ev.gcalEventId, start.toISOString(), end.toISOString());
   });
 
   // ── google tasks maintenance ──

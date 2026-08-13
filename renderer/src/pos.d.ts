@@ -125,11 +125,11 @@ declare global {
         rows: Call; updateBlock: Call; deleteBlock: Call;
       };
       applecal: { available: Call; calendars: Call; events: Call; mirror: Call; deleteEvent: Call };
-      calendar: { deleteEvent: Call };
+      calendar: { deleteEvent: Call; moveEvent: Call };
       reminders: { available: Call; lists: Call; list: Call; sync: Call; complete: Call };
       gtasks: { purgePreview: Call; purgeApply: Call };
       /** Cross-source calendar ops for the day view (Google + Apple aware). */
-      calendar: { deleteEvent: Call };
+      calendar: { deleteEvent: Call; moveEvent: Call };
       settings: {
         keys: Call; setKey: Call; doctrineGet: Call; doctrineSet: Call;
         spend: Call; setCeiling: Call; get: Call; set: Call;
