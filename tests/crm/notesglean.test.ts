@@ -9,7 +9,12 @@ import {
   uniqueNameMatch,
   applyChunk,
   createPersonFromChunk,
+  gleanNotes,
+  pendingNoteChunks,
+  resolveNoteChunk,
+  dismissNoteChunk,
 } from "../../main/crm/notesglean.ts";
+import type { LlmClient } from "../../main/llm/provider.ts";
 
 let dir: string;
 let db: Db;
@@ -118,5 +123,88 @@ describe("createPersonFromChunk", () => {
   });
   it("throws without a name", () => {
     expect(() => createPersonFromChunk(db, { facts: ["x"] })).toThrow();
+  });
+});
+
+function fakeLlm(jsonText: string | null): LlmClient {
+  return { call: async () => (jsonText === null ? null : { text: jsonText }) } as unknown as LlmClient;
+}
+const addPhoneAlias = (personId: number, value: string) =>
+  db.prepare("INSERT INTO alias (person_id, kind, value) VALUES (?, 'phone', ?)").run(personId, value);
+
+describe("gleanNotes", () => {
+  it("phone in the note attaches by identifier even when names differ", async () => {
+    const id = addPerson("Abdeali Diwan");
+    addPhoneAlias(id, "+15551112222");
+    const r = await gleanNotes(
+      db,
+      fakeLlm(JSON.stringify([{ name: "Abdeali", phone: "+1 555 111 2222", facts: ["gym buddy"] }])),
+      "dump"
+    );
+    expect(r).toMatchObject({ chunks: 1, applied: 1, created: 0, queued: 0 });
+    expect(person(id).bio as string).toContain("gym buddy");
+  });
+  it("unique name auto-attaches; new name creates tier-2 person", async () => {
+    const id = addPerson("Abdeali Diwan");
+    const r = await gleanNotes(
+      db,
+      fakeLlm(
+        JSON.stringify([
+          { name: "Abdeali Diwan", facts: ["met at gym"] },
+          { name: "Brand New", facts: ["from the conf"] },
+        ])
+      ),
+      "dump"
+    );
+    expect(r).toMatchObject({ applied: 2, created: 1, queued: 0 });
+    expect(person(id).bio as string).toContain("met at gym");
+  });
+  it("duplicate names queue for review; nameless facts queue too", async () => {
+    addPerson("Jay Shah");
+    addPerson("Jay Shah");
+    const r = await gleanNotes(
+      db,
+      fakeLlm(
+        JSON.stringify([
+          { name: "Jay Shah", facts: ["owes me $20"] },
+          { facts: ["someone mentioned a book: Deep Work"] },
+        ])
+      ),
+      "dump"
+    );
+    expect(r).toMatchObject({ applied: 0, created: 0, queued: 2 });
+    const pending = pendingNoteChunks(db);
+    expect(pending).toHaveLength(2);
+    const jay = pending.find((p) => p.chunk.name === "Jay Shah")!;
+    expect(jay.candidates.map((c) => c.display_name)).toEqual(["Jay Shah", "Jay Shah"]);
+  });
+  it("throws when the LLM is unavailable (capture drain retries)", async () => {
+    await expect(gleanNotes(db, fakeLlm(null), "dump")).rejects.toThrow();
+  });
+});
+
+describe("note-chunk queue", () => {
+  it("resolve applies to the chosen person and clears the entry", async () => {
+    addPerson("Jay Shah");
+    const keep = addPerson("Jay Shah");
+    await gleanNotes(db, fakeLlm(JSON.stringify([{ name: "Jay Shah", facts: ["owes me $20"] }])), "dump");
+    const [item] = pendingNoteChunks(db);
+    const r = resolveNoteChunk(db, item.key, keep);
+    expect(r).toEqual({ resolved: true, personId: keep });
+    expect(person(keep).bio as string).toContain("owes me $20");
+    expect(pendingNoteChunks(db)).toHaveLength(0);
+  });
+  it('resolve "new" creates a person when the chunk has a name', async () => {
+    addPerson("Jay Shah");
+    addPerson("Jay Shah");
+    await gleanNotes(db, fakeLlm(JSON.stringify([{ name: "Jay Shah", facts: ["a third jay"] }])), "dump");
+    const [item] = pendingNoteChunks(db);
+    const r = resolveNoteChunk(db, item.key, "new");
+    expect(r.resolved).toBe(true);
+    expect(person(r.personId!).bio as string).toContain("a third jay");
+  });
+  it("dismiss deletes; resolving a bogus key is a no-op", () => {
+    expect(dismissNoteChunk(db, "notechunk:nope")).toBe(false);
+    expect(resolveNoteChunk(db, "notechunk:nope", 1)).toEqual({ resolved: false });
   });
 });

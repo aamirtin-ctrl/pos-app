@@ -14,9 +14,13 @@
 // touched.
 
 import type { Db } from "../db/db.ts";
+import { getSetting, setSetting } from "../db/db.ts";
+import { resolveHandle } from "./identity.ts";
 import { normalizeName, normalizePhone, normalizeEmail } from "./normalize.ts";
 import { splitBio, composeBio } from "./enrich.ts";
+import { contentHash } from "./commitments.ts";
 import { addAlias } from "../connectors/common.ts";
+import { extractJson, type LlmClient } from "../llm/provider.ts";
 
 export interface NoteChunk {
   name?: string;
@@ -124,4 +128,150 @@ export function createPersonFromChunk(db: Db, chunk: NoteChunk): number {
   const id = Number(r.lastInsertRowid);
   applyChunk(db, chunk, id);
   return id;
+}
+
+// ── the glean ────────────────────────────────────────────────────────────────
+
+const GLEAN_PROMPT_HEAD = `You are filing the owner's raw personal note about people into his CRM.
+Split the note into one JSON object per person mentioned.
+Return ONLY a JSON array, no prose. Each object:
+  {"name": "...", "org": "...", "role": "...", "phone": "...", "email": "...", "facts": ["..."]}
+Rules:
+- Every field is optional. OMIT a field rather than guess or infer it. Never invent.
+- "facts" matter most: keep EVERY substantive statement about the person as one short
+  fact, close to the owner's own words. Do not summarize facts away.
+- Text clearly not about a specific person: one object with only "facts".
+- Names: use exactly what the owner wrote (do not expand or correct spellings).
+
+NOTE:
+`;
+
+export interface GleanResult {
+  chunks: number;
+  applied: number;
+  created: number;
+  queued: number;
+}
+
+/**
+ * ONE smart-tier call for the whole dump (quota discipline — never per-chunk calls), then
+ * route every chunk: identifier/corroborated match → apply; unique-name → apply; fresh
+ * name → new tier-2 person; anything ambiguous or nameless → the review queue. Throws when
+ * the model is unavailable so the capture drain keeps the row and retries.
+ */
+export async function gleanNotes(db: Db, llm: LlmClient, rawText: string): Promise<GleanResult> {
+  const res = await llm.call("notesglean", "smart", GLEAN_PROMPT_HEAD + rawText.slice(0, 8000), {
+    json: true,
+    maxTokens: 2048,
+  });
+  if (!res) throw new Error("llm unavailable for notesglean");
+  const chunks = parseGleanChunks(extractJson(res.text));
+  const out: GleanResult = { chunks: chunks.length, applied: 0, created: 0, queued: 0 };
+
+  for (const chunk of chunks) {
+    const r = resolveHandle(db, {
+      name: chunk.name,
+      phone: chunk.phone,
+      email: chunk.email,
+      org: chunk.org,
+    });
+    if (r.status === "matched" && r.personId) {
+      applyChunk(db, chunk, r.personId);
+      out.applied++;
+      continue;
+    }
+    if (r.status === "unmatched" && chunk.name) {
+      const unique = uniqueNameMatch(db, chunk.name);
+      if (unique) {
+        applyChunk(db, chunk, unique);
+        out.applied++;
+      } else {
+        createPersonFromChunk(db, chunk);
+        out.created++;
+        out.applied++;
+      }
+      continue;
+    }
+    // ambiguous, or nameless with no identifier — the user decides, nothing is dropped.
+    queueNoteChunk(db, chunk, r.candidateIds ?? []);
+    out.queued++;
+  }
+  return out;
+}
+
+// ── review queue for undecidable chunks (setting-table keys, like ambiguous:*) ──
+
+export const NOTECHUNK_PREFIX = "notechunk:";
+
+interface NoteChunkStored {
+  chunk: NoteChunk;
+  candidateIds: number[];
+  firstSeenAt: string;
+}
+
+export interface NoteChunkItem {
+  key: string;
+  chunk: NoteChunk;
+  /** chunkText() of the chunk — what the review card shows. */
+  text: string;
+  firstSeenAt: string;
+  candidates: { id: number; display_name: string; org: string | null; role: string | null }[];
+}
+
+export function queueNoteChunk(db: Db, chunk: NoteChunk, candidateIds: number[]): string {
+  const key = `${NOTECHUNK_PREFIX}${contentHash(JSON.stringify(chunk))}`;
+  if (!getSetting(db, key)) {
+    const stored: NoteChunkStored = { chunk, candidateIds, firstSeenAt: new Date().toISOString() };
+    setSetting(db, key, JSON.stringify(stored));
+  }
+  return key;
+}
+
+export function pendingNoteChunks(db: Db): NoteChunkItem[] {
+  const rows = db
+    .prepare("SELECT key, value FROM setting WHERE key LIKE ? ORDER BY key")
+    .all(`${NOTECHUNK_PREFIX}%`) as { key: string; value: string }[];
+  const person = db.prepare("SELECT id, display_name, org, role FROM person WHERE id = ?");
+  const out: NoteChunkItem[] = [];
+  for (const r of rows) {
+    let stored: NoteChunkStored;
+    try {
+      stored = JSON.parse(r.value) as NoteChunkStored;
+    } catch {
+      continue; // corrupt JSON: skip rather than blow up the queue
+    }
+    if (!stored?.chunk) continue;
+    const chunk = parseGleanChunks([stored.chunk])[0];
+    if (!chunk) continue;
+    const candidates = (stored.candidateIds ?? [])
+      .map((id) => person.get(id) as NoteChunkItem["candidates"][number] | undefined)
+      .filter((p): p is NoteChunkItem["candidates"][number] => !!p);
+    out.push({ key: r.key, chunk, text: chunkText(chunk), firstSeenAt: stored.firstSeenAt ?? "", candidates });
+  }
+  return out;
+}
+
+/** Apply the held chunk to the chosen person ("new" = create from it) and clear the entry. */
+export function resolveNoteChunk(
+  db: Db,
+  key: string,
+  personId: number | "new"
+): { resolved: boolean; personId?: number } {
+  if (!key.startsWith(NOTECHUNK_PREFIX)) throw new Error("not a note-chunk queue key");
+  const raw = getSetting(db, key);
+  if (!raw) return { resolved: false };
+  const stored = JSON.parse(raw) as NoteChunkStored;
+  const chunk = parseGleanChunks([stored.chunk])[0];
+  if (!chunk) {
+    dismissNoteChunk(db, key);
+    return { resolved: false };
+  }
+  const id = personId === "new" ? createPersonFromChunk(db, chunk) : (applyChunk(db, chunk, personId), personId);
+  dismissNoteChunk(db, key);
+  return { resolved: true, personId: id };
+}
+
+export function dismissNoteChunk(db: Db, key: string): boolean {
+  if (!key.startsWith(NOTECHUNK_PREFIX)) throw new Error("not a note-chunk queue key");
+  return db.prepare("DELETE FROM setting WHERE key = ?").run(key).changes > 0;
 }
