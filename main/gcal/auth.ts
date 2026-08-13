@@ -155,15 +155,37 @@ export interface GoogleScopeStatus {
   hasCreds: boolean;
   /** Connected AND the grant covers calendar writes (calendars.insert). */
   canWrite: boolean;
+  /** Tokens exist on disk but Google refuses them (expired/revoked refresh token). */
+  tokenDead: boolean;
 }
 
-/** One read for the UI: connected / creds present / grant wide enough to push. */
-export function googleScopeStatus(secrets: SecretStore): GoogleScopeStatus {
+/**
+ * One read for the UI: connected / creds present / grant wide enough to push —
+ * and now, whether the token actually WORKS.
+ *
+ * Owner-visible failure 2026-08-13: his refresh token had expired (invalid_grant),
+ * so every sync and every conflict-replan silently failed for a day — his manual
+ * calendar rearrangement never reached the plan — while Settings said "Connected",
+ * because tokens-on-disk was the only thing this checked. The probe below asks
+ * Google for an access token, which is the one question that distinguishes a
+ * dead grant from a live one. Network failures are NOT treated as dead: offline
+ * must not nag him to re-auth a token that is fine.
+ */
+export async function googleScopeStatus(secrets: SecretStore): Promise<GoogleScopeStatus> {
   const connected = isGoogleConnected(secrets);
+  let tokenDead = false;
+  if (connected) {
+    try {
+      await oauthClient(secrets).getAccessToken();
+    } catch (e) {
+      if (needsReconsent(e)) tokenDead = true;
+    }
+  }
   return {
     connected,
     hasCreds: hasGoogleCreds(secrets),
-    canWrite: connected && hasCalendarWriteScope(secrets),
+    canWrite: connected && !tokenDead && hasCalendarWriteScope(secrets),
+    tokenDead,
   };
 }
 

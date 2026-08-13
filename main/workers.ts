@@ -24,7 +24,7 @@ import { dateUndatedTasks } from "./crm/taskdates.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { runEnrichment } from "./crm/enrich.ts";
 import { commitmentToTask, closeGoogleTask, drainTombstones, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
-import { hasCalendarWriteScope, isGoogleConnected } from "./gcal/auth.ts";
+import { hasCalendarWriteScope, isGoogleConnected, googleScopeStatus } from "./gcal/auth.ts";
 import { autoPushEnabled, pushPlanToGoogle } from "./planner.ts";
 import { eventsForDate as icsEventsForDate } from "./icscal.ts";
 import { distillWeek, distillWeekKey } from "./worklog.ts";
@@ -85,6 +85,9 @@ const EXTRACT_CAP = 50;
  * days; it is a bound on staleness, not a backlog to work through.
  */
 export const EXTRACT_LOOKBACK = "-2 days";
+
+/** Once-per-run guard for the dead-Google-token notification in the tick. */
+let warnedGoogleTokenDead = false;
 
 const CONNECTORS: Record<SyncSource, ConnectorFn> = {
   gmail: (deps) => syncAllMail(deps), // every configured mail account (gmail/outlook/imap)
@@ -1274,6 +1277,16 @@ export function startWorkers(
         } catch (e) {
           console.warn(`workers: agentic curriculum sync failed: ${(e as Error).message}`);
         }
+      }
+
+      // A dead Google grant freezes everything downstream of this point — anchors heal
+      // from stale snapshots, the change-fingerprint never moves, and conflict-replans
+      // conclude "nothing changed" forever. That is exactly what ate 2026-08-13: the
+      // owner rearranged his calendar by hand and the plan never followed, with no
+      // error anywhere he could see. Say it ONCE per app run, loudly.
+      if (!warnedGoogleTokenDead && (await googleScopeStatus(secrets)).tokenDead) {
+        warnedGoogleTokenDead = true;
+        notify?.("Google sign-in expired — calendar sync and replanning are paused. Reconnect in Settings → Google.");
       }
 
       // The calendar moving under a plan re-solves it — today AND the next two days, since

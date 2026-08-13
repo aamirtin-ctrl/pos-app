@@ -20,7 +20,7 @@ type LlmHealth = {
 };
 // canWrite is false when the stored token predates the calendar-write scope widening:
 // it still refreshes, so nothing looks disconnected, but every push is refused with 403.
-type GcalState = { connected: boolean; hasCreds: boolean; canWrite: boolean };
+type GcalState = { connected: boolean; hasCreds: boolean; canWrite: boolean; tokenDead?: boolean };
 type AdherenceRow = { blockType: string; planned: number; completed: number; rate: number };
 
 // workers.ts is still landing — normalize whatever row shape sync.status() returns.
@@ -1001,12 +1001,12 @@ function GoogleCard({
               style={{ borderColor: "var(--danger)", background: "color-mix(in srgb, var(--danger) 8%, white)" }}
             >
               <p className="text-sm font-medium" style={{ color: "var(--danger)" }}>
-                Google needs re-authorizing
+                {gcal.tokenDead ? "Google sign-in expired" : "Google needs re-authorizing"}
               </p>
               <p className="text-xs mt-1" style={{ color: "var(--muted)" }}>
-                POS&rsquo;s calendar permissions changed — it now creates its own
-                &lsquo;POS — Planned&rsquo; calendar, which the older sign-in did not allow. Pushes are
-                refused until you reconnect. Nothing is lost; this just re-grants access.
+                {gcal.tokenDead
+                  ? "Google no longer accepts the saved sign-in, so task sync, calendar anchors, and automatic replanning are all paused. Nothing is lost — reconnect to resume."
+                  : "POS\u2019s calendar permissions changed — it now creates its own \u2018POS — Planned\u2019 calendar, which the older sign-in did not allow. Pushes are refused until you reconnect. Nothing is lost; this just re-grants access."}
               </p>
               <button
                 onClick={connect}
