@@ -73,6 +73,56 @@ export function buildReadScript(title: string): string {
   ].join("\n");
 }
 
+// ── the sync ─────────────────────────────────────────────────────────────────
+
+type OsaRun = (script: string) => Promise<{ ok: true; stdout: string } | { ok: false; error: Error }>;
+
+/**
+ * One tick: read the designated note; if quiet and carrying new text, land it durably in
+ * capture_inbox FIRST, then wipe the note. Content-hash dedupe (extraction_log) makes a
+ * failed wipe safe: the next tick re-reads the same body, skips re-capture, retries the
+ * wipe. recordCapture caps a row at 8000 chars — fine for an inbox note that is wiped
+ * every tick, and the cap is preferable to losing the whole dump.
+ */
+export async function syncAppleNotes(
+  deps: ConnectorDeps,
+  opts: { run?: OsaRun } = {}
+): Promise<SyncReport> {
+  const { db } = deps;
+  const run: OsaRun = opts.run ?? runOsascript;
+  const report: SyncReport = { source: "applenotes", ingested: 0, skipped: 0, created: 0 };
+
+  const title = (getSetting(db, NOTE_TITLE_KEY) ?? "").trim();
+  if (!title) return report; // not configured — silent, like an unconfigured connector
+
+  const read = await run(buildReadScript(title));
+  if (!read.ok) return { ...report, error: read.error.message };
+  if (read.stdout.trim() === NOTE_NOT_FOUND) {
+    return { ...report, error: `No Apple Note titled "${title}" — create it or fix the title in Settings` };
+  }
+  const parsed = parseNoteRead(read.stdout);
+  if (!parsed) return { ...report, error: "unreadable Notes output" };
+  if (!shouldCapture(parsed, MIN_QUIET_SECONDS, title)) {
+    // Recently modified or effectively empty. Never wipe what we did not capture.
+    if (parsed.text.trim() && parsed.text.trim() !== title) report.skipped = 1;
+    return report;
+  }
+
+  const text = parsed.text.trim();
+  const hash = contentHash(text);
+  if (!contentSeen(db, hash)) {
+    recordCapture(db, "apple_notes", text);
+    logExtraction(db, null, hash, "captured:apple_notes");
+    report.ingested = 1;
+  } else {
+    report.skipped = 1; // already captured — this read exists only to retry the wipe
+  }
+
+  const wipe = await run(buildWipeScript(title));
+  if (!wipe.ok) return { ...report, error: `captured but wipe failed: ${wipe.error.message}` };
+  return report;
+}
+
 /**
  * Wipe = reset the body to just the title heading. Notes derives a note's name from its
  * first line; an empty body would rename the note and orphan the watcher.
