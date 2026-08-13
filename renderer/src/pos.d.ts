@@ -105,6 +105,7 @@ declare global {
         pending: Call; keep: Call; discard: Call; group: Call;
         mergeCluster: Call; dismissDuplicates: Call;
         resolveAmbiguous: Call; dismissAmbiguous: Call;
+        resolveNoteChunk: Call; dismissNoteChunk: Call;
       };
       groups: {
         list: Call; create: Call; rename: Call; delete: Call;

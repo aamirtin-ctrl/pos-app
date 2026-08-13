@@ -25,6 +25,7 @@ import { getSetting, setSetting } from "../db/db.ts";
 import { assignToGroup } from "./groups.ts";
 import { mergePeople } from "./people.ts";
 import { emailDomain, isGenericEmailDomain, normalizeName } from "./normalize.ts";
+import { pendingNoteChunks, type NoteChunkItem } from "./notesglean.ts";
 import { bulkAddressReason, isBulkDisplayName } from "../connectors/common.ts";
 
 /** The tag connectors put on auto-created contacts (main/connectors/{imessage,gmail}.ts). */
@@ -723,7 +724,9 @@ export interface ReviewQueue {
   contacts: PendingContact[];
   duplicates: DuplicateCluster[];
   ambiguous: AmbiguousItem[];
-  counts: { contacts: number; duplicates: number; ambiguous: number; total: number };
+  /** Note chunks the Apple Notes gleaner could not attribute (crm/notesglean.ts). */
+  notes: NoteChunkItem[];
+  counts: { contacts: number; duplicates: number; ambiguous: number; notes: number; total: number };
 }
 
 /** Everything the Review modal (and its count badge) needs, in one IPC round-trip. */
@@ -731,15 +734,18 @@ export function reviewQueue(db: Db): ReviewQueue {
   const contacts = pendingContacts(db);
   const duplicates = duplicateClusters(db);
   const ambiguous = pendingAmbiguous(db);
+  const notes = pendingNoteChunks(db);
   return {
     contacts,
     duplicates,
     ambiguous,
+    notes,
     counts: {
       contacts: contacts.length,
       duplicates: duplicates.length,
       ambiguous: ambiguous.length,
-      total: contacts.length + duplicates.length + ambiguous.length,
+      notes: notes.length,
+      total: contacts.length + duplicates.length + ambiguous.length + notes.length,
     },
   };
 }

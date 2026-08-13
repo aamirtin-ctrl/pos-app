@@ -27,6 +27,8 @@ contextBridge.exposeInMainWorld("pos", {
     dismissDuplicates: call("review.dismissDuplicates"),
     resolveAmbiguous: call("review.resolveAmbiguous"),
     dismissAmbiguous: call("review.dismissAmbiguous"),
+    resolveNoteChunk: call("review.resolveNoteChunk"),
+    dismissNoteChunk: call("review.dismissNoteChunk"),
   },
   groups: {
     list: call("groups.list"),

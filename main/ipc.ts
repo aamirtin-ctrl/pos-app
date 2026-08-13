@@ -39,6 +39,7 @@ import {
   resolveAmbiguous,
   dismissAmbiguous,
 } from "./crm/review.ts";
+import { resolveNoteChunk, dismissNoteChunk } from "./crm/notesglean.ts";
 import { exportContactsCsv, defaultCsvFilename } from "./crm/export.ts";
 import { rank } from "./crm/ranking.ts";
 import {
@@ -417,6 +418,9 @@ export function registerIpc(deps: IpcDeps) {
   h("review.dismissDuplicates", (key: string) => ({ dismissed: dismissDuplicates(db, key) }));
   h("review.resolveAmbiguous", (key: string, personId: number) => resolveAmbiguous(db, key, personId));
   h("review.dismissAmbiguous", (key: string) => ({ dismissed: dismissAmbiguous(db, key) }));
+  // Note chunks the Apple Notes gleaner held for a human decision (crm/notesglean.ts).
+  h("review.resolveNoteChunk", (key: string, personId: number | "new") => resolveNoteChunk(db, key, personId));
+  h("review.dismissNoteChunk", (key: string) => ({ dismissed: dismissNoteChunk(db, key) }));
 
   // ── CSV export (#20) ──
   // Body is pure (crm/export.ts); the dialog + write live here.
