@@ -43,6 +43,8 @@ import { runCapture, resolveDoctrineDir } from "./capture.ts";
 import { mirrorToGoogle, appleCalendarAvailable } from "./applecal.ts";
 import { drainCaptures } from "./capture-inbox.ts";
 import { handleCommand } from "./assistant.ts";
+import { syncAppleNotes, NOTE_TITLE_KEY } from "./connectors/applenotes.ts";
+import { gleanNotes } from "./crm/notesglean.ts";
 import { sendMorningDigest, shouldSendDigest } from "./digest.ts";
 import { loadDoctrine } from "./engine/doctrine.ts";
 import { runMsgPlans } from "./msgplans.ts";
@@ -69,7 +71,8 @@ export type SyncSource =
   | "mailfile"
   | "capture"
   | "msgplans"
-  | "notion";
+  | "notion"
+  | "applenotes";
 
 /** `extra` = LinkedIn export folder / mailfile path (unused by gmail/imessage). */
 export type ConnectorFn = (deps: ConnectorDeps, extra?: string) => Promise<SyncReport>;
@@ -114,6 +117,9 @@ const CONNECTORS: Record<SyncSource, ConnectorFn> = {
     const c = await syncNotion(deps.db, deps.secrets);
     return { source: "notion", ingested: c.pulled, skipped: 0, created: 0 };
   },
+  // Apple Notes people drop-box: raw dump → capture_inbox, note wiped. Gleaning happens
+  // in the capture drain (crm/notesglean.ts), not here.
+  applenotes: (deps) => syncAppleNotes(deps),
 };
 
 /**
@@ -1167,7 +1173,10 @@ export function startWorkers(
         if (llm) {
           const cap = await drainCaptures(
             db,
-            async (text) => {
+            async (text, source) => {
+              // People-dumps from the Apple Notes drop-box get the dedicated gleaner —
+              // they are about OTHER people, not commands to the assistant.
+              if (source === "apple_notes") return await gleanNotes(db, llm, text);
               const r = await handleCommand({ db, secrets, doctrineDir: resolveDoctrineDir(), llm }, text);
               return { kind: r.kind };
             },
@@ -1363,6 +1372,10 @@ export function startWorkers(
       // writes error rows to sync_run.
       if (notionConfigured(db, secrets)) {
         announce(await runSync(db, secrets, llm, "notion"));
+      }
+      // Apple Notes people drop-box — only when the owner has named a note in Settings.
+      if (process.platform === "darwin" && (getSetting(db, NOTE_TITLE_KEY) ?? "").trim()) {
+        announce(await runSync(db, secrets, llm, "applenotes"));
       }
       // Morning digest: once per day, from doctrine wake_time + 15 min on, gated on
       // digest_enabled. Errors are contained here — a failed send never stops the tick.
