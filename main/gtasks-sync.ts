@@ -572,6 +572,7 @@ export async function purgeOrphanedGoogleTasks(
             await deps.deleteTask({ tasklist, task: g.id });
             done = true;
             out.deleted++;
+            if (out.deleted % 200 === 0) console.log(`purge: ${out.deleted} deleted so far`);
             if (out.samples.length < 15) out.samples.push(title || "(untitled)");
           } catch (e) {
             const msg = (e as Error).message;

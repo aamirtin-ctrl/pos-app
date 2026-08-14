@@ -21,6 +21,9 @@ const MODE = process.argv[2] === "apply" ? "apply" : "preview";
 // name, and a late setName leaves this process decrypting with "Electron"'s
 // key — every secret silently reads as null and Google looks disconnected.
 app.setName("POS");
+// No Dock icon: this ran 11 hours as a bare "Electron" in the Dock and the owner,
+// quite reasonably, quit it thinking it was the app. Invisible is honest here.
+app.dock?.hide();
 app.setPath("userData", path.join(app.getPath("appData"), "pos"));
 
 app.whenReady().then(async () => {
