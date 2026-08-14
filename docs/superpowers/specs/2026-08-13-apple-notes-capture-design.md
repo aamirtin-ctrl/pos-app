@@ -44,7 +44,10 @@ record lives in POS.
    - **One LLM call per captured dump** (quota discipline: never per-chunk calls),
      strict-JSON-array output:
      `[{name?, org?, role?, phone?, email?, facts?: string[]}]` — model instructed to
-     leave fields absent rather than infer, keep every substantive statement as a fact.
+     leave fields absent rather than infer, and to CLEAN UP the owner's haphazard typing:
+     every fact comes out as a terse polished phrase in the house bio style (no leading
+     pronoun, shorthand expanded, fragments merged), keeping every substantive piece of
+     information without embellishment (owner directive 2026-08-13).
    - Per chunk: resolve →
      a. phone/email present → existing resolveHandle identifier cascade.
      b. else unique name match (normalizeName over live people + name aliases,

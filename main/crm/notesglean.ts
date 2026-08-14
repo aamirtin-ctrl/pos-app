@@ -132,14 +132,25 @@ export function createPersonFromChunk(db: Db, chunk: NoteChunk): number {
 
 // ── the glean ────────────────────────────────────────────────────────────────
 
+// Owner directive 2026-08-13: the note is typed haphazardly — the job is extraction AND
+// cleanup. Facts must come out in the same style enrich.ts's bio mining produces (terse
+// phrase, no leading pronoun) so a person's bio reads as one voice regardless of whether
+// a bullet came from conversation mining or from the note. Unlike mining, nothing here is
+// dropped for being minor: he chose to write it down, so every substantive piece survives —
+// cleaned, merged, never embellished.
 const GLEAN_PROMPT_HEAD = `You are filing the owner's raw personal note about people into his CRM.
-Split the note into one JSON object per person mentioned.
+The note is typed hastily — shorthand, fragments, typos. Your job is BOTH extraction and
+cleanup: split it into one JSON object per person mentioned, rewriting what he meant as
+clean CRM-quality entries.
 Return ONLY a JSON array, no prose. Each object:
   {"name": "...", "org": "...", "role": "...", "phone": "...", "email": "...", "facts": ["..."]}
 Rules:
 - Every field is optional. OMIT a field rather than guess or infer it. Never invent.
-- "facts" matter most: keep EVERY substantive statement about the person as one short
-  fact, close to the owner's own words. Do not summarize facts away.
+- "facts" matter most. Each fact is a terse, polished phrase with no leading pronoun
+  ("Sourcing funding for a solar startup", not "he said hes maybe sourcing funding lol").
+  Expand shorthand, fix typos and casing, and MERGE fragments about the same thing into
+  one fact. Keep EVERY substantive piece of information — clean it, never drop it, never
+  add color or detail the owner didn't write.
 - Text clearly not about a specific person: one object with only "facts".
 - Names: use exactly what the owner wrote (do not expand or correct spellings).
 
