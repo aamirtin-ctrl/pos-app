@@ -347,6 +347,17 @@ export default function DayPlanner() {
     }, 60000);
     return () => clearInterval(t);
   }, []);
+  // Same lesson for calendar EVENTS (owner question 2026-08-13: "if I change an event in
+  // Google, POS updates, right?"). External events were fetch-on-open, so a Google-side
+  // edit only painted after navigating away and back. The main-side anchors cache has a
+  // 60s TTL, so a 60s poll here rides it: at most one live Google read per minute, and an
+  // edit reaches the screen within ~two minutes without touching anything.
+  useEffect(() => {
+    const t = setInterval(() => {
+      void refreshExternal(dateRef.current);
+    }, 60000);
+    return () => clearInterval(t);
+  }, [refreshExternal]);
   // Task lookup for the popover — purely additive detail, so failures stay silent.
   useEffect(() => {
     let cancelled = false;
