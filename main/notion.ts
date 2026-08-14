@@ -572,6 +572,62 @@ export function formatCurriculumNotes(entry: CurriculumEntry): string | null {
   return lines.length ? lines.join("\n") : null;
 }
 
+/** A date-only ISO string shifted by N days (UTC-noon anchor avoids DST edge slips). */
+export function shiftISODate(iso: string, deltaDays: number): string {
+  const d = new Date(`${iso.slice(0, 10)}T12:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + deltaDays);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Push every curriculum row on/after `fromISO` later by `deltaDays` (owner ask 2026-08-16:
+ * a missed session carries over and "everything gets pushed down the line" — in the Notion
+ * calendar itself, so Notion stays the source of truth the enrichment reads from).
+ *
+ * The rows are shifted latest-first purely for tidiness in Notion's history; date rows have
+ * no uniqueness constraint, so order is not correctness-bearing. Rows the owner already
+ * ticked Done are left where they are — history doesn't move.
+ */
+export async function shiftCurriculumDates(
+  secrets: SecretStore,
+  databaseId: string,
+  fromISO: string,
+  deltaDays: number
+): Promise<{ shifted: number }> {
+  if (deltaDays <= 0) return { shifted: 0 };
+  const token = requireToken(secrets);
+
+  // Collect every not-done row with Date >= fromISO (paginated).
+  const rows: { id: string; date: string }[] = [];
+  let cursor: string | undefined;
+  do {
+    const res = await notionFetch(token, `/databases/${databaseId}/query`, {
+      method: "POST",
+      body: {
+        filter: { property: "Date", date: { on_or_after: fromISO.slice(0, 10) } },
+        page_size: 100,
+        ...(cursor ? { start_cursor: cursor } : {}),
+      },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    for (const row of (res.results ?? []) as any[]) {
+      const date = row.properties?.Date?.date?.start;
+      const done = row.properties?.Done?.checkbox === true;
+      if (typeof date === "string" && !done) rows.push({ id: row.id, date: date.slice(0, 10) });
+    }
+    cursor = res.has_more ? (res.next_cursor as string | undefined) : undefined;
+  } while (cursor);
+
+  rows.sort((a, b) => b.date.localeCompare(a.date)); // latest first
+  for (const r of rows) {
+    await notionFetch(token, `/pages/${r.id}`, {
+      method: "PATCH",
+      body: { properties: { Date: { date: { start: shiftISODate(r.date, deltaDays) } } } },
+    });
+  }
+  return { shifted: rows.length };
+}
+
 /** Swappable query fn — real Notion in production, a fake in tests. No network in tests. */
 export interface CurriculumDeps {
   queryForDate: typeof queryCurriculumForDate;

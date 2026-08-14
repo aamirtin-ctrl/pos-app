@@ -49,6 +49,7 @@ import { sendMorningDigest, shouldSendDigest } from "./digest.ts";
 import { loadDoctrine } from "./engine/doctrine.ts";
 import { runMsgPlans } from "./msgplans.ts";
 import { syncNotion, notionConfigured, enrichAgenticCurriculumTasks } from "./notion.ts";
+import { rolloverMissedTasks } from "./rollover.ts";
 import { materializeRecurringTasks } from "./crm/recurring.ts";
 import { todayISO, addDaysISO } from "./dates.ts";
 import { getSetting, setSetting } from "./db/db.ts";
@@ -1255,6 +1256,25 @@ export function startWorkers(
         }
       } catch (e) {
         console.warn(`screen time auto-capture failed: ${(e as Error).message}`);
+      }
+
+      // Daily carry-over (owner ask 2026-08-16): unfinished one-off tasks roll to today, and a
+      // missed curriculum day shifts the whole Notion plan down the line. MUST run before the
+      // materialize/enrich block below — the shift changes which Notion row belongs to which
+      // day, and the enrich pass right after fills today's instance from the shifted dates.
+      try {
+        const today = todayISO();
+        const rolloverKey = `rollover_done_${today}`;
+        if (!getSetting(db, rolloverKey)) {
+          const r = await rolloverMissedTasks(db, secrets, today);
+          setSetting(db, rolloverKey, new Date().toISOString());
+          if (r.moved > 0) notify?.(`Carried ${r.moved} unfinished task${r.moved === 1 ? "" : "s"} over to today`);
+          if (r.curriculumShifted > 0) {
+            notify?.(`Missed a curriculum day — pushed ${r.curriculumShifted} Notion session${r.curriculumShifted === 1 ? "" : "s"} down the line`);
+          }
+        }
+      } catch (e) {
+        console.warn(`workers: daily rollover failed: ${(e as Error).message}`);
       }
 
       // Agentic-coding curriculum (owner ask 2026-08-07): Notion says WHAT each 30-minute
