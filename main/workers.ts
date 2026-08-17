@@ -1459,6 +1459,11 @@ export function startWorkers(
   })();
 
   const task = cron.schedule("*/15 * * * *", tick);
+  // One immediate tick at launch. The daily jobs (carry-over, curriculum shift, digest) are
+  // keyed per-day inside tick — if the app was closed at midnight, waiting for the next
+  // quarter-hour means opening to yesterday's plan for up to 15 minutes. Same reasoning as
+  // the startup stale-engine sweep above; `running` guard makes the overlap safe.
+  void tick();
   // Nudges run on their own 5-minute cadence: the reality window is 10 minutes, so a
   // 15-minute tick would leave blind gaps, and a call-out shouldn't queue behind Gmail.
   const nudgeTask = cron.schedule("*/5 * * * *", async () => {
