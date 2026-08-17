@@ -162,8 +162,8 @@ export interface PushTasksApi {
     insert(args: { requestBody: { title: string } }): Promise<{ data: { id?: string | null } }>;
   };
   tasks: {
-    list(args: { tasklist: string; maxResults: number; showCompleted?: boolean }): Promise<{
-      data: { items?: { id?: string | null; notes?: string | null }[] };
+    list(args: { tasklist: string; maxResults: number; showCompleted?: boolean; pageToken?: string }): Promise<{
+      data: { items?: { id?: string | null; notes?: string | null }[]; nextPageToken?: string | null };
     }>;
     insert(args: { tasklist: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
     update(args: { tasklist: string; task: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
@@ -1355,8 +1355,22 @@ async function pushTasksInner(
        WHERE c.status = 'open' AND c.confirmed_by_user = 1 AND c.direction = 'i_owe_them'`
     )
     .all() as { id: number; description: string; due_at: string | null; who: string | null }[];
-  const existing = await api.tasks.list({ tasklist: listId, maxResults: 100, showCompleted: false });
-  const have = new Set((existing.data.items ?? []).map((t) => t.notes ?? ""));
+  // Collect EVERY existing marker, across ALL pages. The original scan read one page of 100
+  // with no pagination: once the list grew past 100 rows the dedupe check went blind, and
+  // every open commitment was re-inserted on every 15-minute tick — self-amplifying, since
+  // each insert pushed the real markers further past the visible page (3,298-row list,
+  // owner report 2026-08-17). Substring match, not equality: notes may carry more than the
+  // bare marker.
+  const have = new Set<string>();
+  let pageToken: string | undefined;
+  do {
+    const page = await api.tasks.list({ tasklist: listId, maxResults: 100, showCompleted: false, pageToken });
+    for (const g of page.data.items ?? []) {
+      const m = /pos:commitment:\d+/.exec(g.notes ?? "");
+      if (m) have.add(m[0]);
+    }
+    pageToken = page.data.nextPageToken ?? undefined;
+  } while (pageToken);
   for (const c of commitments) {
     const marker = `pos:commitment:${c.id}`;
     if (have.has(marker)) continue;

@@ -517,10 +517,18 @@ export async function purgeOrphanedGoogleTasks(
   // "Tentative:" prefix — a task he typed on his phone has neither and is never touched.
   const lists = [posList, DEFAULT_TASKLIST_ID];
 
-  const liveTask = db.prepare("SELECT 1 FROM task WHERE id = ?");
+  const liveTask = db.prepare("SELECT gtasks_id FROM task WHERE id = ?");
   const liveCommitment = db.prepare(
     "SELECT 1 FROM commitment WHERE id = ? AND status IN ('open','scheduled')"
   );
+  // Duplicate copies of LIVE items (owner report 2026-08-17: 3,298 rows in the POS list).
+  // The blind commitment push re-inserted the same live commitments for days, and this purge
+  // kept every copy — "live" was the whole test. Now: a live TASK keeps only the row its
+  // gtasks_id points at (or the first seen, healing gtasks_id when applying); a live
+  // COMMITMENT keeps only the first row per marker. Everything else with that marker is a
+  // duplicate and dies.
+  const keptCommitment = new Set<number>();
+  const keptTaskFirst = new Map<number, string>(); // taskId → first g.id kept (gtasks_id was NULL)
 
   const seenIds = new Set<string>(); // '@default' may resolve to a list already scanned
   for (const tasklist of lists) {
@@ -547,8 +555,38 @@ export async function purgeOrphanedGoogleTasks(
         } else {
           const taskId = taskIdFromNotes(g.notes);
           const commitmentId = commitmentIdFromNotes(g.notes);
-          if (taskId != null) doomed = !liveTask.get(taskId);
-          else if (commitmentId != null) doomed = !liveCommitment.get(commitmentId);
+          if (taskId != null) {
+            const row = liveTask.get(taskId) as { gtasks_id: string | null } | undefined;
+            if (!row) {
+              doomed = true; // task gone locally → orphan
+            } else if (row.gtasks_id) {
+              doomed = row.gtasks_id !== g.id; // live task keeps only its canonical row
+            } else {
+              // Task never linked (crash between insert and link). Keep the first copy and
+              // heal the link; every later copy with the same marker is a duplicate.
+              const first = keptTaskFirst.get(taskId);
+              if (first === undefined) {
+                keptTaskFirst.set(taskId, g.id);
+                if (opts.apply) {
+                  db.prepare("UPDATE task SET gtasks_id = ?, gtasks_list = ? WHERE id = ?").run(
+                    g.id,
+                    tasklist === posList ? null : tasklist,
+                    taskId
+                  );
+                }
+              } else {
+                doomed = first !== g.id;
+              }
+            }
+          } else if (commitmentId != null) {
+            if (!liveCommitment.get(commitmentId)) {
+              doomed = true; // commitment resolved/gone → orphan
+            } else if (keptCommitment.has(commitmentId)) {
+              doomed = true; // duplicate copy of a live commitment
+            } else {
+              keptCommitment.add(commitmentId);
+            }
+          }
           // no marker at all → his own row, never touched
         }
 
