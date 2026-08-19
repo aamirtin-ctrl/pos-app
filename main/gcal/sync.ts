@@ -1222,6 +1222,18 @@ export async function reconcileMovedEvents(db: Db, secrets: SecretStore): Promis
   return { locked };
 }
 
+/**
+ * True only for a genuinely missing remote row (404/410). Everything else — quota, network,
+ * 5xx — is transient, and re-inserting on it MINTS A DUPLICATE: on 2026-08-18 a quota-starved
+ * day turned every failed update into a fresh copy (~2,175 rows in one day), because the
+ * update's catch treated any non-reconsent error as "task missing".
+ */
+function isMissingRemote(err: unknown): boolean {
+  const e = err as { code?: number | string; response?: { status?: number } };
+  const status = typeof e?.code === "number" ? e.code : Number(e?.code) || e?.response?.status;
+  return status === 404 || status === 410;
+}
+
 /** Find-or-create the POS Google Tasks list. */
 export async function ensurePosTasklist(
   db: Db,
@@ -1324,7 +1336,13 @@ async function pushTasksInner(
           // Only a MISSING task justifies re-inserting. A scope refusal would fail the
           // insert identically, so surface it instead of doubling the failed calls.
           if (needsReconsent(e)) throw e;
-          /* fall through to insert */
+          if (!isMissingRemote(e)) {
+            // Quota/network/5xx: skip — the next tick retries the update. Falling through
+            // here is how the 2026-08-18 duplicate flood was minted.
+            console.warn(`gtasks push: update ${t.gtasks_id} failed transiently, skipping: ${(e as Error).message}`);
+            continue;
+          }
+          /* genuinely gone → fall through to insert */
         }
       } else {
         // Wrong list — a task crossed the near-term horizon, or was pushed before routing
@@ -1336,7 +1354,13 @@ async function pushTasksInner(
           await api.tasks.delete({ tasklist: currentList, task: t.gtasks_id });
         } catch (e) {
           if (needsReconsent(e)) throw e;
-          /* fall through and insert into the target list anyway */
+          if (!isMissingRemote(e)) {
+            // Couldn't confirm the old copy is gone (quota/network). Inserting the new-list
+            // copy now would leave both alive — skip and let the next tick move it.
+            console.warn(`gtasks push: move-delete ${t.gtasks_id} failed transiently, skipping move: ${(e as Error).message}`);
+            continue;
+          }
+          /* already gone → fall through and insert into the target list */
         }
       }
     }
