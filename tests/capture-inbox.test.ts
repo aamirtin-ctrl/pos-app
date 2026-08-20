@@ -61,12 +61,19 @@ describe("recordCapture", () => {
 });
 
 describe("the queue", () => {
-  it("holds an input whose interpretation failed", () => {
+  it("holds an input whose interpretation failed — a model outage burns no attempt", () => {
     const id = recordCapture(db, "sparkle", "something the model could not reach")!;
     markCaptureFailed(db, id, "429 quota exceeded");
     expect(pendingCaptureCount(db)).toBe(1);
-    expect(row(id).attempts).toBe(1);
+    expect(row(id).attempts).toBe(0); // transient: waits for a healthier run, cap untouched
     expect(row(id).error).toMatch(/quota/);
+  });
+
+  it("holds an input whose interpretation genuinely failed, counting the attempt", () => {
+    const id = recordCapture(db, "sparkle", "text the model rejected")!;
+    markCaptureFailed(db, id, "model returned malformed JSON");
+    expect(pendingCaptureCount(db)).toBe(1);
+    expect(row(id).attempts).toBe(1);
   });
 
   it("releases it once it has been understood", () => {
@@ -135,5 +142,39 @@ describe("drainCaptures", () => {
     const res = await drainCaptures(db, async () => ({ kind: "note" }), { healthy: true, limit: 3 });
     expect(res.processed).toBe(3);
     expect(pendingCaptureCount(db)).toBe(5);
+  });
+});
+
+// Transient LLM failures burn no attempts (owner report 2026-08-20: five "llm unavailable"
+// refusals permanently closed a contact-bio capture; the row must instead wait for a
+// healthier run and still glean once the model is back).
+describe("transient LLM failures", () => {
+  it("an 'llm unavailable' failure keeps the row pending with attempts unburned — forever", async () => {
+    recordCapture(db, "apple_notes", "Abdeali Diwan — doing quant");
+    for (let i = 0; i < 10; i++) {
+      await drainCaptures(db, async () => { throw new Error("llm unavailable for notesglean"); }, { healthy: true });
+    }
+    expect(pendingCaptureCount(db)).toBe(1); // still queued after 10 outage-failures
+    const row = db.prepare("SELECT attempts, processed_at, error FROM capture_inbox").get() as {
+      attempts: number; processed_at: string | null; error: string;
+    };
+    expect(row.attempts).toBe(0);
+    expect(row.processed_at).toBeNull();
+    expect(row.error).toContain("llm unavailable");
+  });
+
+  it("a real parse failure still burns attempts and closes at the cap", async () => {
+    recordCapture(db, "sparkle", "gibberish");
+    for (let i = 0; i < 6; i++) {
+      await drainCaptures(db, async () => { throw new Error("boom"); }, { healthy: true });
+    }
+    expect(pendingCaptureCount(db)).toBe(0); // exhausted and closed
+  });
+
+  it("quota refusals are transient too", async () => {
+    recordCapture(db, "sparkle", "fine text");
+    await drainCaptures(db, async () => { throw new Error("429 Quota Exceeded"); }, { healthy: true });
+    const row = db.prepare("SELECT attempts FROM capture_inbox").get() as { attempts: number };
+    expect(row.attempts).toBe(0);
   });
 });
