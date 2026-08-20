@@ -125,7 +125,7 @@ export async function moveGoogleEvent(
     return { ok: false, error: (e as Error).message || "move failed" };
   }
 }
-function tasksApi(secrets: SecretStore): tasks_v1.Tasks {
+export function tasksApi(secrets: SecretStore): tasks_v1.Tasks {
   return google.tasks({ version: "v1", auth: oauthClient(secrets) });
 }
 
