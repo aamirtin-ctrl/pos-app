@@ -50,6 +50,7 @@ import { loadDoctrine } from "./engine/doctrine.ts";
 import { runMsgPlans } from "./msgplans.ts";
 import { syncNotion, notionConfigured, enrichAgenticCurriculumTasks } from "./notion.ts";
 import { rolloverMissedTasks } from "./rollover.ts";
+import { syncAppleContactBios } from "./crm/apple-bios.ts";
 import { materializeRecurringTasks } from "./crm/recurring.ts";
 import { todayISO, addDaysISO } from "./dates.ts";
 import { getSetting, setSetting } from "./db/db.ts";
@@ -1421,6 +1422,23 @@ export function startWorkers(
         const d = await distillWeek(db, llm);
         if (d.inserted > 0) notify?.(`Worklog: distilled ${d.inserted} entr${d.inserted === 1 ? "y" : "ies"} for the week`);
       }
+      // Mirror bios into Apple Contacts: once per day (owner ask 2026-08-20). Updates the
+      // managed ―― POS ―― note block on matched cards and creates cards for named people the
+      // Mac doesn't know — which also teaches iMessage their names. First run prompts for
+      // Contacts automation permission.
+      try {
+        const bioKey = `apple_bios_day_${todayISO()}`;
+        if (!getSetting(db, bioKey)) {
+          const b = await syncAppleContactBios(db, { apply: true });
+          setSetting(db, bioKey, new Date().toISOString());
+          if (b.updated > 0 || b.created > 0) {
+            notify?.(`Apple Contacts: ${b.updated} bio${b.updated === 1 ? "" : "s"} updated, ${b.created} contact${b.created === 1 ? "" : "s"} created`);
+          }
+        }
+      } catch (e) {
+        console.warn(`workers: apple contact bio sync failed: ${(e as Error).message}`);
+      }
+
       // Profile synthesis + bio-mining: once per day. The daily LLM budget lives in
       // enrich.ts (enrichment_attempt ledger); the setting key just keeps the pass
       // from re-running on every 15-minute tick. Skipped silently without an LLM.
