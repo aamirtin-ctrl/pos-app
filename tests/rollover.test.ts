@@ -64,20 +64,27 @@ describe("ordinary task carry-over", () => {
     expect(planDate(id)).toBe(TODAY);
   });
 
-  it("leaves done/dropped, today's, undated, window, recurring-template and instance tasks alone", async () => {
+  it("leaves done/dropped, today's, undated, window and recurring-template tasks alone", async () => {
     const done = insertTask({ status: "done" });
     const today = insertTask({ plan_date: TODAY });
     const undated = insertTask({ plan_date: null });
     const windowed = insertTask({ window_end: "2026-08-20" });
-    const template = insertTask({ recurrence: "daily", plan_date: null });
-    const gymInstance = insertTask({ recurrence_parent_id: template, title: "Gym" });
     const r = await rolloverMissedTasks(db, noNotion, TODAY, noShift);
     expect(r.moved).toBe(0);
     expect(statusOf(done)).toBe("done");
     expect(planDate(today)).toBe(TODAY);
     expect(planDate(undated)).toBeNull();
     expect(planDate(windowed)).toBe(YESTERDAY);
-    expect(planDate(gymInstance)).toBe(YESTERDAY); // gym recurs; rolling it would double it
+  });
+
+  it("a missed habit instance is dropped — tomorrow's own instance IS the roll-over", async () => {
+    const template = insertTask({ recurrence: "daily", plan_date: null });
+    const missedGym = insertTask({ recurrence_parent_id: template, title: "Gym / workout" });
+    const todayGym = insertTask({ recurrence_parent_id: template, title: "Gym / workout", plan_date: TODAY });
+    const r = await rolloverMissedTasks(db, noNotion, TODAY, noShift);
+    expect(r.droppedHabits).toBe(1);
+    expect(statusOf(missedGym)).toBe("dropped"); // its Google row is deleted by the push pass
+    expect(statusOf(todayGym)).toBe("planned"); // today's stands — exactly one gym task exists
   });
 });
 

@@ -1304,6 +1304,22 @@ async function pushTasksInner(
     gtasks_list: string | null; recurrence_parent_id: number | null; reminder_id: string | null;
   }[];
   for (const t of open) {
+    // Future HABIT instances stay local until their day (owner spec 2026-08-20: the Tasks tab
+    // shows TODAY's three habits + his own work, not the whole planning horizon). An instance
+    // an earlier build already pushed gets its remote row taken back down.
+    if (t.recurrence_parent_id != null && t.plan_date && t.plan_date > todayLocalISO()) {
+      if (t.gtasks_id) {
+        try {
+          await api.tasks.delete({ tasklist: t.gtasks_list ?? listId, task: t.gtasks_id });
+          db.prepare("UPDATE task SET gtasks_id = NULL, gtasks_list = NULL WHERE id = ?").run(t.id);
+        } catch (e) {
+          if (needsReconsent(e)) throw e;
+          if (isMissingRemote(e)) db.prepare("UPDATE task SET gtasks_id = NULL, gtasks_list = NULL WHERE id = ?").run(t.id);
+          /* transient: leave the link; a later push retries the take-down */
+        }
+      }
+      continue;
+    }
     // A clock-time deadline is more specific than a plain day, so it wins when both exist.
     const due = t.hard_deadline_at
       ? new Date(t.hard_deadline_at).toISOString()
@@ -1407,6 +1423,22 @@ async function pushTasksInner(
       },
     });
     pushed++;
+  }
+
+  // Dropped tasks (a habit day that passed un-done, a merged duplicate): their Google rows are
+  // DELETED, not completed — he didn't do the work, so "completed" would be a lie on the record.
+  const dropped = db
+    .prepare("SELECT id, gtasks_id, gtasks_list FROM task WHERE status = 'dropped' AND gtasks_id IS NOT NULL")
+    .all() as { id: number; gtasks_id: string; gtasks_list: string | null }[];
+  for (const d of dropped) {
+    try {
+      await api.tasks.delete({ tasklist: d.gtasks_list ?? listId, task: d.gtasks_id });
+      db.prepare("UPDATE task SET gtasks_id = NULL, gtasks_list = NULL WHERE id = ?").run(d.id);
+    } catch (e) {
+      if (needsReconsent(e)) throw e;
+      if (isMissingRemote(e)) db.prepare("UPDATE task SET gtasks_id = NULL, gtasks_list = NULL WHERE id = ?").run(d.id);
+      /* transient: retry on a later push */
+    }
   }
 
   // complete Google tasks whose local task is done — in whichever list each one lives

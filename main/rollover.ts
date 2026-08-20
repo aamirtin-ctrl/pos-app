@@ -14,10 +14,12 @@
 //     by the number of missed days — and the stale local instances are reset so the normal
 //     enrichment pass re-fills them from the shifted dates. Notion stays the source of truth.
 //
+// Habit instances (gym / Instagram) are DROPPED when their day passes un-done (owner spec
+// 2026-08-20: the Tasks tab shows today's three habits and nothing more). Tomorrow always
+// materializes its own instance, so the drop IS the roll-over — carrying yesterday's forward
+// would double it. Their Google rows are taken down by the push's dropped-cleanup pass.
+//
 // Untouched on purpose:
-//   • other RECURRING instances (gym): tomorrow materializes its own instance anyway — rolling
-//     yesterday's forward would double it (owner: "doesn't really raise a problem for the gym
-//     tasks").
 //   • window tasks (window_end set): the planner already owns advancing those day by day.
 //   • templates: they are definitions, not work.
 
@@ -41,6 +43,7 @@ export interface RolloverResult {
   moved: number; // ordinary tasks carried to today
   curriculumShifted: number; // Notion rows pushed down the line
   curriculumFrom: string | null; // the missed date the shift started from
+  droppedHabits: number; // missed habit instances self-cleaned (tomorrow's instance is the roll)
 }
 
 /**
@@ -110,5 +113,19 @@ export async function rolloverMissedTasks(
     }
   }
 
-  return { moved, curriculumShifted, curriculumFrom };
+  // ── habit instances: a missed day self-cleans; tomorrow's instance is the roll-over ──
+  // Curriculum children are excluded: their missed days are handled by the Notion shift above
+  // (and, with no Notion token, deliberately wait rather than silently skipping a topic).
+  const droppedHabits = db
+    .prepare(
+      `UPDATE task SET status = 'dropped', updated_at = datetime('now')
+        WHERE recurrence_parent_id IS NOT NULL
+          AND recurrence_parent_id NOT IN
+            (SELECT id FROM task WHERE notes LIKE '%${AGENTIC_CURRICULUM_MARKER_PREFIX}%')
+          AND plan_date IS NOT NULL AND plan_date < ?
+          AND status IN ${INCOMPLETE}`
+    )
+    .run(todayISO).changes;
+
+  return { moved, curriculumShifted, curriculumFrom, droppedHabits };
 }
