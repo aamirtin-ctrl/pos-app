@@ -12,7 +12,7 @@ import type { Db } from "./db/db.ts";
 import type { SecretStore } from "./secrets.ts";
 import { extractJson, llmHealth, type LlmClient } from "./llm/provider.ts";
 import { backfillDegraded, listDegraded } from "./backfill.ts";
-import {
+import { verifyPendingCommitments,
   extractCommitmentsLlm,
   passesCommitmentGate,
   isExpiredSameDay,
@@ -104,6 +104,43 @@ let warnedGoogleTokenDead = false;
  * Keychain session and every encrypted secret started reading as null in-process — while a
  * fresh process decrypted fine. Neither may happen quietly again. */
 let warnedImessageUnavailable = false;
+
+/** Apple apps POS's sweeps drive over AppleScript — launched implicitly by `tell` if not
+ * already open. The owner's complaint (2026-08-24): every 15 minutes these pop open and
+ * stay. The tick snapshots which are running BEFORE its work and quits, at the end, only
+ * the ones the tick itself brought up — an app the owner had open is never touched. (An
+ * app opened by the owner DURING a tick can be caught in the sweep; the window is seconds
+ * wide and reopening costs one click — accepted.) */
+const APPLESCRIPT_TARGET_APPS = ["Calendar", "Notes", "Reminders"] as const;
+
+async function runningTargetApps(): Promise<Set<string>> {
+  const { runOsascript } = await import("./applecal.ts");
+  const res = await runOsascript(
+    'tell application "System Events" to get name of every process whose background only is false',
+    15_000
+  );
+  const out = new Set<string>();
+  if (res.ok) {
+    const names = res.stdout.split(",").map((x) => x.trim());
+    for (const t of APPLESCRIPT_TARGET_APPS) if (names.includes(t)) out.add(t);
+  } else {
+    // Can't see the process list -> claim everything is running so we quit nothing.
+    for (const t of APPLESCRIPT_TARGET_APPS) out.add(t);
+  }
+  return out;
+}
+
+async function quitTickLaunchedApps(before: Set<string>): Promise<void> {
+  const { runOsascript } = await import("./applecal.ts");
+  const after = await runningTargetApps();
+  for (const name of APPLESCRIPT_TARGET_APPS) {
+    if (after.has(name) && !before.has(name)) {
+      // Only apps running NOW: `tell app to quit` on a closed app would LAUNCH it first.
+      await runOsascript(`tell application "${name}" to quit`, 15_000);
+    }
+  }
+}
+
 let warnedMailVanished = false;
 
 const CONNECTORS: Record<SyncSource, ConnectorFn> = {
@@ -242,6 +279,12 @@ export async function runSync(
         // rows. Reminders.app is the task source now; he taps once, POS imports it.
         if (getSetting(db, AUTO_TASKS_ENABLED_KEY) === "1") {
           await autoTentativeTasks(db, secrets, beforeMax);
+        }
+        // Batched Gemini gate: fresh commitments stay invisible until one call per
+        // batch confirms them real and rewrites the headline (owner ask 2026-08-24).
+        const vr = await verifyPendingCommitments(db, llm);
+        if (vr.verified + vr.dropped > 0) {
+          console.log(`workers: commitment verify — ${vr.verified} confirmed, ${vr.dropped} rejected, ${vr.waiting} still pending`);
         }
       }
       // Thread-resolution pass AFTER extraction: new messages that fulfill or cancel
@@ -1159,6 +1202,9 @@ export function startWorkers(
     const sweepDays = tickNo++ % 2 === 0 ? REPLAN_HORIZON_DAYS : 1;
     if (running) return; // never overlap
     running = true;
+    const appsRunningBefore = await runningTargetApps().catch(() => {
+      const all = new Set<string>(); for (const t of APPLESCRIPT_TARGET_APPS) all.add(t); return all;
+    });
     try {
       // Degraded-work backfill FIRST, before anything else that spends the model (owner ask
       // 2026-08-05: "when my Gemini credits refill it should go back and fix the stuff it
@@ -1481,6 +1527,8 @@ export function startWorkers(
     } catch (e) {
       console.warn(`workers: scheduled sync failed: ${(e as Error).message}`);
     } finally {
+      // Close what this tick opened (Calendar/Notes/Reminders driven over AppleScript).
+      await quitTickLaunchedApps(appsRunningBefore).catch(() => {});
       running = false;
     }
   };

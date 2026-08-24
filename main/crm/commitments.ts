@@ -757,11 +757,75 @@ Rules: only use n values from the list; do not invent facts or dates; never copy
  * confidence — and with it that row's title/kind — and the earlier created_at, filling in
  * any due_at/start_time the original lacked. Rows with dedupe_key NULL never conflict.
  */
+/**
+ * Batch verification gate (owner directive 2026-08-24): a freshly extracted commitment is
+ * INVISIBLE — status 'pending_verify' — until one batched Gemini call confirms it is a real
+ * obligation and rewrites its headline. Only then does it become 'open' (review queue,
+ * listCommitments("open"), pushTasks all filter on 'open', so nothing pending can reach the
+ * UI or Google Tasks). Rejects are dropped with resolved_at for audit. One call per batch of
+ * up to `cap` — explicitly to conserve API quota, whose exhaustion has bitten this app
+ * before. No LLM (quota dead, key missing) means rows WAIT: fail-closed was the ask.
+ */
+export async function verifyPendingCommitments(
+  db: Db,
+  llm: LlmClient | null,
+  cap = 25
+): Promise<{ verified: number; dropped: number; waiting: number }> {
+  const rows = db
+    .prepare("SELECT id, description, direction FROM commitment WHERE status = 'pending_verify' ORDER BY id LIMIT ?")
+    .all(cap) as { id: number; description: string; direction: string }[];
+  const waiting = (db.prepare("SELECT COUNT(*) AS n FROM commitment WHERE status = 'pending_verify'").get() as { n: number }).n;
+  if (rows.length === 0) return { verified: 0, dropped: 0, waiting: 0 };
+  if (!llm) return { verified: 0, dropped: 0, waiting };
+
+  const listing = rows.map((r, i) => `${i + 1}. [${r.direction}] ${r.description.slice(0, 200)}`).join("\n");
+  const prompt = `These lines were auto-extracted from the owner's messages as possible commitments (things he owes someone or someone owes him). For EACH, decide if it is a REAL, actionable commitment — not chatter, not a question, not something already finished, not scheduling noise.
+
+${listing}
+
+Return STRICT JSON ONLY — an array with one entry per line, same n:
+[{ "n": <number>, "real": true | false, "title": "<clean imperative headline, <=80 chars>" }]
+For real=false the title may be "". Never invent obligations that are not in the line.`;
+
+  const res = await llm.call("commitments-verify", "fast", prompt, { json: true });
+  if (!res) return { verified: 0, dropped: 0, waiting };
+
+  let verified = 0;
+  let droppedN = 0;
+  try {
+    const parsed = extractJson(res.text);
+    if (!Array.isArray(parsed)) return { verified: 0, dropped: 0, waiting };
+    const open = db.prepare(
+      "UPDATE commitment SET status = 'open', description = ? WHERE id = ? AND status = 'pending_verify'"
+    );
+    const drop = db.prepare(
+      "UPDATE commitment SET status = 'dropped', resolved_at = datetime('now') WHERE id = ? AND status = 'pending_verify'"
+    );
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      const o = item as Record<string, unknown>;
+      const n = Number(o.n);
+      if (!Number.isFinite(n) || n < 1 || n > rows.length) continue;
+      const row = rows[n - 1];
+      if (o.real === true) {
+        const title = typeof o.title === "string" && o.title.trim().length > 2 ? o.title.trim().slice(0, 120) : row.description;
+        if (open.run(title, row.id).changes > 0) verified++;
+      } else if (o.real === false) {
+        if (drop.run(row.id).changes > 0) droppedN++;
+      }
+      // anything the model skipped stays pending for the next batch
+    }
+  } catch {
+    return { verified: 0, dropped: 0, waiting };
+  }
+  return { verified, dropped: droppedN, waiting: waiting - verified - droppedN };
+}
+
 const insertCommitment = (db: Db) =>
   db.prepare(
     `INSERT INTO commitment (person_id, direction, description, due_at, status, source_interaction_id,
                              confidence, confirmed_by_user, dedupe_key, kind, start_time, created_at)
-     VALUES (?, ?, ?, ?, 'open', ?, ?, 0, ?, ?, ?, datetime('now'))
+     VALUES (?, ?, ?, ?, 'pending_verify', ?, ?, 0, ?, ?, ?, datetime('now'))
      ON CONFLICT(dedupe_key) WHERE dedupe_key IS NOT NULL DO UPDATE SET
        description = CASE WHEN excluded.confidence > commitment.confidence THEN excluded.description ELSE commitment.description END,
        kind        = CASE WHEN excluded.confidence > commitment.confidence THEN excluded.kind        ELSE commitment.kind        END,
