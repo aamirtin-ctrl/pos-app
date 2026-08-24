@@ -94,6 +94,18 @@ export const EXTRACT_LOOKBACK = "-2 days";
 /** Once-per-run guard for the dead-Google-token notification in the tick. */
 let warnedGoogleTokenDead = false;
 
+/** Once-per-run guards for the other two silent sync-freeze modes (owner report 2026-08-24:
+ * "why is it that the messages/emails dont always stay up to date"). Both gates fail
+ * SILENTLY by design — no sync_run row, no error — which is correct behavior for a machine
+ * that never had the capability, and a slow-motion lie on one that lost it. iMessage died
+ * 2026-08-13 the moment the app started running as the dev binary (TCC grants Full Disk
+ * Access per app bundle; POS.app has it, node_modules Electron does not) and said nothing
+ * for eleven days. Mail died 2026-08-21 when the then four-day-old process lost its
+ * Keychain session and every encrypted secret started reading as null in-process — while a
+ * fresh process decrypted fine. Neither may happen quietly again. */
+let warnedImessageUnavailable = false;
+let warnedMailVanished = false;
+
 const CONNECTORS: Record<SyncSource, ConnectorFn> = {
   gmail: (deps) => syncAllMail(deps), // every configured mail account (gmail/outlook/imap)
   imessage: (deps) => syncImessage(deps),
@@ -1364,7 +1376,14 @@ export function startWorkers(
         console.warn(`apple mirror sweep failed: ${(e as Error).message}`);
       }
 
-      if (gmailConfigured({ secrets })) {
+      const mailOk = gmailConfigured({ secrets });
+      // Accounts exist on disk but read as absent -> the process can no longer decrypt
+      // (stale Keychain session in a long-lived instance). Restarting the app fixes it.
+      if (!mailOk && !warnedMailVanished && (secrets.list?.() ?? []).some((e) => e.name === "MAIL_ACCOUNTS")) {
+        warnedMailVanished = true;
+        notify?.("Email sync is paused — the app can no longer read its saved mail accounts. Quit and reopen POS to fix it.");
+      }
+      if (mailOk) {
         announce(await runSync(db, secrets, llm, "gmail"));
         // Same accounts, LinkedIn notification mail only (invites/accepts → people).
         announce(await runSync(db, secrets, llm, "linkedin-email"));
@@ -1373,6 +1392,10 @@ export function startWorkers(
       // or configured self iMessage handles).
       if (gmailConfigured({ secrets }) || (getSetting(db, "capture_self_handles") ?? "").trim()) {
         announce(await runSync(db, secrets, llm, "capture"));
+      }
+      if (!imessageAvailable() && !warnedImessageUnavailable) {
+        warnedImessageUnavailable = true;
+        notify?.("iMessage sync is paused — this build can't read Messages. Grant Full Disk Access to the app that is actually running (System Settings → Privacy & Security → Full Disk Access).");
       }
       if (imessageAvailable()) {
         // FDA can still be revoked between the precheck and the copy — announce() stays
