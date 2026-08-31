@@ -37,7 +37,13 @@ export interface LlmOptions {
 
 const MODELS: Record<"anthropic" | "gemini", Record<LlmTier, string>> = {
   anthropic: { fast: "claude-haiku-4-5-20251001", smart: "claude-sonnet-5" },
-  gemini: { fast: "gemini-2.5-flash", smart: "gemini-2.5-pro" },
+  // 'smart' is the -latest ALIAS on purpose (2026-08-31): the pinned "gemini-2.5-pro"
+  // was retired for new users and every smart-tier call — bio mining, profile synthesis,
+  // the notes glean — returned 404 for WEEKS, warned only to a console nobody watches
+  // (315 'llm returned null' rows in the enrichment ledger). The alias tracks whatever
+  // pro-class model Google currently serves, so a model retirement can never silently
+  // kill half the app again.
+  gemini: { fast: "gemini-2.5-flash", smart: "gemini-pro-latest" },
 };
 
 export type LlmProvider = "anthropic" | "gemini";
