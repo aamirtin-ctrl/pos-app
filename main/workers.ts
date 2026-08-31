@@ -24,7 +24,7 @@ import { dateUndatedTasks } from "./crm/taskdates.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { runEnrichment } from "./crm/enrich.ts";
 import { resolveNamedDate } from "./context.ts";
-import { commitmentToTask, commitmentToEvent, closeGoogleTask, drainTombstones, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
+import { commitmentToTask, commitmentToEvent, closeGoogleTask, drainTombstones, pruneRetiredTaskBlocks, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
 import { hasCalendarWriteScope, isGoogleConnected, googleScopeStatus } from "./gcal/auth.ts";
 import { autoPushEnabled, pushPlanToGoogle } from "./planner.ts";
 import { eventsForDate as icsEventsForDate } from "./icscal.ts";
@@ -1356,6 +1356,13 @@ export function startWorkers(
           // Tasks tab forever (the pass rollover's comment promised but nothing implemented).
           const cg = await cleanupDroppedTaskRows(db, secrets);
           if (cg.removed > 0) console.log(`workers: cleared ${cg.removed} dropped task row(s) from Google`);
+          // …and their calendar shadows: blocks of retired tasks tombstone their events,
+          // and the drain issues the Google deletes (owner report 2026-08-31).
+          const pr = pruneRetiredTaskBlocks(db);
+          if (pr.pruned > 0) {
+            const dt = await drainTombstones(db, secrets);
+            console.log(`workers: pruned ${pr.pruned} retired-task block(s), withdrew ${dt.deleted} calendar event(s)`);
+          }
           setSetting(db, rolloverKey, new Date().toISOString());
           if (r.moved > 0) notify?.(`Carried ${r.moved} unfinished task${r.moved === 1 ? "" : "s"} over to today`);
           if (r.curriculumShifted > 0) {

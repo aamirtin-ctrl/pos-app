@@ -1698,6 +1698,33 @@ export function commitmentToEvent(db: Db, id: number, dateISO?: string, hhmm?: s
 }
 
 
+/**
+ * The other half of "the calendar must match the plan" (owner report 2026-08-31: "why
+ * didn't this stuff automatically delete when I deleted the Google tasks?"). Deleting a
+ * Google TASK retires the local task (reconcile matrix -> 'deferred'), but its BLOCKS in
+ * already-built plans kept their calendar events — blocks, not tasks, own events, and
+ * nothing walked from a retired task back to its blocks. So "Physics Test" left Tasks and
+ * haunted the calendar. This sweep tombstones the events of every block whose task is
+ * deferred or dropped and removes the blocks; drainTombstones does the Google deletes
+ * through the machinery replans already use. Done work is untouched — a completed task's
+ * event is history, not clutter.
+ */
+export function pruneRetiredTaskBlocks(db: Db): { pruned: number } {
+  const calId = getSetting(db, "pos_calendar_id");
+  const rows = db.prepare(
+    `SELECT b.id, b.gcal_event_id FROM block b JOIN task t ON t.id = b.task_id
+      WHERE t.status IN ('deferred','dropped')`
+  ).all() as { id: number; gcal_event_id: string | null }[];
+  if (rows.length === 0) return { pruned: 0 };
+  const bury = db.prepare("INSERT INTO gcal_tombstone (event_id, calendar_id) VALUES (?, ?)");
+  const drop = db.prepare("DELETE FROM block WHERE id = ?");
+  for (const r of rows) {
+    if (r.gcal_event_id) bury.run(r.gcal_event_id, calId);
+    drop.run(r.id);
+  }
+  return { pruned: rows.length };
+}
+
 // ── the calendar must match the plan, not accumulate it ──────────────────────
 //
 // Owner report 2026-08-06, with a screenshot: two Lunches, two Comms window 2s, two math
