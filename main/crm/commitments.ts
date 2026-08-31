@@ -770,13 +770,13 @@ export async function verifyPendingCommitments(
   db: Db,
   llm: LlmClient | null,
   cap = 25
-): Promise<{ verified: number; dropped: number; waiting: number }> {
+): Promise<{ verified: number; dropped: number; waiting: number; verifiedIds: number[] }> {
   const rows = db
     .prepare("SELECT id, description, direction FROM commitment WHERE status = 'pending_verify' ORDER BY id LIMIT ?")
     .all(cap) as { id: number; description: string; direction: string }[];
   const waiting = (db.prepare("SELECT COUNT(*) AS n FROM commitment WHERE status = 'pending_verify'").get() as { n: number }).n;
-  if (rows.length === 0) return { verified: 0, dropped: 0, waiting: 0 };
-  if (!llm) return { verified: 0, dropped: 0, waiting };
+  if (rows.length === 0) return { verified: 0, dropped: 0, waiting: 0, verifiedIds: [] };
+  if (!llm) return { verified: 0, dropped: 0, waiting, verifiedIds: [] };
 
   const listing = rows.map((r, i) => `${i + 1}. [${r.direction}] ${r.description.slice(0, 200)}`).join("\n");
   const prompt = `These lines were auto-extracted from the owner's messages as possible commitments (things he owes someone or someone owes him). For EACH, decide if it is a REAL, actionable commitment — not chatter, not a question, not something already finished, not scheduling noise.
@@ -788,13 +788,14 @@ Return STRICT JSON ONLY — an array with one entry per line, same n:
 For real=false the title may be "". Never invent obligations that are not in the line.`;
 
   const res = await llm.call("commitments-verify", "fast", prompt, { json: true });
-  if (!res) return { verified: 0, dropped: 0, waiting };
+  if (!res) return { verified: 0, dropped: 0, waiting, verifiedIds: [] };
 
   let verified = 0;
   let droppedN = 0;
+  const verifiedIds: number[] = [];
   try {
     const parsed = extractJson(res.text);
-    if (!Array.isArray(parsed)) return { verified: 0, dropped: 0, waiting };
+    if (!Array.isArray(parsed)) return { verified: 0, dropped: 0, waiting, verifiedIds: [] };
     const open = db.prepare(
       "UPDATE commitment SET status = 'open', description = ? WHERE id = ? AND status = 'pending_verify'"
     );
@@ -809,16 +810,16 @@ For real=false the title may be "". Never invent obligations that are not in the
       const row = rows[n - 1];
       if (o.real === true) {
         const title = typeof o.title === "string" && o.title.trim().length > 2 ? o.title.trim().slice(0, 120) : row.description;
-        if (open.run(title, row.id).changes > 0) verified++;
+        if (open.run(title, row.id).changes > 0) { verified++; verifiedIds.push(row.id); }
       } else if (o.real === false) {
         if (drop.run(row.id).changes > 0) droppedN++;
       }
       // anything the model skipped stays pending for the next batch
     }
   } catch {
-    return { verified: 0, dropped: 0, waiting };
+    return { verified: 0, dropped: 0, waiting, verifiedIds: [] };
   }
-  return { verified, dropped: droppedN, waiting: waiting - verified - droppedN };
+  return { verified, dropped: droppedN, waiting: waiting - verified - droppedN, verifiedIds };
 }
 
 const insertCommitment = (db: Db) =>

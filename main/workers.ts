@@ -23,7 +23,8 @@ import { verifyPendingCommitments,
 import { dateUndatedTasks } from "./crm/taskdates.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { runEnrichment } from "./crm/enrich.ts";
-import { commitmentToTask, closeGoogleTask, drainTombstones, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
+import { resolveNamedDate } from "./context.ts";
+import { commitmentToTask, commitmentToEvent, closeGoogleTask, drainTombstones, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
 import { hasCalendarWriteScope, isGoogleConnected, googleScopeStatus } from "./gcal/auth.ts";
 import { autoPushEnabled, pushPlanToGoogle } from "./planner.ts";
 import { eventsForDate as icsEventsForDate } from "./icscal.ts";
@@ -285,6 +286,31 @@ export async function runSync(
         const vr = await verifyPendingCommitments(db, llm);
         if (vr.verified + vr.dropped > 0) {
           console.log(`workers: commitment verify — ${vr.verified} confirmed, ${vr.dropped} rejected, ${vr.waiting} still pending`);
+        }
+        // NOTES-sourced commitments flow all the way through (owner directive 2026-08-31):
+        // a blurb he wrote about a person — "should meet up with her this summer" — becomes,
+        // once verified, a commitment AND a dated task in Google AND a calendar block,
+        // all hanging off the same commitment row. Deliberately ROUTING, not new machinery:
+        // commitmentToTask and commitmentToEvent are the same converters the review queue's
+        // buttons call; notes get them automatically because writing it down was already
+        // his confirmation (the same doctrine notesglean applies to new people). Message-
+        // sourced commitments still stop at the review queue — that channel earned its
+        // gate. Extraction's due date wins; a named period falls back to his date anchors
+        // (resolveNamedDate); truly undated notes become an inbox task and no event.
+        for (const cid of vr.verifiedIds) {
+          try {
+            const src = db.prepare(
+              `SELECT i.channel, c.due_at, c.description, c.start_time FROM commitment c
+                 JOIN interaction i ON i.id = c.source_interaction_id WHERE c.id = ?`
+            ).get(cid) as { channel: string; due_at: string | null; description: string; start_time: string | null } | undefined;
+            if (src?.channel !== "notes") continue;
+            const dateISO = src.due_at?.slice(0, 10) ?? resolveNamedDate(db, src.description) ?? undefined;
+            await commitmentToTask(db, secrets, cid, dateISO, { tentative: true });
+            if (dateISO) commitmentToEvent(db, cid, dateISO, src.start_time ?? undefined);
+            console.log(`workers: note commitment ${cid} routed — task${dateISO ? " + event on " + dateISO : " (undated inbox)"}`);
+          } catch (e) {
+            console.warn(`workers: note-commitment route ${cid} failed: ${(e as Error).message}`);
+          }
         }
       }
       // Thread-resolution pass AFTER extraction: new messages that fulfill or cancel

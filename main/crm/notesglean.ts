@@ -106,9 +106,12 @@ export function applyChunk(db: Db, chunk: NoteChunk, personId: number): void {
   const email = normalizeEmail(chunk.email);
   if (email) addAlias(db, personId, "email", email.norm, "applenotes");
 
+  // body_summary too, not just body_raw: commitment extraction selects subject/body_summary,
+  // so a notes row without it is INVISIBLE to the pipeline — "should meet up this summer"
+  // written in a note could never become a commitment (routing gap closed 2026-08-31).
   db.prepare(
-    "INSERT INTO interaction (person_id, channel, occurred_at, body_raw) VALUES (?, 'notes', datetime('now'), ?)"
-  ).run(personId, chunkText(chunk));
+    "INSERT INTO interaction (person_id, channel, occurred_at, body_raw, body_summary) VALUES (?, 'notes', datetime('now'), ?, ?)"
+  ).run(personId, chunkText(chunk), chunkText(chunk).slice(0, 500));
 }
 
 /** The chunk as one readable blob for interaction history / review cards. */
