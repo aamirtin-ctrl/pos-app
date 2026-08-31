@@ -79,6 +79,69 @@ interface SqliteModule {
 
 /** Max chars of a self-message fed to the assistant. */
 export const CAPTURE_MAX_CHARS = 1500;
+/**
+ * HARD not-for-POS rules (owner directive 2026-08-31, after a backlog sync turned his
+ * self-texted video scripts into Google tasks): the self thread is also his notepad,
+ * and long-form content is storage, not instruction. Deterministic, no model:
+ *   - "pos:" / "pos " prefix        -> FORCED in (never skipped, bypasses the LLM gate)
+ *   - "skip:" / "ignore:" / "." lead -> explicit opt-out
+ *   - > NOT_FOR_POS_MAX_CHARS chars or >= NOT_FOR_POS_MAX_LINES non-empty lines
+ *     -> long-form (scripts, drafts, dumps)
+ * Returns a reason string, or null when the text may proceed.
+ */
+export const NOT_FOR_POS_MAX_CHARS = 600;
+export const NOT_FOR_POS_MAX_LINES = 6;
+
+export function isForcedForPos(text: string): boolean {
+  return /^pos[:\s]/i.test((text ?? "").trimStart());
+}
+
+export function notForPos(text: string): string | null {
+  const t = (text ?? "").trim();
+  if (!t) return null;
+  if (isForcedForPos(t)) return null;
+  if (/^(skip:|ignore:|\.)/i.test(t)) return "opt-out";
+  if (t.length > NOT_FOR_POS_MAX_CHARS) return "long-form";
+  const lines = t.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length >= NOT_FOR_POS_MAX_LINES) return "long-form";
+  return null;
+}
+
+/**
+ * FLEXIBLE rule: one batched model call per run asking, for every candidate that survived
+ * the hard rules, "is this addressed to the assistant, or is the self thread just being
+ * used as storage?" Batched — never per message — to conserve quota. FAIL-OPEN: with no
+ * model (or an unparseable answer) everything that passed the hard rules proceeds, because
+ * capture is the owner's primary input and freezing it on a quota outage is worse than
+ * letting the deterministic rules stand alone. Returns approved hashes, or null on no-call.
+ */
+async function classifyForPos(
+  llm: { call(f: string, t: "fast" | "smart", p: string, o?: object): Promise<{ text: string } | null> } | null,
+  items: { hash: string; text: string }[]
+): Promise<Set<string> | null> {
+  if (!llm || items.length === 0) return null;
+  const listing = items.map((it, i) => `${i + 1}. ${it.text.replace(/\s+/g, " ").slice(0, 160)}`).join("\n");
+  const prompt = `The owner texts his own number for two different reasons: (a) to tell his assistant something — a task, an event, a fact to remember, a command; (b) to use the thread as personal storage — video scripts, drafts, links, notes to copy elsewhere. For EACH numbered message decide which it is.
+
+${listing}
+
+Return STRICT JSON ONLY: [{ "n": <number>, "for_pos": true | false }]. When genuinely unsure, use true.`;
+  const res = await llm.call("capture-gate", "fast", prompt, { json: true }).catch(() => null);
+  if (!res) return null;
+  try {
+    const parsed = JSON.parse(res.text.replace(/^```(?:json)?|```$/gm, "").trim());
+    if (!Array.isArray(parsed)) return null;
+    const ok = new Set<string>();
+    for (const it of parsed) {
+      const n = Number((it as any)?.n);
+      if (Number.isFinite(n) && n >= 1 && n <= items.length && (it as any).for_pos === true) ok.add(items[n - 1].hash);
+    }
+    return ok;
+  } catch {
+    return null;
+  }
+}
+
 /** First-run lookback: last 24 hours only. */
 export const FIRST_RUN_MS = 24 * 60 * 60 * 1000;
 /** Setting key: comma-separated third-party senders allowed to feed capture. Empty by default. */
@@ -680,6 +743,23 @@ export async function runCapture(deps: ConnectorDeps): Promise<SyncReport> {
   const kinds = new Map<string, number>();
 
   const cmdDeps = { db: deps.db, secrets: deps.secrets, doctrineDir, llm: deps.llm ?? null };
+
+  // One batched relevance call for everything this run will consider (flexible rule).
+  const gateCandidates: { hash: string; text: string }[] = [];
+  const gateSeen = new Set<string>();
+  for (const { batch } of batches) {
+    for (const m of batch.messages) {
+      if (!m.text?.trim() || isDigestMessage(m.text) || isDigestReply(m.text)) continue;
+      if (isForcedForPos(m.text) || notForPos(m.text) !== null) continue;
+      const h = contentHash(m.text);
+      if (gateSeen.has(h) || contentSeen(deps.db, h)) continue;
+      gateSeen.add(h);
+      gateCandidates.push({ hash: h, text: m.text });
+      if (gateCandidates.length >= 30) break;
+    }
+  }
+  const approvedHashes = await classifyForPos(deps.llm ?? null, gateCandidates);
+
   outer: for (const { source, batch } of batches) {
     report.skipped += batch.skipped;
     for (const m of batch.messages) {
@@ -739,6 +819,25 @@ export async function runCapture(deps: ConnectorDeps): Promise<SyncReport> {
           // sparkle path could see before is a DEGRADED SUCCESS — the fallback parser ran
           // during an outage and returned a real but low-quality answer (his film/gym text
           // fragmented into three garbled tasks) with nothing marking it as such.
+          // Not-for-POS veto: hard rules first, then the batched model verdict. Skips are
+          // recorded in the capture inbox (auditable, not vanished) and their hash logged
+          // so the same script is never re-judged on a later run.
+          const hardReason = notForPos(m.text);
+          const softVeto =
+            hardReason === null &&
+            !isForcedForPos(m.text) &&
+            approvedHashes !== null &&
+            gateSeen.has(hash) &&
+            !approvedHashes.has(hash);
+          if (hardReason !== null || softVeto) {
+            const skipId = recordCapture(deps.db, source, m.text);
+            if (skipId !== null) markCaptureDone(deps.db, skipId, { kind: `not-for-pos:${hardReason ?? "model"}`, degraded: false });
+            logExtraction(deps.db, null, hash, "capture");
+            kinds.set("not-for-pos", (kinds.get("not-for-pos") ?? 0) + 1);
+            report.skipped++;
+            m.advance();
+            continue;
+          }
           const captureId = recordCapture(deps.db, source, m.text);
           const healthy = deps.llm ? llmHealth(deps.db, deps.secrets).ok : false;
           const res = await handleCommand(cmdDeps, m.text);
