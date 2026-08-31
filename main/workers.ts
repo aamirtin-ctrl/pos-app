@@ -31,7 +31,7 @@ import { eventsForDate as icsEventsForDate } from "./icscal.ts";
 import { distillWeek, distillWeekKey } from "./worklog.ts";
 import type { ConnectorDeps, SyncReport } from "./connectors/common.ts";
 import { syncAllMail, gmailConfigured } from "./connectors/gmail.ts";
-import { reconcileGoogleTasks } from "./gtasks-sync.ts";
+import { reconcileGoogleTasks, cleanupDroppedTaskRows } from "./gtasks-sync.ts";
 import { runNudgeCheck } from "./nudge.ts";
 import { screenTimeAvailable, autoCaptureOutcomes } from "./screentime.ts";
 import { generatePlan, replanUpcoming, upcomingDates, REPLAN_HORIZON_DAYS } from "./planner.ts";
@@ -1352,6 +1352,10 @@ export function startWorkers(
         const rolloverKey = `rollover_done_${today}`;
         if (!getSetting(db, rolloverKey)) {
           const r = await rolloverMissedTasks(db, secrets, today);
+          // The Google half of the habit drop — without it, missed instances linger in the
+          // Tasks tab forever (the pass rollover's comment promised but nothing implemented).
+          const cg = await cleanupDroppedTaskRows(db, secrets);
+          if (cg.removed > 0) console.log(`workers: cleared ${cg.removed} dropped task row(s) from Google`);
           setSetting(db, rolloverKey, new Date().toISOString());
           if (r.moved > 0) notify?.(`Carried ${r.moved} unfinished task${r.moved === 1 ? "" : "s"} over to today`);
           if (r.curriculumShifted > 0) {

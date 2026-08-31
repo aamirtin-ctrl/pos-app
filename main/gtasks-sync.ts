@@ -467,6 +467,38 @@ function pullFromGoogle(
   }
 }
 
+/**
+ * The pass rollover.ts always believed in ("their Google rows are taken down by the push's
+ * dropped-cleanup pass") but which never existed — found 2026-08-31 when weeks of missed
+ * gym/Instagram instances turned out to be piling up in the owner's Tasks tab. When
+ * rollover drops a missed habit instance locally, its Google row must go too, or the tab
+ * violates the whole spec: today's three habits and nothing more. Small daily volume, so
+ * unpaced; gtasks_id is nulled even when the remote delete fails (tombstoned/gone rows
+ * 404 here and are already what we want).
+ */
+export async function cleanupDroppedTaskRows(
+  db: Db,
+  secrets: SecretStore,
+  deps: GoogleTasksDeps = realGoogleTasksDeps(db, secrets)
+): Promise<{ removed: number }> {
+  if (!deps.isConnected(secrets)) return { removed: 0 };
+  const rows = db.prepare(
+    "SELECT id, gtasks_id, gtasks_list FROM task WHERE status = 'dropped' AND gtasks_id IS NOT NULL LIMIT 40"
+  ).all() as { id: number; gtasks_id: string; gtasks_list: string | null }[];
+  if (rows.length === 0) return { removed: 0 };
+  let posList: string | null = null;
+  try { posList = await deps.ensureTasklist(); } catch { /* fall through; per-row failures tolerated */ }
+  let removed = 0;
+  for (const r of rows) {
+    try {
+      await deps.deleteTask({ tasklist: r.gtasks_list ?? posList ?? "@default", task: r.gtasks_id });
+      removed++;
+    } catch { /* already gone / unreachable — either way, unlink below */ }
+    db.prepare("UPDATE task SET gtasks_id = NULL, gtasks_list = NULL WHERE id = ?").run(r.id);
+  }
+  return { removed };
+}
+
 export interface PurgeResult {
   scanned: number;
   deleted: number;
