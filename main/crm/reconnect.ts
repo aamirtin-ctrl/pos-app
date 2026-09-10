@@ -126,6 +126,14 @@ export function reconnectDue(
        WHERE p.next_touch_due_at IS NOT NULL
          AND p.next_touch_due_at <= datetime(?, '-' || ? || ' days')
          AND p.tier < 3
+         -- Hard floor (owner directive 2026-09-10): never suggest anyone touched in the
+         -- last 90 days, whatever the cadence math says. Normally redundant with
+         -- refreshLastContact, but it holds even when a person row's stamp is stale or
+         -- a tier change shortens the threshold under someone.
+         AND NOT EXISTS (
+           SELECT 1 FROM interaction i
+           WHERE i.person_id = p.id AND i.occurred_at > datetime(?, '-90 days')
+         )
          AND NOT EXISTS (
            SELECT 1 FROM dismissal d
            WHERE d.person_id = p.id AND d.kind = 'stale'
@@ -137,7 +145,7 @@ export function reconnectDue(
          )
        ORDER BY p.tier ASC, overdue_days DESC`
     )
-    .all(nowIso, nowIso, graceDays, nowIso) as (Omit<ReconnectRow, "groups"> & { group_names: string | null })[];
+    .all(nowIso, nowIso, graceDays, nowIso, nowIso) as (Omit<ReconnectRow, "groups"> & { group_names: string | null })[];
   return rows.map(({ group_names, ...r }) => ({
     ...r,
     groups: group_names ? group_names.split(GROUP_SEP).sort() : [],

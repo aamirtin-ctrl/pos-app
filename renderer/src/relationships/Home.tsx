@@ -16,6 +16,15 @@ type RankPerson = {
 };
 type RankOutcome = { results: { person: RankPerson; reason: string }[]; usedLlm: boolean; usedVec: boolean };
 
+/** The slice of people.get used by the hover card. */
+type PersonPreview = {
+  display_name: string;
+  org: string | null;
+  role: string | null;
+  bio: string | null;
+  last_contact_at: string | null;
+};
+
 type ReconnectRow = {
   id: number;
   display_name: string;
@@ -150,6 +159,37 @@ export default function Home() {
   const [mutedGroups, setMutedGroups] = useState<string[]>([]);
   const [snoozeFor, setSnoozeFor] = useState<number | null>(null);
 
+  // Multi-select over the reconnect list (owner ask 2026-09-10): cmd-click toggles,
+  // shift-click extends from the last clicked row, Esc clears. Plain clicks still
+  // navigate to the contact — selection only engages while a modifier is held.
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [selectAnchor, setSelectAnchor] = useState<number | null>(null);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setSelected(new Set()); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Hover preview: person detail fetched lazily on first hover, cached for the session.
+  const [hover, setHover] = useState<{ id: number; top: number; left: number } | null>(null);
+  const [previews, setPreviews] = useState<Map<number, PersonPreview>>(new Map());
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showPreview = (id: number, el: HTMLElement) => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current);
+    hoverTimer.current = setTimeout(async () => {
+      const rect = el.getBoundingClientRect();
+      setHover({ id, top: rect.bottom + 4, left: rect.left });
+      if (!previews.has(id)) {
+        const r = await window.pos.people.get(id);
+        if (r.ok && r.data) setPreviews((m) => new Map(m).set(id, r.data as PersonPreview));
+      }
+    }, 350);
+  };
+  const hidePreview = () => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current);
+    setHover(null);
+  };
+
   const refetch = useCallback(async () => {
     const [rec, com, ppl, grp] = await Promise.all([
       window.pos.people.reconnect(),
@@ -249,6 +289,35 @@ export default function Home() {
     await refetch();
   };
 
+  const rowClick = (e: React.MouseEvent, id: number) => {
+    if (!e.metaKey && !e.ctrlKey && !e.shiftKey) return; // plain click = navigate
+    e.preventDefault();
+    setSelected((cur) => {
+      const next = new Set(cur);
+      if (e.shiftKey && selectAnchor !== null) {
+        const ids = reconnectShown.map((r) => r.id);
+        const a = ids.indexOf(selectAnchor);
+        const b = ids.indexOf(id);
+        if (a !== -1 && b !== -1) {
+          for (const x of ids.slice(Math.min(a, b), Math.max(a, b) + 1)) next.add(x);
+          return next;
+        }
+      }
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+    setSelectAnchor(id);
+  };
+
+  /** Apply snooze/dismiss to every selected person, then clear the selection. */
+  const bulkSnooze = async (days: number | null) => {
+    const ids = Array.from(selected);
+    setSelected(new Set());
+    await Promise.all(ids.map((id) => window.pos.people.dismissReconnect(id, days)));
+    await refetch();
+  };
+
   return (
     <div className="p-6 max-w-4xl mx-auto">
       <div className="drag-region h-4" />
@@ -290,13 +359,61 @@ export default function Home() {
             </p>
           ) : (
             <div className="space-y-0.5">
+              {selected.size > 0 && (
+                <div
+                  className="flex items-center gap-2 rounded-md border px-2 py-1.5 mb-1 text-xs bg-white"
+                  style={{ borderColor: "var(--line)" }}
+                >
+                  <span style={{ color: "var(--muted)" }}>{selected.size} selected</span>
+                  <span className="flex-1" />
+                  <button
+                    onClick={() => bulkSnooze(30)}
+                    className="px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
+                    style={{ borderColor: "var(--line)", color: "var(--accent)" }}
+                  >
+                    Snooze 30d
+                  </button>
+                  <button
+                    onClick={() => bulkSnooze(90)}
+                    className="px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
+                    style={{ borderColor: "var(--line)", color: "var(--accent)" }}
+                  >
+                    Snooze 90d
+                  </button>
+                  <button
+                    onClick={() => bulkSnooze(null)}
+                    className="px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
+                    style={{ borderColor: "var(--line)", color: "var(--danger)" }}
+                  >
+                    Dismiss
+                  </button>
+                  <button
+                    onClick={() => setSelected(new Set())}
+                    className="px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
+                    style={{ borderColor: "var(--line)", color: "var(--muted)" }}
+                  >
+                    Clear
+                  </button>
+                </div>
+              )}
               {reconnectShown.map((r) => (
                 <div
                   key={r.id}
                   className="group flex items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-white transition-[background-color] duration-[120ms]"
-                  style={{ color: "var(--ink)" }}
+                  style={{
+                    color: "var(--ink)",
+                    background: selected.has(r.id) ? "color-mix(in srgb, var(--accent) 12%, white)" : undefined,
+                  }}
+                  onClick={(e) => rowClick(e, r.id)}
+                  onMouseEnter={(e) => showPreview(r.id, e.currentTarget)}
+                  onMouseLeave={hidePreview}
                 >
-                  <a href={`#/contact/${r.id}`} className="flex-1 truncate" style={{ color: "var(--ink)" }}>
+                  <a
+                    href={`#/contact/${r.id}`}
+                    className="flex-1 truncate"
+                    style={{ color: "var(--ink)" }}
+                    onClick={(e) => { if (e.metaKey || e.ctrlKey || e.shiftKey) e.preventDefault(); }}
+                  >
                     {r.display_name}
                   </a>
                   <span
@@ -358,6 +475,38 @@ export default function Home() {
                   </span>
                 </div>
               ))}
+            </div>
+          )}
+          {hover && (
+            <div
+              className="fixed z-50 w-72 rounded-lg border bg-white p-3 shadow-lg text-xs"
+              style={{ top: hover.top, left: hover.left, borderColor: "var(--line)", color: "var(--ink)" }}
+            >
+              {(() => {
+                const pv = previews.get(hover.id);
+                if (!pv) return <p style={{ color: "var(--muted)" }}>Loading…</p>;
+                const bioHead = (pv.bio ?? "").split("\n").filter((l) => l.trim()).slice(0, 4);
+                return (
+                  <>
+                    <p className="font-medium text-sm">{pv.display_name}</p>
+                    {(pv.role || pv.org) && (
+                      <p style={{ color: "var(--muted)" }}>{[pv.role, pv.org].filter(Boolean).join(" — ")}</p>
+                    )}
+                    {pv.last_contact_at && (
+                      <p className="mt-1" style={{ color: "var(--muted)" }}>
+                        Last contact {pv.last_contact_at.slice(0, 10)}
+                      </p>
+                    )}
+                    {bioHead.length > 0 && (
+                      <div className="mt-1.5 space-y-0.5">
+                        {bioHead.map((l, i) => (
+                          <p key={i} className="leading-snug">{l.replace(/^[-•]\s*/, "")}</p>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
             </div>
           )}
         </section>

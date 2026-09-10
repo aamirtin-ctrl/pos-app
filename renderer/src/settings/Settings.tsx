@@ -62,6 +62,15 @@ function normalizeSyncRows(data: unknown): SyncRow[] {
 
 const usd = (n: number) => `$${n.toFixed(2)}`;
 
+function Group({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="mb-4">
+      <p className="text-xs mb-1.5" style={{ color: "var(--muted)" }}>{label}</p>
+      <div className="space-y-2">{children}</div>
+    </div>
+  );
+}
+
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <section className="mb-8">
@@ -416,14 +425,31 @@ function Integrations() {
   const toggle = (id: string) => setOpenCard((cur) => (cur === id ? null : id));
 
   return (
+    <>
     <Section title="Integrations">
-      <div className="space-y-2">
-        <MorningCaptureCard
-          row={syncRow("capture")}
-          open={openCard === "capture"}
-          onToggle={() => toggle("capture")}
+      <Group label="Messages">
+        <IMessageCard
+          row={syncRow("imessage")}
+          open={openCard === "imessage"}
+          onToggle={() => toggle("imessage")}
           refetchSync={refetchSync}
         />
+        <MsgPlansCard
+          row={syncRow("msgplans")}
+          open={openCard === "msgplans"}
+          onToggle={() => toggle("msgplans")}
+          refetchSync={refetchSync}
+        />
+      </Group>
+      <Group label="Email">
+        <EmailAccountsCard
+          row={syncRow("gmail")}
+          open={openCard === "gmail"}
+          onToggle={() => toggle("gmail")}
+          refetchSync={refetchSync}
+        />
+      </Group>
+      <Group label="Calendars & tasks">
         <GoogleCard
           gcal={gcal}
           present={present}
@@ -439,36 +465,14 @@ function Integrations() {
           open={openCard === "ics"}
           onToggle={() => toggle("ics")}
         />
+      </Group>
+      <Group label="More">
         <NotionCard
           present={present}
           row={syncRow("notion")}
           open={openCard === "notion"}
           onToggle={() => toggle("notion")}
           onKeySaved={refetchKeys}
-          refetchSync={refetchSync}
-        />
-        <EmailAccountsCard
-          row={syncRow("gmail")}
-          open={openCard === "gmail"}
-          onToggle={() => toggle("gmail")}
-          refetchSync={refetchSync}
-        />
-        <IMessageCard
-          row={syncRow("imessage")}
-          open={openCard === "imessage"}
-          onToggle={() => toggle("imessage")}
-          refetchSync={refetchSync}
-        />
-        <AppleNotesCard
-          row={syncRow("applenotes")}
-          open={openCard === "applenotes"}
-          onToggle={() => toggle("applenotes")}
-          refetchSync={refetchSync}
-        />
-        <MsgPlansCard
-          row={syncRow("msgplans")}
-          open={openCard === "msgplans"}
-          onToggle={() => toggle("msgplans")}
           refetchSync={refetchSync}
         />
         <PickImportCard
@@ -502,15 +506,32 @@ function Integrations() {
           onToggle={() => toggle("mailfile")}
           refetchSync={refetchSync}
         />
+      </Group>
+    </Section>
+    <Section title="Features">
+      <div className="space-y-2">
         <AiCard
           present={present}
           open={openCard === "ai"}
           onToggle={() => toggle("ai")}
           onKeySaved={refetchKeys}
         />
+        <MorningCaptureCard
+          row={syncRow("capture")}
+          open={openCard === "capture"}
+          onToggle={() => toggle("capture")}
+          refetchSync={refetchSync}
+        />
+        <AppleNotesCard
+          row={syncRow("applenotes")}
+          open={openCard === "applenotes"}
+          onToggle={() => toggle("applenotes")}
+          refetchSync={refetchSync}
+        />
       </div>
       <EmbedProfiles />
     </Section>
+    </>
   );
 }
 
