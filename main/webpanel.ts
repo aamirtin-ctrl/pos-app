@@ -87,7 +87,10 @@ export const SERVICES: Record<string, PanelService> = {
   snapchat: {
     id: "snapchat",
     label: "Snapchat",
-    url: "https://web.snapchat.com/",
+    // Snapchat retired web.snapchat.com as the app's home — it now redirects into the
+    // marketing site, which is why the panel stopped landing on messaging (owner report
+    // 2026-09-10). The web app proper lives at /web on the main domain.
+    url: "https://www.snapchat.com/web",
     partition: "persist:snapchat",
   },
   linkedin: {
