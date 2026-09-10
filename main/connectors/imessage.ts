@@ -31,6 +31,7 @@ import type { Db } from "../db/db.ts";
 import { normalizeEmail, normalizePhone } from "../crm/normalize.ts";
 import { resolveHandle } from "../crm/identity.ts";
 import { recordAmbiguous } from "../crm/review.ts";
+import { adoptSavedNames } from "../crm/name-infer.ts";
 import { buildNameIndex, type NameIndex } from "./addressbook.ts";
 import {
   type ConnectorDeps,
@@ -387,6 +388,13 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
     // but a contact is STILL created (owner spec 2026-08-06): the inbox never hides anyone.
     const ab = buildNameIndex();
     const canCreate = ab.sources > 0;
+
+    // A contact he SAVED since last sync beats any unverified/inferred name (owner ask
+    // 2026-09-10). Same index, so this costs one cheap table scan per sync.
+    if (canCreate) {
+      const adopted = adoptSavedNames(db, ab);
+      if (adopted.renamed > 0) console.log(`imessage: adopted ${adopted.renamed} saved contact name(s)`);
+    }
 
     // Per-handle resolution cache: handle norm → person id (null = skip this handle).
     const personByHandle = new Map<string, number | null>();

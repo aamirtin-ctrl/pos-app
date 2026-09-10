@@ -693,4 +693,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_task_reminder_id ON task(reminder_id);
 CREATE INDEX IF NOT EXISTS idx_interaction_extract_scan ON interaction(extracted_at, occurred_at);
 `,
   },
+  {
+    version: 21,
+    name: "person_name_inferred_at",
+    sql: `
+-- Owner ask 2026-09-10: unsaved numbers that text him should get a NAME guessed from the
+-- conversation itself ("hey it's Jake") — but such a name is a GUESS, and a real iCloud
+-- contact, whenever he saves one, must override it (name only; the bio stays).
+--
+-- This stamp is what separates the two name provenances. NULL = the display_name came from
+-- a trusted source (macOS Contacts, his own typing, a note). Non-null = an LLM inferred it
+-- from message text, which means: (a) the 'unverified' tag stays on, (b) the Apple-bios
+-- mirror must NEVER create an iCloud card from it (a guess that minted a card would then
+-- "verify" itself on the next sync), and (c) any real AddressBook hit for the person's
+-- number/email overwrites it without asking.
+ALTER TABLE person ADD COLUMN name_inferred_at TEXT;
+`,
+  },
 ];

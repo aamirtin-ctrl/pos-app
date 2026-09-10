@@ -103,8 +103,10 @@ export async function syncAppleContactBios(
 ): Promise<AppleBioSyncResult> {
   const create = opts.create ?? true;
   const people = db
-    .prepare("SELECT id, display_name, bio FROM person WHERE bio IS NOT NULL AND bio != ''")
-    .all() as { id: number; display_name: string; bio: string }[];
+    .prepare(
+      "SELECT id, display_name, bio, name_inferred_at FROM person WHERE bio IS NOT NULL AND bio != ''"
+    )
+    .all() as { id: number; display_name: string; bio: string; name_inferred_at: string | null }[];
   const aliases = db.prepare("SELECT person_id, kind, value FROM alias").all() as {
     person_id: number; kind: string; value: string;
   }[];
@@ -163,7 +165,9 @@ export async function syncAppleContactBios(
       continue;
     }
     if (!create) continue;
-    if (!isCreatableName(p.display_name)) {
+    // An LLM-inferred name is a guess — creating an iCloud card from it would let the
+    // guess "verify" itself on the next sync. Only saved/typed names may mint cards.
+    if (p.name_inferred_at || !isCreatableName(p.display_name)) {
       out.skippedUncreatable++;
       continue;
     }

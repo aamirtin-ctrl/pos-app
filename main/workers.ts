@@ -23,6 +23,7 @@ import { verifyPendingCommitments,
 import { dateUndatedTasks } from "./crm/taskdates.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { runEnrichment } from "./crm/enrich.ts";
+import { inferUnknownNames } from "./crm/name-infer.ts";
 import { resolveNamedDate } from "./context.ts";
 import { commitmentToTask, commitmentToEvent, closeGoogleTask, drainTombstones, pruneRetiredTaskBlocks, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
 import { hasCalendarWriteScope, isGoogleConnected, googleScopeStatus } from "./gcal/auth.ts";
@@ -1550,6 +1551,11 @@ export function startWorkers(
       // from re-running on every 15-minute tick. Skipped silently without an LLM.
       try {
         if (llm && !getSetting(db, enrichDayKey())) {
+          // Name inference FIRST, so today's synthesis prompt sees "Jake", not "+1424…".
+          const ni = await inferUnknownNames(db, llm);
+          if (ni.named > 0) {
+            notify?.(`Named ${ni.named} unsaved sender${ni.named === 1 ? "" : "s"} from conversation`);
+          }
           const e = await runEnrichment(db, llm);
           setSetting(db, enrichDayKey(), new Date().toISOString());
           if (e.synthesized > 0 || e.mined > 0) {
