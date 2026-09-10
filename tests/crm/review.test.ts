@@ -18,6 +18,7 @@ import {
   ambiguousKey,
   reviewQueue,
 } from "../../main/crm/review.ts";
+import { queueNoteChunk } from "../../main/crm/notesglean.ts";
 
 let dir: string;
 let db: Db;
@@ -304,9 +305,18 @@ describe("reviewQueue", () => {
     recordAmbiguous(db, { handleKind: "email", handleValue: "c@shared.com", candidateIds: [1, 2] });
 
     const q = reviewQueue(db);
-    expect(q.counts).toEqual({ contacts: 1, duplicates: 1, ambiguous: 1, total: 3 });
+    expect(q.counts).toEqual({ contacts: 1, duplicates: 1, ambiguous: 1, notes: 0, total: 3 });
     expect(q.contacts[0].id).toBe(2);
     expect(q.duplicates[0].key).toBe("1-2");
     expect(q.ambiguous[0].candidates).toHaveLength(2);
+  });
+
+  it("carries pending note chunks in payload and counts", () => {
+    queueNoteChunk(db, { name: "Jay Shah", facts: ["owes me $20"] }, []);
+    const q = reviewQueue(db);
+    expect(q.notes).toHaveLength(1);
+    expect(q.notes[0].chunk.name).toBe("Jay Shah");
+    expect(q.counts.notes).toBe(1);
+    expect(q.counts.total).toBe(1);
   });
 });

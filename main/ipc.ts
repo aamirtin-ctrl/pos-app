@@ -39,6 +39,7 @@ import {
   resolveAmbiguous,
   dismissAmbiguous,
 } from "./crm/review.ts";
+import { resolveNoteChunk, dismissNoteChunk } from "./crm/notesglean.ts";
 import { exportContactsCsv, defaultCsvFilename } from "./crm/export.ts";
 import { rank } from "./crm/ranking.ts";
 import {
@@ -100,7 +101,7 @@ import {
   RECONSENT_REQUIRED,
 } from "./gcal/auth.ts";
 import { google } from "googleapis";
-import { reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent, dropCommitmentCascade } from "./gcal/sync.ts";
+import { reconcileMovedEvents, readAnchors, commitmentToTask, commitmentToEvent, dropCommitmentCascade, deleteGoogleEvent, moveGoogleEvent } from "./gcal/sync.ts";
 import { listSubscriptions, addSubscription, removeSubscription, eventsForDate as icsEventsForDate, icsBlockType } from "./icscal.ts";
 import {
   notionAvailable, searchTargets, syncNotion, PARENT_PAGE_KEY,
@@ -113,7 +114,16 @@ import {
   mirrorToGoogle,
   listAppleCalendars,
   excludedCalendarNames,
+  deleteAppleEvent,
 } from "./applecal.ts";
+import {
+  remindersAvailable,
+  listReminderLists,
+  readReminders,
+  syncReminders,
+  completeReminder,
+} from "./connectors/reminders.ts";
+import { purgeOrphanedGoogleTasks } from "./gtasks-sync.ts";
 import fs from "node:fs";
 import path from "node:path";
 import {
@@ -408,6 +418,9 @@ export function registerIpc(deps: IpcDeps) {
   h("review.dismissDuplicates", (key: string) => ({ dismissed: dismissDuplicates(db, key) }));
   h("review.resolveAmbiguous", (key: string, personId: number) => resolveAmbiguous(db, key, personId));
   h("review.dismissAmbiguous", (key: string) => ({ dismissed: dismissAmbiguous(db, key) }));
+  // Note chunks the Apple Notes gleaner held for a human decision (crm/notesglean.ts).
+  h("review.resolveNoteChunk", (key: string, personId: number | "new") => resolveNoteChunk(db, key, personId));
+  h("review.dismissNoteChunk", (key: string) => ({ dismissed: dismissNoteChunk(db, key) }));
 
   // ── CSV export (#20) ──
   // Body is pure (crm/export.ts); the dialog + write live here.
@@ -649,6 +662,67 @@ export function registerIpc(deps: IpcDeps) {
     return out;
   });
 
+  // Delete an event shown on the day view (select → ⌫). The events the day shows are
+  // real Google-calendar events (POS's own calendars are excluded from anchors), so the
+  // primary path is a Google delete by (calendarId, eventId). If the event is flagged as
+  // Apple-sourced we also remove the Calendar.app original so the mirror can't re-create it.
+  // ICS-feed rows have no gcalEventId — those are read-only subscriptions, reported as such.
+  h("calendar.deleteEvent", async (ev: {
+    gcalEventId?: string; calendarId?: string; iCalUID?: string; source?: string;
+  }) => {
+    if (!ev || typeof ev !== "object") return { ok: false, error: "no event given" };
+    if (ev.gcalEventId && ev.calendarId) {
+      const g = await deleteGoogleEvent(secrets, ev.calendarId, ev.gcalEventId);
+      if (!g.ok) return { ok: false, error: g.error };
+      // Apple-original cleanup is a full-calendar AppleScript scan — 30-90s on a cold
+      // Calendar.app. Awaiting it here held the IPC reply hostage and the popover just
+      // said "Deleting…" until the owner gave up ("it gets stuck", 2026-08-13). The
+      // Google copy — the one he can see — is already gone; the Apple original can go
+      // in its own time, and a failure only means the next mirror pass re-mirrors one
+      // event, which the delete button can remove again.
+      if (ev.source === "apple" && ev.iCalUID) {
+        void deleteAppleEvent(ev.iCalUID).catch((e) =>
+          console.warn(`applecal: background delete of ${ev.iCalUID} failed: ${(e as Error).message}`));
+      }
+      return { ok: true };
+    }
+    if (ev.source === "apple" && ev.iCalUID) {
+      const a = await deleteAppleEvent(ev.iCalUID);
+      return a.ok ? { ok: true } : { ok: false, error: a.error.message };
+    }
+    return { ok: false, error: "This event is a read-only subscription and can't be deleted from POS." };
+  });
+
+  // Drag-to-move for external calendar events: patch the Google event's times. Minutes are
+  // local wall-clock on dateISO; the Date constructor makes them absolute in this machine's
+  // timezone, which is the same convention the anchors reader parses back.
+  h("calendar.moveEvent", async (ev: {
+    gcalEventId?: string; calendarId?: string; dateISO?: string; startMin?: number; durationMin?: number;
+  }) => {
+    if (!ev?.gcalEventId || !ev.calendarId || !ev.dateISO || ev.startMin == null || !ev.durationMin) {
+      return { ok: false, error: "missing event, date, or time" };
+    }
+    const [y, mo, d] = ev.dateISO.split("-").map(Number);
+    const start = new Date(y, mo - 1, d, 0, ev.startMin);
+    const end = new Date(y, mo - 1, d, 0, ev.startMin + ev.durationMin);
+    return moveGoogleEvent(secrets, ev.calendarId, ev.gcalEventId, start.toISOString(), end.toISOString());
+  });
+
+  // ── google tasks maintenance ──
+  // One-shot purge of rows POS orphaned in its Google list (the tentative-push duplicate
+  // loop left ~1200). Dry-run unless apply=true; never touches rows he created himself.
+  h("gtasks.purgePreview", () => purgeOrphanedGoogleTasks(db, secrets, { apply: false }));
+  h("gtasks.purgeApply", () => purgeOrphanedGoogleTasks(db, secrets, { apply: true }));
+
+  // ── apple reminders (Reminders.app) ──
+  // Owner directive 2026-08-10: iOS's own detection in Messages + a one-tap reminder is
+  // the task source now; POS imports what HE chose instead of inferring tasks from text.
+  h("reminders.available", () => remindersAvailable());
+  h("reminders.lists", () => listReminderLists());
+  h("reminders.list", () => readReminders(false));
+  h("reminders.sync", () => syncReminders(db, todayISO()));
+  h("reminders.complete", (id: string) => completeReminder(id));
+
   // ── subscribed calendars (webcal/ICS) ──
   h("ics.list", () => listSubscriptions(db));
   h("ics.add", (url: string, name?: string) => addSubscription(db, url, name));
@@ -683,6 +757,9 @@ export function registerIpc(deps: IpcDeps) {
   // names for the Settings picker; POS's own mirror calendars are never listed
   h("applecal.calendars", () => listAppleCalendars());
   h("applecal.events", (dateISO: string) => readAppleEvents(dateISO, { exclude: excludedCalendarNames(db), db }));
+  // Per-event delete from the day view (select an event → ⌫). Removes it from
+  // Calendar.app by UID; the next scan/refresh reflects it. Returns {ok, deleted}.
+  h("applecal.deleteEvent", (uid: string, calendar?: string) => deleteAppleEvent(uid, calendar));
   // The mirror writes to Google too, so it hits the same stale-scope wall — map it to the
   // one typed string the UI knows how to act on. (applecal.ts stays free of auth policy.)
   h("applecal.mirror", async (dateISO: string) => {

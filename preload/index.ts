@@ -27,6 +27,8 @@ contextBridge.exposeInMainWorld("pos", {
     dismissDuplicates: call("review.dismissDuplicates"),
     resolveAmbiguous: call("review.resolveAmbiguous"),
     dismissAmbiguous: call("review.dismissAmbiguous"),
+    resolveNoteChunk: call("review.resolveNoteChunk"),
+    dismissNoteChunk: call("review.dismissNoteChunk"),
   },
   groups: {
     list: call("groups.list"),
@@ -90,6 +92,18 @@ contextBridge.exposeInMainWorld("pos", {
     reconcile: call("gcal.reconcile"),
     events: call("gcal.events"),
   },
+  // Cross-source calendar ops used by the day view (delete the selected event).
+  calendar: { deleteEvent: call("calendar.deleteEvent"), moveEvent: call("calendar.moveEvent") },
+  // Google Tasks maintenance: preview then apply the orphan purge.
+  gtasks: { purgePreview: call("gtasks.purgePreview"), purgeApply: call("gtasks.purgeApply") },
+  // Apple Reminders as the task source (iOS detects the plan, he taps once, POS imports).
+  reminders: {
+    available: call("reminders.available"),
+    lists: call("reminders.lists"),
+    list: call("reminders.list"),
+    sync: call("reminders.sync"),
+    complete: call("reminders.complete"),
+  },
   ics: { list: call("ics.list"), add: call("ics.add"), remove: call("ics.remove") },
   notion: {
     available: call("notion.available"),
@@ -111,6 +125,7 @@ contextBridge.exposeInMainWorld("pos", {
     calendars: call("applecal.calendars"),
     events: call("applecal.events"),
     mirror: call("applecal.mirror"),
+    deleteEvent: call("applecal.deleteEvent"),
   },
   // System-wide voice-capture shortcut (main/index.ts globalShortcut).
   hotkey: { get: call("hotkey.get"), set: call("hotkey.set") },
@@ -125,6 +140,14 @@ contextBridge.exposeInMainWorld("pos", {
     const listener = () => cb();
     ipcRenderer.on("pos:voice-capture", listener);
     return () => { ipcRenderer.removeListener("pos:voice-capture", listener); };
+  },
+  // Main fires this when a background calendar refresh discovers the snapshot it served was
+  // stale (e.g. an event deleted on another device). Payload is the affected date (ISO).
+  // Same bridge rules as onVoiceCapture: no raw event crosses; returns the unsubscribe.
+  onDayChanged: (cb: (dateISO: string) => void) => {
+    const listener = (_e: unknown, dateISO: string) => cb(dateISO);
+    ipcRenderer.on("pos:day-changed", listener);
+    return () => { ipcRenderer.removeListener("pos:day-changed", listener); };
   },
   settings: {
     keys: call("settings.keys"),

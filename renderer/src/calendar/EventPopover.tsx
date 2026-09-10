@@ -22,16 +22,22 @@ import {
 
 const WIDTH = 300;
 
-export default function EventPopover({ item, anchorRef, task, onClose }: {
+export default function EventPopover({ item, anchorRef, task, onClose, onDeleted }: {
   item: Item;
   /** The card element this popover hangs off — read at layout time, never cached. */
   anchorRef: RefObject<HTMLElement | null>;
   /** Resolved from the day's task list when the block has a task_id. */
   task: { title: string; status: string } | null;
   onClose: () => void;
+  /** Called after an external event was deleted, so the day can refresh. */
+  onDeleted?: () => void;
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
   const [place, setPlace] = useState<PopoverPlacement | null>(null);
+  // Delete flow state: click once to arm ("Confirm"), again to actually delete.
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [delErr, setDelErr] = useState<string | null>(null);
 
   const reposition = useCallback(() => {
     const el = ref.current;
@@ -164,6 +170,64 @@ export default function EventPopover({ item, anchorRef, task, onClose }: {
         </div>
         <p className="mt-0.5 text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>{g.how}</p>
       </div>
+
+      {/* Delete — external calendar events only. Plan blocks keep their own drop/undo
+          flow, so offering "delete" here would be a second, inconsistent way to remove
+          them. Two-step (Delete → Confirm) because this removes the real event. */}
+      {item.external && (
+        <div className="mt-2.5 flex items-center gap-2">
+          {delErr && (
+            <span className="text-[10px] leading-snug flex-1" style={{ color: "var(--danger, #b42318)" }}>{delErr}</span>
+          )}
+          {!delErr && confirming && (
+            <span className="text-[10px] flex-1" style={{ color: "var(--muted)" }}>Delete this event?</span>
+          )}
+          {!delErr && !confirming && <span className="flex-1" />}
+          {confirming && !busy && (
+            <button
+              className="px-2 py-0.5 rounded-full text-[10px]"
+              style={{ border: "1px solid var(--line)", color: "var(--muted)", background: "transparent" }}
+              onClick={(e) => { e.stopPropagation(); setConfirming(false); setDelErr(null); }}
+            >
+              Cancel
+            </button>
+          )}
+          <button
+            className="px-2 py-0.5 rounded-full text-[10px] font-medium disabled:opacity-50"
+            style={{
+              border: "1px solid color-mix(in srgb, var(--danger, #b42318) 45%, transparent)",
+              color: "var(--danger, #b42318)",
+              background: "color-mix(in srgb, var(--danger, #b42318) 8%, transparent)",
+            }}
+            disabled={busy}
+            onClick={async (e) => {
+              e.stopPropagation();
+              setDelErr(null);
+              if (!confirming) { setConfirming(true); return; }
+              setBusy(true);
+              try {
+                const res = await window.pos.calendar.deleteEvent({
+                  gcalEventId: item.gcalEventId,
+                  calendarId: item.calendarId,
+                  iCalUID: item.iCalUID,
+                  source: item.source,
+                });
+                const payload = (res && typeof res === "object" && "data" in res ? (res as any).data : res) as
+                  | { ok?: boolean; error?: string } | undefined;
+                if (payload?.ok) { onDeleted?.(); onClose(); }
+                else { setDelErr(payload?.error || "Could not delete this event."); setConfirming(false); }
+              } catch (err) {
+                setDelErr((err as Error).message || "Could not delete this event.");
+                setConfirming(false);
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            {busy ? "Deleting…" : confirming ? "Confirm" : "Delete"}
+          </button>
+        </div>
+      )}
     </div>,
     document.body
   );

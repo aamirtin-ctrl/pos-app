@@ -107,12 +107,20 @@ function fakeDeps(
    * produced "Call family" three times on 2026-08-07.
    */
   opts: { throwOn?: keyof FakeCalls; throwOnNth?: number; error?: () => Error } = {}
-): GcalPushDeps & { calls: FakeCalls; deleted: string[]; listed: { id: string; summary: string }[]; taskBodies: any[] } {
+): GcalPushDeps & {
+  calls: FakeCalls;
+  deleted: string[];
+  deletedTasks: { tasklist: string; task: string }[];
+  listed: { id: string; summary: string }[];
+  taskBodies: any[];
+} {
   const calls: FakeCalls = {
     calendarsGet: 0, calendarsInsert: 0, eventsInsert: 0, eventsUpdate: 0, eventsDelete: 0, tasksInsert: 0,
   };
   /** Event ids the fake Google has been asked to delete, in order. */
   const deleted: string[] = [];
+  /** Google-task deletes, which only the list re-routing path issues. */
+  const deletedTasks: { tasklist: string; task: string }[] = [];
   /** What the fake calendar currently holds, for the orphan reconcile. */
   const listed: { id: string; summary: string }[] = [];
   /** Bodies of every tasks.insert, so marker/notes shape is assertable. */
@@ -181,9 +189,14 @@ function fakeDeps(
       async update() {
         return { data: { id: "t" } };
       },
+      // Re-routing a task between lists is delete-then-insert (Google Tasks has no move).
+      async delete(args: { tasklist: string; task: string }) {
+        deletedTasks.push(args);
+        return {};
+      },
     },
   };
-  return { calls, deleted, listed, taskBodies, calendar: () => calendar, tasks: () => tasks };
+  return { calls, deleted, deletedTasks, listed, taskBodies, calendar: () => calendar, tasks: () => tasks };
 }
 
 let dir: string;

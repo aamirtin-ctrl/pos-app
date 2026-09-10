@@ -37,7 +37,7 @@ import { getSetting, setSetting } from "./db/db.ts";
 import type { SecretStore } from "./secrets.ts";
 import { google, type calendar_v3 } from "googleapis";
 import { isGoogleConnected, oauthClient } from "./gcal/auth.ts";
-import { googleICalUids, persistDayCache, readDayCache } from "./gcal/sync.ts";
+import { googleICalUids, persistDayCache, readDayCache, ensurePosCalendar } from "./gcal/sync.ts";
 
 /** Google calendar that receives the mirrored Apple events. Nothing else is written. */
 export const APPLE_MIRROR_CALENDAR_NAME = "POS — Apple";
@@ -566,6 +566,42 @@ export async function appleCalendarAvailable(): Promise<{ ok: boolean; error?: s
   return { ok: true, calendars: parseCalendarNames(res.stdout).length };
 }
 
+/**
+ * Delete a Calendar.app event by its UID. Powers the renderer's per-event delete
+ * (select an event → ⌫). `calendarName`, when supplied, restricts the (slow)
+ * `whose uid` scan to the one calendar the event was read from; otherwise every
+ * calendar is checked. A per-calendar `try` keeps one unreadable calendar from
+ * aborting the delete. Returns how many matching events were removed (0 = the UID
+ * was already gone, treated as success by the caller).
+ */
+export async function deleteAppleEvent(
+  uid: string,
+  calendarName?: string
+): Promise<{ ok: true; deleted: number } | { ok: false; error: AppleCalError }> {
+  const guardOpen = calendarName ? `if (name of c) is ${asString(calendarName)} then` : "if true then";
+  const script = [
+    'tell application "Calendar"',
+    "  set n to 0",
+    "  repeat with c in calendars",
+    `    ${guardOpen}`,
+    "      try",
+    `        set matches to (every event of c whose uid is ${asString(uid)})`,
+    "        repeat with e in matches",
+    "          delete e",
+    "          set n to n + 1",
+    "        end repeat",
+    "      end try",
+    "    end if",
+    "  end repeat",
+    "  return n",
+    "end tell",
+  ].join("\n");
+  const res = await runOsascript(script, 60_000);
+  if (!res.ok) return { ok: false, error: res.error };
+  const deleted = parseInt((res.stdout || "0").trim(), 10);
+  return { ok: true, deleted: Number.isFinite(deleted) ? deleted : 0 };
+}
+
 // ── mirror into Google ───────────────────────────────────────────────────────
 
 function calApi(secrets: SecretStore): calendar_v3.Calendar {
@@ -573,13 +609,38 @@ function calApi(secrets: SecretStore): calendar_v3.Calendar {
 }
 
 /**
- * Find-or-create the dedicated "POS — Apple" Google calendar; id cached in settings
- * under its own key. Same shape as ensurePosCalendar, deliberately a separate calendar
- * so the Apple mirror can never collide with pushed plan blocks.
+ * The Google calendar the Apple mirror writes to.
+ *
+ * Owner directive 2026-08-10: "combine POS — Apple and POS — Planned". Three POS calendars
+ * was two too many to read. The mirror now targets the planner's calendar, so one POS
+ * calendar carries both what he committed to (mirrored from Calendar.app) and what POS
+ * scheduled around it.
+ *
+ * Sharing a calendar is safe because BOTH writers are id-scoped, not calendar-scoped:
+ *   - the mirror only ever updates or deletes events it tagged `appleUid` (see the byUid map
+ *     in mirrorToGoogle — a plan block never enters it, so the deletion sweep cannot reach
+ *     one), and
+ *   - pushPlan only touches events whose ids it stored on its own block rows, and withdraws
+ *     through tombstones. Neither ever clears the calendar wholesale.
+ * That property is what this merge rests on; a future bulk-delete on either side would break
+ * it, so keep both writers id-scoped.
+ *
+ * Set `apple_mirror_separate` to "1" to go back to a dedicated "POS — Apple" calendar.
  */
+export const APPLE_MIRROR_SEPARATE_KEY = "apple_mirror_separate";
+
 export async function ensureAppleMirrorCalendar(db: Db, secrets: SecretStore): Promise<string> {
-  const cached = getSetting(db, APPLE_MIRROR_SETTING_KEY);
   const cal = calApi(secrets);
+
+  if (getSetting(db, APPLE_MIRROR_SEPARATE_KEY) !== "1") {
+    // Merged (default): reuse the planner's calendar. ensurePosCalendar find-or-creates it
+    // and caches its id, so this stays correct if he ever deletes the calendar in Google.
+    const posId = await ensurePosCalendar(db, secrets);
+    setSetting(db, APPLE_MIRROR_SETTING_KEY, posId);
+    return posId;
+  }
+
+  const cached = getSetting(db, APPLE_MIRROR_SETTING_KEY);
   if (cached) {
     try {
       await cal.calendars.get({ calendarId: cached });
@@ -649,9 +710,14 @@ export async function mirrorToGoogle(
   const knownToGoogle = await googleICalUids(db, secrets, dateISO);
   const calId = await ensureAppleMirrorCalendar(db, secrets);
 
-  // Hard guard: only ever the dedicated mirror calendar. Never primary, never POS — Planned.
+  // Hard guard: never the primary calendar, and — when the mirror is running as its own
+  // calendar — never the planner's either. Since 2026-08-10 the two are merged by default
+  // (ensureAppleMirrorCalendar), so writing into POS — Planned is the intended path and only
+  // `primary` remains categorically off-limits. The merge is safe because this function
+  // touches exclusively events carrying its own `appleUid` tag; see the byUid map below.
   const posId = getSetting(db, "pos_calendar_id");
-  if (!calId || calId === "primary" || (posId && calId === posId)) {
+  const separate = getSetting(db, APPLE_MIRROR_SEPARATE_KEY) === "1";
+  if (!calId || calId === "primary" || (separate && posId && calId === posId)) {
     throw new AppleCalError("unavailable", `refusing to write outside "${APPLE_MIRROR_CALENDAR_NAME}"`);
   }
 

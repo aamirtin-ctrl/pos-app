@@ -105,6 +105,7 @@ declare global {
         pending: Call; keep: Call; discard: Call; group: Call;
         mergeCluster: Call; dismissDuplicates: Call;
         resolveAmbiguous: Call; dismissAmbiguous: Call;
+        resolveNoteChunk: Call; dismissNoteChunk: Call;
       };
       groups: {
         list: Call; create: Call; rename: Call; delete: Call;
@@ -124,7 +125,12 @@ declare global {
         pages: Call; page: Call; append: Call; check: Call; createPage: Call;
         rows: Call; updateBlock: Call; deleteBlock: Call;
       };
-      applecal: { available: Call; calendars: Call; events: Call; mirror: Call };
+      applecal: { available: Call; calendars: Call; events: Call; mirror: Call; deleteEvent: Call };
+      calendar: { deleteEvent: Call; moveEvent: Call };
+      reminders: { available: Call; lists: Call; list: Call; sync: Call; complete: Call };
+      gtasks: { purgePreview: Call; purgeApply: Call };
+      /** Cross-source calendar ops for the day view (Google + Apple aware). */
+      calendar: { deleteEvent: Call; moveEvent: Call };
       settings: {
         keys: Call; setKey: Call; doctrineGet: Call; doctrineSet: Call;
         spend: Call; setCeiling: Call; get: Call; set: Call;
@@ -141,6 +147,7 @@ declare global {
        * window, which treats each one as a toggle. Returns its unsubscribe.
        */
       onVoiceCapture: (cb: () => void) => () => void;
+      onDayChanged: (cb: (dateISO: string) => void) => () => void;
       /** Provider reachability — see LlmHealth above. */
       llm: { health: Call<LlmHealth> };
       msgplans: { run: Call; list: Call };

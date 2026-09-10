@@ -24,7 +24,7 @@
 import type { Db } from "./db/db.ts";
 
 /** Where he said it. Every surface that can carry an instruction writes one of these. */
-export type CaptureSource = "sparkle" | "self_email" | "imessage" | "alexa";
+export type CaptureSource = "sparkle" | "self_email" | "imessage" | "alexa" | "apple_notes";
 
 export interface CaptureRow {
   id: number;
@@ -70,15 +70,26 @@ export function markCaptureDone(db: Db, id: number, result: unknown): void {
 }
 
 /**
- * Interpretation failed. The row stays in the queue unless it has exhausted its attempts, in
- * which case it is closed with the error kept — a line that can never be parsed should stop
- * costing model calls, but it must still be findable.
+ * A failure that says nothing about the TEXT — the model itself was unreachable (quota, 429,
+ * 503, outage). The `healthy` gate in drainCaptures catches a fully-down provider, but a
+ * per-call refusal slips past it; on 2026-08-16 five such refusals permanently closed a
+ * contact-bio capture the owner expected to be filed once the model returned.
+ */
+const TRANSIENT_LLM_RE = /llm unavailable|quota|rate ?limit|\b429\b|\b503\b|overloaded|unavailable|timed? ?out|network/i;
+
+/**
+ * Interpretation failed. A TRANSIENT failure (model unreachable) records the error but burns
+ * no attempt — the row simply waits for a healthier run. A real failure counts toward the
+ * cap, and a row that exhausts it is closed with the error kept — a line that can never be
+ * parsed should stop costing model calls, but it must still be findable.
  */
 export function markCaptureFailed(db: Db, id: number, error: string): void {
-  db.prepare("UPDATE capture_inbox SET attempts = attempts + 1, error = ? WHERE id = ?").run(
-    String(error).slice(0, 500),
-    id
-  );
+  const msg = String(error).slice(0, 500);
+  if (TRANSIENT_LLM_RE.test(msg)) {
+    db.prepare("UPDATE capture_inbox SET error = ? WHERE id = ?").run(msg, id);
+    return;
+  }
+  db.prepare("UPDATE capture_inbox SET attempts = attempts + 1, error = ? WHERE id = ?").run(msg, id);
   db.prepare(
     `UPDATE capture_inbox SET processed_at = datetime('now')
       WHERE id = ? AND attempts >= ? AND processed_at IS NULL`

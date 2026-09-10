@@ -32,7 +32,7 @@ import { google, type tasks_v1 } from "googleapis";
 import type { Db } from "./db/db.ts";
 import type { SecretStore } from "./secrets.ts";
 import { isGoogleConnected, oauthClient } from "./gcal/auth.ts";
-import { ensurePosTasklist, pushTasks } from "./gcal/sync.ts";
+import { ensurePosTasklist, pushTasks, DEFAULT_TASKLIST_ID } from "./gcal/sync.ts";
 
 /** Whole reconciliation is time-boxed — it runs on a cron and must never wedge. */
 export const RECONCILE_TIMEOUT_MS = 60_000;
@@ -80,6 +80,8 @@ export interface GoogleTasksDeps {
   listTasks(args: { tasklist: string; pageToken?: string }): Promise<GoogleTasksPage>;
   patchTask(args: { tasklist: string; task: string; body: Partial<GoogleTaskLite> }): Promise<void>;
   insertTask(args: { tasklist: string; body: Partial<GoogleTaskLite> }): Promise<GoogleTaskLite>;
+  /** Hard-delete one row. Only purgeOrphanedGoogleTasks uses this; the sync never deletes. */
+  deleteTask(args: { tasklist: string; task: string }): Promise<void>;
   /** Local → Google. Defaults to gcal/sync.pushTasks; never reimplemented here. */
   pushTasks(): Promise<{ pushed: number; completed: number }>;
   now(): Date;
@@ -123,6 +125,9 @@ export function realGoogleTasksDeps(db: Db, secrets: SecretStore): GoogleTasksDe
     },
     async patchTask({ tasklist, task, body }) {
       await tasksApi(secrets).tasks.patch({ tasklist, task, requestBody: body });
+    },
+    async deleteTask({ tasklist, task }) {
+      await tasksApi(secrets).tasks.delete({ tasklist, task });
     },
     async insertTask({ tasklist, body }) {
       const res = await tasksApi(secrets).tasks.insert({ tasklist, requestBody: body });
@@ -442,6 +447,13 @@ function pullFromGoogle(
     if (g.deleted === true || g.status === "completed") continue;
     const title = (g.title ?? "").trim();
     if (!title) continue; // Google keeps empty draft rows; they are not tasks yet
+    // POS's own tentative pushes carry this prefix. Until 2026-08-10 they went out with
+    // NO pos:task marker, so neither check above can recognize them, and they arrived
+    // here looking exactly like something the owner typed on his phone — which is how a
+    // single commitment became 31 Google rows and 220 local "Tentative: …" duplicates,
+    // one per sync. The marker is now written at the source, but the unmarked rows are
+    // already in his account, so importing this prefix stays refused: he never types it.
+    if (/^tentative:\s/i.test(title)) continue;
     const due = dueDateOf(g.due);
     // due is DATE-only in Google Tasks: it names the day (plan_date), never a clock time.
     // Writing `${due}T00:00:00` here used to hand the solver a deadline that was already
@@ -453,6 +465,203 @@ function pullFromGoogle(
     ).run(title.slice(0, 200), g.notes ?? null, due, g.id, listOf.get(g.id) ?? null);
     result.pulled++;
   }
+}
+
+/**
+ * The pass rollover.ts always believed in ("their Google rows are taken down by the push's
+ * dropped-cleanup pass") but which never existed — found 2026-08-31 when weeks of missed
+ * gym/Instagram instances turned out to be piling up in the owner's Tasks tab. When
+ * rollover drops a missed habit instance locally, its Google row must go too, or the tab
+ * violates the whole spec: today's three habits and nothing more. Small daily volume, so
+ * unpaced; gtasks_id is nulled even when the remote delete fails (tombstoned/gone rows
+ * 404 here and are already what we want).
+ */
+export async function cleanupDroppedTaskRows(
+  db: Db,
+  secrets: SecretStore,
+  deps: GoogleTasksDeps = realGoogleTasksDeps(db, secrets)
+): Promise<{ removed: number }> {
+  if (!deps.isConnected(secrets)) return { removed: 0 };
+  const rows = db.prepare(
+    "SELECT id, gtasks_id, gtasks_list FROM task WHERE status = 'dropped' AND gtasks_id IS NOT NULL LIMIT 40"
+  ).all() as { id: number; gtasks_id: string; gtasks_list: string | null }[];
+  if (rows.length === 0) return { removed: 0 };
+  let posList: string | null = null;
+  try { posList = await deps.ensureTasklist(); } catch { /* fall through; per-row failures tolerated */ }
+  let removed = 0;
+  for (const r of rows) {
+    try {
+      await deps.deleteTask({ tasklist: r.gtasks_list ?? posList ?? "@default", task: r.gtasks_id });
+      removed++;
+    } catch { /* already gone / unreachable — either way, unlink below */ }
+    db.prepare("UPDATE task SET gtasks_id = NULL, gtasks_list = NULL WHERE id = ?").run(r.id);
+  }
+  return { removed };
+}
+
+export interface PurgeResult {
+  scanned: number;
+  deleted: number;
+  kept: number;
+  /** Deleted titles, capped — enough for the UI to show what went without a wall of text. */
+  samples: string[];
+  error?: string;
+}
+
+/**
+ * One-shot cleanup of the POS Google Tasks list (owner report 2026-08-11: "there are
+ * literally 1200 POS entries; the only ones really needed are the ones that came from my
+ * personalcrm system").
+ *
+ * Those 1200 are the wreckage of the tentative-push duplicate loop plus the local cleanup
+ * that followed it: rows POS created whose local task no longer exists. Deleting the whole
+ * list in Google would take the good ones with it AND make reconcileGoogleTasks read every
+ * surviving local task as "deleted on the phone" (it defers them and clears gtasks_id), so
+ * this deletes row by row instead, keeping anything still backed by POS.
+ *
+ * Deleted:
+ *   - titles starting with "Tentative:" — POS's own prefix, which the owner never types;
+ *   - pos:task rows whose local task is gone;
+ *   - pos:commitment rows whose commitment is gone or already dropped.
+ * Kept: everything still backed by a live local row, and everything with no POS marker at
+ * all (those are his own, typed on the phone — this must never touch them).
+ *
+ * Dry-run by default. Nothing is deleted unless `apply` is true.
+ */
+export async function purgeOrphanedGoogleTasks(
+  db: Db,
+  secrets: SecretStore,
+  opts: { apply?: boolean } = {},
+  deps: GoogleTasksDeps = realGoogleTasksDeps(db, secrets)
+): Promise<PurgeResult> {
+  const out: PurgeResult = { scanned: 0, deleted: 0, kept: 0, samples: [] };
+  if (!deps.isConnected(secrets)) return { ...out, error: "not_connected" };
+
+  let posList: string;
+  try {
+    posList = await deps.ensureTasklist();
+  } catch (e) {
+    return { ...out, error: (e as Error).message };
+  }
+  // Both lists POS can write to since routing landed (gcal/sync.targetTasklistFor): its own
+  // list and the owner's default "Tasks" tab. Scanning the default one is safe precisely
+  // because the rules below only ever delete rows carrying a POS marker or POS's own
+  // "Tentative:" prefix — a task he typed on his phone has neither and is never touched.
+  const lists = [posList, DEFAULT_TASKLIST_ID];
+
+  const liveTask = db.prepare("SELECT gtasks_id FROM task WHERE id = ?");
+  const liveCommitment = db.prepare(
+    "SELECT 1 FROM commitment WHERE id = ? AND status IN ('open','scheduled')"
+  );
+  // Duplicate copies of LIVE items (owner report 2026-08-17: 3,298 rows in the POS list).
+  // The blind commitment push re-inserted the same live commitments for days, and this purge
+  // kept every copy — "live" was the whole test. Now: a live TASK keeps only the row its
+  // gtasks_id points at (or the first seen, healing gtasks_id when applying); a live
+  // COMMITMENT keeps only the first row per marker. Everything else with that marker is a
+  // duplicate and dies.
+  const keptCommitment = new Set<number>();
+  const keptTaskFirst = new Map<number, string>(); // taskId → first g.id kept (gtasks_id was NULL)
+
+  const seenIds = new Set<string>(); // '@default' may resolve to a list already scanned
+  for (const tasklist of lists) {
+    let pageToken: string | undefined;
+    do {
+      let page;
+      try {
+        page = await deps.listTasks({ tasklist, pageToken });
+      } catch (e) {
+        // One unreadable list must not lose the other's cleanup.
+        console.warn(`gtasks purge: listing ${tasklist} failed: ${(e as Error).message}`);
+        break;
+      }
+      for (const g of page.items ?? []) {
+        if (!g.id || seenIds.has(g.id)) continue;
+        seenIds.add(g.id);
+        out.scanned++;
+        if (g.deleted === true) continue; // already gone; nothing to do
+
+        const title = (g.title ?? "").trim();
+        let doomed = false;
+        if (/^tentative:\s/i.test(title)) {
+          doomed = true;
+        } else {
+          const taskId = taskIdFromNotes(g.notes);
+          const commitmentId = commitmentIdFromNotes(g.notes);
+          if (taskId != null) {
+            const row = liveTask.get(taskId) as { gtasks_id: string | null } | undefined;
+            if (!row) {
+              doomed = true; // task gone locally → orphan
+            } else if (row.gtasks_id) {
+              doomed = row.gtasks_id !== g.id; // live task keeps only its canonical row
+            } else {
+              // Task never linked (crash between insert and link). Keep the first copy and
+              // heal the link; every later copy with the same marker is a duplicate.
+              const first = keptTaskFirst.get(taskId);
+              if (first === undefined) {
+                keptTaskFirst.set(taskId, g.id);
+                if (opts.apply) {
+                  db.prepare("UPDATE task SET gtasks_id = ?, gtasks_list = ? WHERE id = ?").run(
+                    g.id,
+                    tasklist === posList ? null : tasklist,
+                    taskId
+                  );
+                }
+              } else {
+                doomed = first !== g.id;
+              }
+            }
+          } else if (commitmentId != null) {
+            if (!liveCommitment.get(commitmentId)) {
+              doomed = true; // commitment resolved/gone → orphan
+            } else if (keptCommitment.has(commitmentId)) {
+              doomed = true; // duplicate copy of a live commitment
+            } else {
+              keptCommitment.add(commitmentId);
+            }
+          }
+          // no marker at all → his own row, never touched
+        }
+
+        if (!doomed) {
+          out.kept++;
+          continue;
+        }
+        if (!opts.apply) {
+          out.deleted++;
+          if (out.samples.length < 15) out.samples.push(title || "(untitled)");
+          continue;
+        }
+        // Paced, with backoff. Run one fired as fast as the network allowed and lost
+        // 2,593 deletes to "Quota Exceeded"; run two paced at ~3/s and was refused after
+        // exactly 69 — which is the tell that the Tasks API allows ~60 requests/minute
+        // per user. So: ~55/min steady, and on a refusal sleep out the rest of the
+        // minute (65s) and retry, up to 5 times, before giving up on the run.
+        let done = false;
+        for (let attempt = 0; attempt < 5 && !done; attempt++) {
+          try {
+            await deps.deleteTask({ tasklist, task: g.id });
+            done = true;
+            out.deleted++;
+            if (out.deleted % 200 === 0) console.log(`purge: ${out.deleted} deleted so far`);
+            if (out.samples.length < 15) out.samples.push(title || "(untitled)");
+          } catch (e) {
+            const msg = (e as Error).message;
+            if (/quota|rate ?limit|429/i.test(msg) && attempt < 4) {
+              await new Promise((r) => setTimeout(r, 65_000));
+              continue;
+            }
+            console.warn(`gtasks purge: ${g.id} failed: ${msg}`);
+            if (/quota|rate ?limit|429/i.test(msg)) return { ...out, error: "quota exhausted — re-run later to finish" };
+            break;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 1_100));
+      }
+      pageToken = page.nextPageToken ?? undefined;
+    } while (pageToken);
+  }
+
+  return out;
 }
 
 /** Close a commitment the Google side reports done. Returns true when a row changed. */

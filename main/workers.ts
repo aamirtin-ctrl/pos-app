@@ -12,7 +12,7 @@ import type { Db } from "./db/db.ts";
 import type { SecretStore } from "./secrets.ts";
 import { extractJson, llmHealth, type LlmClient } from "./llm/provider.ts";
 import { backfillDegraded, listDegraded } from "./backfill.ts";
-import {
+import { verifyPendingCommitments,
   extractCommitmentsLlm,
   passesCommitmentGate,
   isExpiredSameDay,
@@ -23,14 +23,15 @@ import {
 import { dateUndatedTasks } from "./crm/taskdates.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { runEnrichment } from "./crm/enrich.ts";
-import { commitmentToTask, closeGoogleTask, drainTombstones, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
-import { hasCalendarWriteScope, isGoogleConnected } from "./gcal/auth.ts";
+import { resolveNamedDate } from "./context.ts";
+import { commitmentToTask, commitmentToEvent, closeGoogleTask, drainTombstones, pruneRetiredTaskBlocks, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
+import { hasCalendarWriteScope, isGoogleConnected, googleScopeStatus } from "./gcal/auth.ts";
 import { autoPushEnabled, pushPlanToGoogle } from "./planner.ts";
 import { eventsForDate as icsEventsForDate } from "./icscal.ts";
 import { distillWeek, distillWeekKey } from "./worklog.ts";
 import type { ConnectorDeps, SyncReport } from "./connectors/common.ts";
 import { syncAllMail, gmailConfigured } from "./connectors/gmail.ts";
-import { reconcileGoogleTasks } from "./gtasks-sync.ts";
+import { reconcileGoogleTasks, cleanupDroppedTaskRows } from "./gtasks-sync.ts";
 import { runNudgeCheck } from "./nudge.ts";
 import { screenTimeAvailable, autoCaptureOutcomes } from "./screentime.ts";
 import { generatePlan, replanUpcoming, upcomingDates, REPLAN_HORIZON_DAYS } from "./planner.ts";
@@ -43,10 +44,14 @@ import { runCapture, resolveDoctrineDir } from "./capture.ts";
 import { mirrorToGoogle, appleCalendarAvailable } from "./applecal.ts";
 import { drainCaptures } from "./capture-inbox.ts";
 import { handleCommand } from "./assistant.ts";
+import { syncAppleNotes, NOTE_TITLE_KEY } from "./connectors/applenotes.ts";
+import { gleanNotes } from "./crm/notesglean.ts";
 import { sendMorningDigest, shouldSendDigest } from "./digest.ts";
 import { loadDoctrine } from "./engine/doctrine.ts";
 import { runMsgPlans } from "./msgplans.ts";
 import { syncNotion, notionConfigured, enrichAgenticCurriculumTasks } from "./notion.ts";
+import { rolloverMissedTasks } from "./rollover.ts";
+import { syncAppleContactBios } from "./crm/apple-bios.ts";
 import { materializeRecurringTasks } from "./crm/recurring.ts";
 import { todayISO, addDaysISO } from "./dates.ts";
 import { getSetting, setSetting } from "./db/db.ts";
@@ -69,13 +74,75 @@ export type SyncSource =
   | "mailfile"
   | "capture"
   | "msgplans"
-  | "notion";
+  | "notion"
+  | "applenotes";
 
 /** `extra` = LinkedIn export folder / mailfile path (unused by gmail/imessage). */
 export type ConnectorFn = (deps: ConnectorDeps, extra?: string) => Promise<SyncReport>;
 
 /** Cap on interactions fed to commitment extraction per run (newest first). */
 const EXTRACT_CAP = 50;
+
+/**
+ * How far back extraction may look, as a SQLite datetime modifier. Nothing older than this
+ * is ever mined, at any point, on any run — see the query in the post-ingest hook for why
+ * (a backfilled three-year message history read as "newest" and produced commitments from
+ * conversations long finished). Sized to cover the app having been closed for a couple of
+ * days; it is a bound on staleness, not a backlog to work through.
+ */
+export const EXTRACT_LOOKBACK = "-2 days";
+
+/** Once-per-run guard for the dead-Google-token notification in the tick. */
+let warnedGoogleTokenDead = false;
+
+/** Once-per-run guards for the other two silent sync-freeze modes (owner report 2026-08-24:
+ * "why is it that the messages/emails dont always stay up to date"). Both gates fail
+ * SILENTLY by design — no sync_run row, no error — which is correct behavior for a machine
+ * that never had the capability, and a slow-motion lie on one that lost it. iMessage died
+ * 2026-08-13 the moment the app started running as the dev binary (TCC grants Full Disk
+ * Access per app bundle; POS.app has it, node_modules Electron does not) and said nothing
+ * for eleven days. Mail died 2026-08-21 when the then four-day-old process lost its
+ * Keychain session and every encrypted secret started reading as null in-process — while a
+ * fresh process decrypted fine. Neither may happen quietly again. */
+let warnedImessageUnavailable = false;
+
+/** Apple apps POS's sweeps drive over AppleScript — launched implicitly by `tell` if not
+ * already open. The owner's complaint (2026-08-24): every 15 minutes these pop open and
+ * stay. The tick snapshots which are running BEFORE its work and quits, at the end, only
+ * the ones the tick itself brought up — an app the owner had open is never touched. (An
+ * app opened by the owner DURING a tick can be caught in the sweep; the window is seconds
+ * wide and reopening costs one click — accepted.) */
+const APPLESCRIPT_TARGET_APPS = ["Calendar", "Notes", "Reminders"] as const;
+
+async function runningTargetApps(): Promise<Set<string>> {
+  const { runOsascript } = await import("./applecal.ts");
+  const res = await runOsascript(
+    'tell application "System Events" to get name of every process whose background only is false',
+    15_000
+  );
+  const out = new Set<string>();
+  if (res.ok) {
+    const names = res.stdout.split(",").map((x) => x.trim());
+    for (const t of APPLESCRIPT_TARGET_APPS) if (names.includes(t)) out.add(t);
+  } else {
+    // Can't see the process list -> claim everything is running so we quit nothing.
+    for (const t of APPLESCRIPT_TARGET_APPS) out.add(t);
+  }
+  return out;
+}
+
+async function quitTickLaunchedApps(before: Set<string>): Promise<void> {
+  const { runOsascript } = await import("./applecal.ts");
+  const after = await runningTargetApps();
+  for (const name of APPLESCRIPT_TARGET_APPS) {
+    if (after.has(name) && !before.has(name)) {
+      // Only apps running NOW: `tell app to quit` on a closed app would LAUNCH it first.
+      await runOsascript(`tell application "${name}" to quit`, 15_000);
+    }
+  }
+}
+
+let warnedMailVanished = false;
 
 const CONNECTORS: Record<SyncSource, ConnectorFn> = {
   gmail: (deps) => syncAllMail(deps), // every configured mail account (gmail/outlook/imap)
@@ -102,6 +169,9 @@ const CONNECTORS: Record<SyncSource, ConnectorFn> = {
     const c = await syncNotion(deps.db, deps.secrets);
     return { source: "notion", ingested: c.pulled, skipped: 0, created: 0 };
   },
+  // Apple Notes people drop-box: raw dump → capture_inbox, note wiped. Gleaning happens
+  // in the capture drain (crm/notesglean.ts), not here.
+  applenotes: (deps) => syncAppleNotes(deps),
 };
 
 /**
@@ -171,19 +241,77 @@ export async function runSync(
       // One-shot duplicate backfill, on the first sync after the upgrade. The setting
       // guard makes every later call a single indexed lookup.
       await cleanupDuplicateCommitments(db, secrets);
+      // Recency window (owner directive 2026-08-10). Extraction used to select purely on
+      // `extracted_at IS NULL ORDER BY id DESC`, with no bound on how OLD a message could
+      // be. That ordering is by row id — insertion order — not by when the message was
+      // sent, so a backfill of three years of iMessage history (23,457 rows reaching back
+      // to 2023-07-05, measured in his database) presented itself as "newest" and was mined
+      // as though it were today's traffic. That is where tasks he could not place came
+      // from: "collect the international block from Papa", Tara/Ethan's-mom logistics from
+      // months ago, all extracted long after they mattered.
+      //
+      // Two days is deliberately the ONLY lookback, and it is what makes the reboot case
+      // and the steady-state case the same code path: running continuously, nothing older
+      // than the last tick is ever new; after the app has been off for a while, this is
+      // exactly the catch-up he asked for and no more. Rows older than the window keep
+      // extracted_at NULL forever, which is correct — they are history, not a backlog.
       const ids = (
         db
           .prepare(
-            "SELECT id FROM interaction WHERE extracted_at IS NULL ORDER BY id DESC LIMIT ?"
+            `SELECT id FROM interaction
+              WHERE extracted_at IS NULL
+                AND occurred_at IS NOT NULL
+                AND occurred_at >= datetime('now', ?)
+              ORDER BY occurred_at DESC
+              LIMIT ?`
           )
-          .all(EXTRACT_CAP) as { id: number }[]
+          .all(EXTRACT_LOOKBACK, EXTRACT_CAP) as { id: number }[]
       ).map((r) => r.id);
       if (llm && ids.length) {
         const beforeMax = (
           db.prepare("SELECT COALESCE(MAX(id), 0) AS m FROM commitment").get() as { m: number }
         ).m;
         await extractCommitmentsLlm(db, llm, ids);
-        await autoTentativeTasks(db, secrets, beforeMax);
+        // Message→TASK auto-conversion, same directive as msgplans above and same default
+        // (off unless explicitly enabled). Extraction itself still runs: commitments are
+        // CRM state — what someone owes him and what he owes them — and they still surface
+        // in the review queue and on people's profiles. What stops is a message silently
+        // becoming a task, which is the path that produced 220 duplicate "Tentative: …"
+        // rows. Reminders.app is the task source now; he taps once, POS imports it.
+        if (getSetting(db, AUTO_TASKS_ENABLED_KEY) === "1") {
+          await autoTentativeTasks(db, secrets, beforeMax);
+        }
+        // Batched Gemini gate: fresh commitments stay invisible until one call per
+        // batch confirms them real and rewrites the headline (owner ask 2026-08-24).
+        const vr = await verifyPendingCommitments(db, llm);
+        if (vr.verified + vr.dropped > 0) {
+          console.log(`workers: commitment verify — ${vr.verified} confirmed, ${vr.dropped} rejected, ${vr.waiting} still pending`);
+        }
+        // NOTES-sourced commitments flow all the way through (owner directive 2026-08-31):
+        // a blurb he wrote about a person — "should meet up with her this summer" — becomes,
+        // once verified, a commitment AND a dated task in Google AND a calendar block,
+        // all hanging off the same commitment row. Deliberately ROUTING, not new machinery:
+        // commitmentToTask and commitmentToEvent are the same converters the review queue's
+        // buttons call; notes get them automatically because writing it down was already
+        // his confirmation (the same doctrine notesglean applies to new people). Message-
+        // sourced commitments still stop at the review queue — that channel earned its
+        // gate. Extraction's due date wins; a named period falls back to his date anchors
+        // (resolveNamedDate); truly undated notes become an inbox task and no event.
+        for (const cid of vr.verifiedIds) {
+          try {
+            const src = db.prepare(
+              `SELECT i.channel, c.due_at, c.description, c.start_time FROM commitment c
+                 JOIN interaction i ON i.id = c.source_interaction_id WHERE c.id = ?`
+            ).get(cid) as { channel: string; due_at: string | null; description: string; start_time: string | null } | undefined;
+            if (src?.channel !== "notes") continue;
+            const dateISO = src.due_at?.slice(0, 10) ?? resolveNamedDate(db, src.description) ?? undefined;
+            await commitmentToTask(db, secrets, cid, dateISO, { tentative: true });
+            if (dateISO) commitmentToEvent(db, cid, dateISO, src.start_time ?? undefined);
+            console.log(`workers: note commitment ${cid} routed — task${dateISO ? " + event on " + dateISO : " (undated inbox)"}`);
+          } catch (e) {
+            console.warn(`workers: note-commitment route ${cid} failed: ${(e as Error).message}`);
+          }
+        }
       }
       // Thread-resolution pass AFTER extraction: new messages that fulfill or cancel
       // an already-open commitment close it (and its task). Counts land on the report.
@@ -462,6 +590,20 @@ export async function resolveFromThreads(
 
   return out;
 }
+
+/**
+ * Settings key gating the message→calendar path (runMsgPlans). Unset means OFF: the owner
+ * turned this direction off entirely on 2026-08-10. Message INGESTION is untouched — it
+ * still feeds people, bios and commitments; only "text becomes a calendar event" stopped.
+ */
+export const MSGPLANS_ENABLED_KEY = "msgplans_enabled";
+
+/**
+ * Settings key gating message→task auto-conversion (autoTentativeTasks). Unset means OFF,
+ * for the same reason and on the same date. Commitments are still extracted and still shown
+ * for review; they just no longer become tasks on their own.
+ */
+export const AUTO_TASKS_ENABLED_KEY = "auto_tasks_from_messages";
 
 /** Autonomy threshold: only commitments at or above this confidence auto-convert. */
 export const AUTO_CONVERT_CONFIDENCE = 0.8;
@@ -1086,6 +1228,9 @@ export function startWorkers(
     const sweepDays = tickNo++ % 2 === 0 ? REPLAN_HORIZON_DAYS : 1;
     if (running) return; // never overlap
     running = true;
+    const appsRunningBefore = await runningTargetApps().catch(() => {
+      const all = new Set<string>(); for (const t of APPLESCRIPT_TARGET_APPS) all.add(t); return all;
+    });
     try {
       // Degraded-work backfill FIRST, before anything else that spends the model (owner ask
       // 2026-08-05: "when my Gemini credits refill it should go back and fix the stuff it
@@ -1114,7 +1259,10 @@ export function startWorkers(
         if (llm) {
           const cap = await drainCaptures(
             db,
-            async (text) => {
+            async (text, source) => {
+              // People-dumps from the Apple Notes drop-box get the dedicated gleaner —
+              // they are about OTHER people, not commands to the assistant.
+              if (source === "apple_notes") return await gleanNotes(db, llm, text);
               const r = await handleCommand({ db, secrets, doctrineDir: resolveDoctrineDir(), llm }, text);
               return { kind: r.kind };
             },
@@ -1195,6 +1343,36 @@ export function startWorkers(
         console.warn(`screen time auto-capture failed: ${(e as Error).message}`);
       }
 
+      // Daily carry-over (owner ask 2026-08-16): unfinished one-off tasks roll to today, and a
+      // missed curriculum day shifts the whole Notion plan down the line. MUST run before the
+      // materialize/enrich block below — the shift changes which Notion row belongs to which
+      // day, and the enrich pass right after fills today's instance from the shifted dates.
+      try {
+        const today = todayISO();
+        const rolloverKey = `rollover_done_${today}`;
+        if (!getSetting(db, rolloverKey)) {
+          const r = await rolloverMissedTasks(db, secrets, today);
+          // The Google half of the habit drop — without it, missed instances linger in the
+          // Tasks tab forever (the pass rollover's comment promised but nothing implemented).
+          const cg = await cleanupDroppedTaskRows(db, secrets);
+          if (cg.removed > 0) console.log(`workers: cleared ${cg.removed} dropped task row(s) from Google`);
+          // …and their calendar shadows: blocks of retired tasks tombstone their events,
+          // and the drain issues the Google deletes (owner report 2026-08-31).
+          const pr = pruneRetiredTaskBlocks(db);
+          if (pr.pruned > 0) {
+            const dt = await drainTombstones(db, secrets);
+            console.log(`workers: pruned ${pr.pruned} retired-task block(s), withdrew ${dt.deleted} calendar event(s)`);
+          }
+          setSetting(db, rolloverKey, new Date().toISOString());
+          if (r.moved > 0) notify?.(`Carried ${r.moved} unfinished task${r.moved === 1 ? "" : "s"} over to today`);
+          if (r.curriculumShifted > 0) {
+            notify?.(`Missed a curriculum day — pushed ${r.curriculumShifted} Notion session${r.curriculumShifted === 1 ? "" : "s"} down the line`);
+          }
+        }
+      } catch (e) {
+        console.warn(`workers: daily rollover failed: ${(e as Error).message}`);
+      }
+
       // Agentic-coding curriculum (owner ask 2026-08-07): Notion says WHAT each 30-minute
       // session is for, POS says WHEN.
       //
@@ -1224,6 +1402,16 @@ export function startWorkers(
         } catch (e) {
           console.warn(`workers: agentic curriculum sync failed: ${(e as Error).message}`);
         }
+      }
+
+      // A dead Google grant freezes everything downstream of this point — anchors heal
+      // from stale snapshots, the change-fingerprint never moves, and conflict-replans
+      // conclude "nothing changed" forever. That is exactly what ate 2026-08-13: the
+      // owner rearranged his calendar by hand and the plan never followed, with no
+      // error anywhere he could see. Say it ONCE per app run, loudly.
+      if (!warnedGoogleTokenDead && (await googleScopeStatus(secrets)).tokenDead) {
+        warnedGoogleTokenDead = true;
+        notify?.("Google sign-in expired — calendar sync and replanning are paused. Reconnect in Settings → Google.");
       }
 
       // The calendar moving under a plan re-solves it — today AND the next two days, since
@@ -1271,7 +1459,14 @@ export function startWorkers(
         console.warn(`apple mirror sweep failed: ${(e as Error).message}`);
       }
 
-      if (gmailConfigured({ secrets })) {
+      const mailOk = gmailConfigured({ secrets });
+      // Accounts exist on disk but read as absent -> the process can no longer decrypt
+      // (stale Keychain session in a long-lived instance). Restarting the app fixes it.
+      if (!mailOk && !warnedMailVanished && (secrets.list?.() ?? []).some((e) => e.name === "MAIL_ACCOUNTS")) {
+        warnedMailVanished = true;
+        notify?.("Email sync is paused — the app can no longer read its saved mail accounts. Quit and reopen POS to fix it.");
+      }
+      if (mailOk) {
         announce(await runSync(db, secrets, llm, "gmail"));
         // Same accounts, LinkedIn notification mail only (invites/accepts → people).
         announce(await runSync(db, secrets, llm, "linkedin-email"));
@@ -1281,18 +1476,33 @@ export function startWorkers(
       if (gmailConfigured({ secrets }) || (getSetting(db, "capture_self_handles") ?? "").trim()) {
         announce(await runSync(db, secrets, llm, "capture"));
       }
+      if (!imessageAvailable() && !warnedImessageUnavailable) {
+        warnedImessageUnavailable = true;
+        notify?.("iMessage sync is paused — this build can't read Messages. Grant Full Disk Access to the app that is actually running (System Settings → Privacy & Security → Full Disk Access).");
+      }
       if (imessageAvailable()) {
         // FDA can still be revoked between the precheck and the copy — announce() stays
         // quiet on any error, so that failure mode is silent too.
         announce(await runSync(db, secrets, llm, "imessage"));
-        // Plans from messages. Same precheck (unreadable chat.db / missing FDA is skipped
-        // silently); the connector itself reports 'full_disk_access' if it's revoked mid-run.
-        announce(await runSync(db, secrets, llm, "msgplans"));
+        // Plans from messages: OFF unless explicitly enabled (owner directive 2026-08-10,
+        // "the calendar doesn't take any information from messages directly"). The iMessage
+        // sync above still runs — it feeds the CRM half (people, bios, commitments), which
+        // he kept. What stops is text becoming calendar events: iOS already detects a plan
+        // in Messages and offers a one-tap reminder, and the anchor for a day is now the one
+        // event HE adds to Apple Calendar the night before. Everything POS schedules is
+        // arranged around that anchor.
+        if (getSetting(db, MSGPLANS_ENABLED_KEY) === "1") {
+          announce(await runSync(db, secrets, llm, "msgplans"));
+        }
       }
       // Notion — gated on token + parent page so an unconfigured integration never
       // writes error rows to sync_run.
       if (notionConfigured(db, secrets)) {
         announce(await runSync(db, secrets, llm, "notion"));
+      }
+      // Apple Notes people drop-box — only when the owner has named a note in Settings.
+      if (process.platform === "darwin" && (getSetting(db, NOTE_TITLE_KEY) ?? "").trim()) {
+        announce(await runSync(db, secrets, llm, "applenotes"));
       }
       // Morning digest: once per day, from doctrine wake_time + 15 min on, gated on
       // digest_enabled. Errors are contained here — a failed send never stops the tick.
@@ -1318,6 +1528,23 @@ export function startWorkers(
         const d = await distillWeek(db, llm);
         if (d.inserted > 0) notify?.(`Worklog: distilled ${d.inserted} entr${d.inserted === 1 ? "y" : "ies"} for the week`);
       }
+      // Mirror bios into Apple Contacts: once per day (owner ask 2026-08-20). Updates the
+      // managed ―― POS ―― note block on matched cards and creates cards for named people the
+      // Mac doesn't know — which also teaches iMessage their names. First run prompts for
+      // Contacts automation permission.
+      try {
+        const bioKey = `apple_bios_day_${todayISO()}`;
+        if (!getSetting(db, bioKey)) {
+          const b = await syncAppleContactBios(db, { apply: true });
+          setSetting(db, bioKey, new Date().toISOString());
+          if (b.updated > 0 || b.created > 0) {
+            notify?.(`Apple Contacts: ${b.updated} bio${b.updated === 1 ? "" : "s"} updated, ${b.created} contact${b.created === 1 ? "" : "s"} created`);
+          }
+        }
+      } catch (e) {
+        console.warn(`workers: apple contact bio sync failed: ${(e as Error).message}`);
+      }
+
       // Profile synthesis + bio-mining: once per day. The daily LLM budget lives in
       // enrich.ts (enrichment_attempt ledger); the setting key just keeps the pass
       // from re-running on every 15-minute tick. Skipped silently without an LLM.
@@ -1337,6 +1564,8 @@ export function startWorkers(
     } catch (e) {
       console.warn(`workers: scheduled sync failed: ${(e as Error).message}`);
     } finally {
+      // Close what this tick opened (Calendar/Notes/Reminders driven over AppleScript).
+      await quitTickLaunchedApps(appsRunningBefore).catch(() => {});
       running = false;
     }
   };
@@ -1356,6 +1585,11 @@ export function startWorkers(
   })();
 
   const task = cron.schedule("*/15 * * * *", tick);
+  // One immediate tick at launch. The daily jobs (carry-over, curriculum shift, digest) are
+  // keyed per-day inside tick — if the app was closed at midnight, waiting for the next
+  // quarter-hour means opening to yesterday's plan for up to 15 minutes. Same reasoning as
+  // the startup stale-engine sweep above; `running` guard makes the overlap safe.
+  void tick();
   // Nudges run on their own 5-minute cadence: the reality window is 10 minutes, so a
   // 15-minute tick would leave blind gaps, and a call-out shouldn't queue behind Gmail.
   const nudgeTask = cron.schedule("*/5 * * * *", async () => {

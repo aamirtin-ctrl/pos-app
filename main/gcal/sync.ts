@@ -25,10 +25,107 @@ import type { Flexibility } from "../engine/grid.ts";
 export const POS_CALENDAR_NAME = "POS — Planned";
 export const POS_TASKLIST_NAME = "POS";
 
+/**
+ * Google's own default list — the "Tasks" tab he actually looks at on the phone. Addressable
+ * by this alias, so it needs no lookup and no creation.
+ */
+export const DEFAULT_TASKLIST_ID = "@default";
+
+/** A dated task this many days out or nearer counts as near-term. */
+export const NEAR_TERM_DAYS = 7;
+
+/**
+ * Which Google list a task belongs in (owner directive 2026-08-11: "all daily/near-time
+ * tasks to my Tasks tab, long term people commitments to the POS tab").
+ *
+ * The split is by WHEN, not by origin, because that is what he reads the lists for: the
+ * Tasks tab is what he is doing now, the POS list is the pile of obligations to people that
+ * has no date yet. So a recurring habit instance, a reminder he tapped through from
+ * Messages, and anything dated inside NEAR_TERM_DAYS all land in Tasks — including a
+ * commitment that has come due. Everything else — undated work, and people-commitments
+ * scheduled further out than a week — stays in POS.
+ *
+ * Pure and exported so the routing can be tested without Google.
+ */
+export function targetTasklistFor(
+  t: { plan_date: string | null; recurrence_parent_id?: number | null; reminder_id?: string | null },
+  todayISO: string,
+  posListId: string
+): string {
+  if (t.recurrence_parent_id != null) return DEFAULT_TASKLIST_ID; // daily habit instance
+  if (t.reminder_id) return DEFAULT_TASKLIST_ID; // he chose it in Reminders — it's live work
+  if (t.plan_date) {
+    const horizon = new Date(`${todayISO}T00:00:00Z`);
+    horizon.setUTCDate(horizon.getUTCDate() + NEAR_TERM_DAYS);
+    if (t.plan_date <= horizon.toISOString().slice(0, 10)) return DEFAULT_TASKLIST_ID;
+  }
+  return posListId;
+}
+
 function calApi(secrets: SecretStore): calendar_v3.Calendar {
   return google.calendar({ version: "v3", auth: oauthClient(secrets) });
 }
-function tasksApi(secrets: SecretStore): tasks_v1.Tasks {
+
+/**
+ * Delete a single Google Calendar event (powers the day view's select→⌫). A 404/410
+ * means it is already gone, which we report as success. This deletes the event the
+ * user is looking at; if it is the Apple-mirror copy, the caller also deletes the
+ * Apple source so the next mirror pass does not re-create it.
+ */
+export async function deleteGoogleEvent(
+  secrets: SecretStore,
+  calendarId: string,
+  eventId: string
+): Promise<{ ok: boolean; error?: string }> {
+  if (!calendarId || !eventId) return { ok: false, error: "missing calendar or event id" };
+  try {
+    await calApi(secrets).events.delete({ calendarId, eventId });
+    // Without this, the next day-refresh reads the ≤60s anchors cache and the event
+    // REAPPEARS after its own deletion — which read as "delete is stuck" to the owner.
+    clearAnchorsCache();
+    return { ok: true };
+  } catch (e) {
+    const msg = (e as Error).message || "delete failed";
+    if (/\b(404|410)\b|already deleted|not found|has been deleted/i.test(msg)) {
+      clearAnchorsCache();
+      return { ok: true };
+    }
+    return { ok: false, error: msg };
+  }
+}
+
+/**
+ * Move (or re-day) a Google event — the day view's drag-an-external-event commit.
+ * External events used to be undraggable on principle ("moved in Google, the sync picks it
+ * up"); the owner's actual calendar IS Google, so from where he sits POS just refused to
+ * reorder his day (2026-08-13). A patch of start/end is exactly what the Calendar UI would
+ * do, POS reads it back like any other external edit, and the cache clear makes the next
+ * read live so the card does not snap back.
+ */
+export async function moveGoogleEvent(
+  secrets: SecretStore,
+  calendarId: string,
+  eventId: string,
+  startISO: string,
+  endISO: string
+): Promise<{ ok: boolean; error?: string }> {
+  if (!calendarId || !eventId) return { ok: false, error: "missing calendar or event id" };
+  try {
+    await calApi(secrets).events.patch({
+      calendarId,
+      eventId,
+      requestBody: {
+        start: { dateTime: new Date(startISO).toISOString() },
+        end: { dateTime: new Date(endISO).toISOString() },
+      },
+    });
+    clearAnchorsCache();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message || "move failed" };
+  }
+}
+export function tasksApi(secrets: SecretStore): tasks_v1.Tasks {
   return google.tasks({ version: "v1", auth: oauthClient(secrets) });
 }
 
@@ -65,11 +162,13 @@ export interface PushTasksApi {
     insert(args: { requestBody: { title: string } }): Promise<{ data: { id?: string | null } }>;
   };
   tasks: {
-    list(args: { tasklist: string; maxResults: number; showCompleted?: boolean }): Promise<{
-      data: { items?: { id?: string | null; notes?: string | null }[] };
+    list(args: { tasklist: string; maxResults: number; showCompleted?: boolean; pageToken?: string }): Promise<{
+      data: { items?: { id?: string | null; notes?: string | null }[]; nextPageToken?: string | null };
     }>;
     insert(args: { tasklist: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
     update(args: { tasklist: string; task: string; requestBody: unknown }): Promise<{ data: { id?: string | null } }>;
+    /** Google Tasks has no move, so re-routing a task between lists is delete-then-insert. */
+    delete(args: { tasklist: string; task: string }): Promise<unknown>;
   };
 }
 
@@ -521,6 +620,27 @@ export function clearAnchorsCache(): void {
   anchorsLiveOnlyUntil = Date.now() + ANCHORS_TTL_MS;
 }
 
+// The stale-while-revalidate read below serves a persisted snapshot and refreshes in the
+// background. Without this hook the refresh corrected the caches but nobody told the renderer,
+// so an event deleted in Apple/Google Calendar stayed on screen until some unrelated re-fetch
+// (owner report 2026-08-13). main/index.ts registers a callback that pings the day view.
+let anchorsRefreshedNotifier: ((dateISO: string) => void) | null = null;
+
+export function setAnchorsRefreshedNotifier(fn: (dateISO: string) => void): void {
+  anchorsRefreshedNotifier = fn;
+}
+
+/**
+ * Did a background refresh materially change what the renderer was shown? Compared on the
+ * fields the day view renders (identity, span, title) — order-insensitive. Pure, for tests.
+ */
+export function anchorsDiffer(a: readonly ExternalAnchor[], b: readonly ExternalAnchor[]): boolean {
+  if (a.length !== b.length) return true;
+  const key = (x: ExternalAnchor) => `${x.gcalEventId}|${x.startMin}|${x.endMin}|${x.title}`;
+  const seen = new Set(a.map(key));
+  return b.some((x) => !seen.has(key(x)));
+}
+
 /**
  * Read anchors for a date from ALL calendars except the POS calendar.
  * External events are immovable by definition. Cached per-date for 60s;
@@ -540,6 +660,11 @@ export async function readAnchors(db: Db, secrets: SecretStore, dateISO: string)
       if (!anchorsRefreshing.has(dateISO)) {
         anchorsRefreshing.add(dateISO);
         void readAnchorsLive(db, secrets, dateISO)
+          .then((fresh) => {
+            // The snapshot we just served may be stale (e.g. an event deleted on another
+            // device). If the live read disagrees, tell the renderer to re-pull this day.
+            if (anchorsDiffer(persisted, fresh)) anchorsRefreshedNotifier?.(dateISO);
+          })
           .catch((e) => console.warn(`gcal: background anchors refresh failed: ${(e as Error).message}`))
           .finally(() => anchorsRefreshing.delete(dateISO));
       }
@@ -1097,6 +1222,18 @@ export async function reconcileMovedEvents(db: Db, secrets: SecretStore): Promis
   return { locked };
 }
 
+/**
+ * True only for a genuinely missing remote row (404/410). Everything else — quota, network,
+ * 5xx — is transient, and re-inserting on it MINTS A DUPLICATE: on 2026-08-18 a quota-starved
+ * day turned every failed update into a fresh copy (~2,175 rows in one day), because the
+ * update's catch treated any non-reconsent error as "task missing".
+ */
+function isMissingRemote(err: unknown): boolean {
+  const e = err as { code?: number | string; response?: { status?: number } };
+  const status = typeof e?.code === "number" ? e.code : Number(e?.code) || e?.response?.status;
+  return status === 404 || status === 410;
+}
+
 /** Find-or-create the POS Google Tasks list. */
 export async function ensurePosTasklist(
   db: Db,
@@ -1157,15 +1294,32 @@ async function pushTasksInner(
   // Google Tasks with no due date at all, which is what he saw.
   const open = db
     .prepare(
-      `SELECT id, title, notes, plan_date, hard_deadline_at, gtasks_id, gtasks_list
+      `SELECT id, title, notes, plan_date, hard_deadline_at, gtasks_id, gtasks_list,
+              recurrence_parent_id, reminder_id
          FROM task WHERE status IN ('inbox','planned','in_progress')`
     )
     .all() as {
     id: number; title: string; notes: string | null;
     plan_date: string | null; hard_deadline_at: string | null; gtasks_id: string | null;
-    gtasks_list: string | null;
+    gtasks_list: string | null; recurrence_parent_id: number | null; reminder_id: string | null;
   }[];
   for (const t of open) {
+    // Future HABIT instances stay local until their day (owner spec 2026-08-20: the Tasks tab
+    // shows TODAY's three habits + his own work, not the whole planning horizon). An instance
+    // an earlier build already pushed gets its remote row taken back down.
+    if (t.recurrence_parent_id != null && t.plan_date && t.plan_date > todayLocalISO()) {
+      if (t.gtasks_id) {
+        try {
+          await api.tasks.delete({ tasklist: t.gtasks_list ?? listId, task: t.gtasks_id });
+          db.prepare("UPDATE task SET gtasks_id = NULL, gtasks_list = NULL WHERE id = ?").run(t.id);
+        } catch (e) {
+          if (needsReconsent(e)) throw e;
+          if (isMissingRemote(e)) db.prepare("UPDATE task SET gtasks_id = NULL, gtasks_list = NULL WHERE id = ?").run(t.id);
+          /* transient: leave the link; a later push retries the take-down */
+        }
+      }
+      continue;
+    }
     // A clock-time deadline is more specific than a plain day, so it wins when both exist.
     const due = t.hard_deadline_at
       ? new Date(t.hard_deadline_at).toISOString()
@@ -1180,27 +1334,56 @@ async function pushTasksInner(
     const marker = `pos:task:${t.id}`;
     const notes = t.notes ? `${t.notes}\n${marker}` : marker;
     const body = { title: t.title, notes, due };
+    const target = targetTasklistFor(t, todayLocalISO(), listId);
+    const currentList = t.gtasks_list ?? listId;
     if (t.gtasks_id) {
-      try {
-        // A task imported from another list ('@default' — the phone's "My Tasks") lives
-        // there; updating it against the POS list is a 404 that would then re-insert it
-        // into the POS list as a duplicate the owner never asked to move.
-        await api.tasks.update({
-          tasklist: t.gtasks_list ?? listId,
-          task: t.gtasks_id,
-          requestBody: { ...body, id: t.gtasks_id },
-        });
-        continue;
-      } catch (e) {
-        // Only a MISSING task justifies re-inserting. A scope refusal would fail the
-        // insert identically, so surface it instead of doubling the failed calls.
-        if (needsReconsent(e)) throw e;
-        /* fall through to insert */
+      // Already in the right list: update in place. A task imported from another list
+      // ('@default' — the phone's "My Tasks") lives there; updating it against the POS
+      // list is a 404 that would then re-insert it as a duplicate he never asked for.
+      if (currentList === target) {
+        try {
+          await api.tasks.update({
+            tasklist: currentList,
+            task: t.gtasks_id,
+            requestBody: { ...body, id: t.gtasks_id },
+          });
+          continue;
+        } catch (e) {
+          // Only a MISSING task justifies re-inserting. A scope refusal would fail the
+          // insert identically, so surface it instead of doubling the failed calls.
+          if (needsReconsent(e)) throw e;
+          if (!isMissingRemote(e)) {
+            // Quota/network/5xx: skip — the next tick retries the update. Falling through
+            // here is how the 2026-08-18 duplicate flood was minted.
+            console.warn(`gtasks push: update ${t.gtasks_id} failed transiently, skipping: ${(e as Error).message}`);
+            continue;
+          }
+          /* genuinely gone → fall through to insert */
+        }
+      } else {
+        // Wrong list — a task crossed the near-term horizon, or was pushed before routing
+        // existed. Google Tasks has no move, so this is delete-then-insert. The delete is
+        // best-effort: if it fails the row is left behind as an orphan, which the purge
+        // cleans, and that is strictly better than skipping the move and leaving it
+        // permanently in the list he does not read.
+        try {
+          await api.tasks.delete({ tasklist: currentList, task: t.gtasks_id });
+        } catch (e) {
+          if (needsReconsent(e)) throw e;
+          if (!isMissingRemote(e)) {
+            // Couldn't confirm the old copy is gone (quota/network). Inserting the new-list
+            // copy now would leave both alive — skip and let the next tick move it.
+            console.warn(`gtasks push: move-delete ${t.gtasks_id} failed transiently, skipping move: ${(e as Error).message}`);
+            continue;
+          }
+          /* already gone → fall through and insert into the target list */
+        }
       }
     }
-    const created = await api.tasks.insert({ tasklist: listId, requestBody: body });
-    // The re-insert landed in the POS list wherever the row lived before.
-    db.prepare("UPDATE task SET gtasks_id = ?, gtasks_list = NULL WHERE id = ?").run(created.data.id ?? null, t.id);
+    const created = await api.tasks.insert({ tasklist: target, requestBody: body });
+    // NULL means "the POS list" (see gtasks-sync); anything else is stored explicitly.
+    db.prepare("UPDATE task SET gtasks_id = ?, gtasks_list = ? WHERE id = ?")
+      .run(created.data.id ?? null, target === listId ? null : target, t.id);
     pushed++;
   }
 
@@ -1212,8 +1395,22 @@ async function pushTasksInner(
        WHERE c.status = 'open' AND c.confirmed_by_user = 1 AND c.direction = 'i_owe_them'`
     )
     .all() as { id: number; description: string; due_at: string | null; who: string | null }[];
-  const existing = await api.tasks.list({ tasklist: listId, maxResults: 100, showCompleted: false });
-  const have = new Set((existing.data.items ?? []).map((t) => t.notes ?? ""));
+  // Collect EVERY existing marker, across ALL pages. The original scan read one page of 100
+  // with no pagination: once the list grew past 100 rows the dedupe check went blind, and
+  // every open commitment was re-inserted on every 15-minute tick — self-amplifying, since
+  // each insert pushed the real markers further past the visible page (3,298-row list,
+  // owner report 2026-08-17). Substring match, not equality: notes may carry more than the
+  // bare marker.
+  const have = new Set<string>();
+  let pageToken: string | undefined;
+  do {
+    const page = await api.tasks.list({ tasklist: listId, maxResults: 100, showCompleted: false, pageToken });
+    for (const g of page.data.items ?? []) {
+      const m = /pos:commitment:\d+/.exec(g.notes ?? "");
+      if (m) have.add(m[0]);
+    }
+    pageToken = page.data.nextPageToken ?? undefined;
+  } while (pageToken);
   for (const c of commitments) {
     const marker = `pos:commitment:${c.id}`;
     if (have.has(marker)) continue;
@@ -1226,6 +1423,22 @@ async function pushTasksInner(
       },
     });
     pushed++;
+  }
+
+  // Dropped tasks (a habit day that passed un-done, a merged duplicate): their Google rows are
+  // DELETED, not completed — he didn't do the work, so "completed" would be a lie on the record.
+  const dropped = db
+    .prepare("SELECT id, gtasks_id, gtasks_list FROM task WHERE status = 'dropped' AND gtasks_id IS NOT NULL")
+    .all() as { id: number; gtasks_id: string; gtasks_list: string | null }[];
+  for (const d of dropped) {
+    try {
+      await api.tasks.delete({ tasklist: d.gtasks_list ?? listId, task: d.gtasks_id });
+      db.prepare("UPDATE task SET gtasks_id = NULL, gtasks_list = NULL WHERE id = ?").run(d.id);
+    } catch (e) {
+      if (needsReconsent(e)) throw e;
+      if (isMissingRemote(e)) db.prepare("UPDATE task SET gtasks_id = NULL, gtasks_list = NULL WHERE id = ?").run(d.id);
+      /* transient: retry on a later push */
+    }
   }
 
   // complete Google tasks whose local task is done — in whichever list each one lives
@@ -1353,6 +1566,17 @@ export async function commitmentToTask(
             tasklist: listId,
             requestBody: {
               title: `Tentative: ${t.title}`,
+              // The pos:task marker is what tells the pull side this row is OUR output.
+              // Omitting it (as this push did until 2026-08-10) meant that whenever the
+              // local gtasks_id write below did not land — a crash or a timed-out insert
+              // that actually succeeded — syncFromGoogle could not relink the stray and
+              // imported it as a brand-new task instead, titled "Tentative: …" and with no
+              // commitment_id. That ran every sync: 220 duplicate tasks and 31 duplicate
+              // Google rows for a single commitment before it was caught.
+              // (literal, not gtasks-sync's TASK_MARKER_PREFIX: that module imports
+              // this one, so referencing it here would close an import cycle — same
+              // reason pushTasks builds its marker literally.)
+              notes: `pos:task:${taskId}`,
               due: t.hard_deadline_at ? new Date(t.hard_deadline_at).toISOString() : undefined,
             },
           }),
@@ -1473,6 +1697,33 @@ export function commitmentToEvent(db: Db, id: number, dateISO?: string, hhmm?: s
   return { event: true, starts_at: startsAt, block_id: Number(r.lastInsertRowid) };
 }
 
+
+/**
+ * The other half of "the calendar must match the plan" (owner report 2026-08-31: "why
+ * didn't this stuff automatically delete when I deleted the Google tasks?"). Deleting a
+ * Google TASK retires the local task (reconcile matrix -> 'deferred'), but its BLOCKS in
+ * already-built plans kept their calendar events — blocks, not tasks, own events, and
+ * nothing walked from a retired task back to its blocks. So "Physics Test" left Tasks and
+ * haunted the calendar. This sweep tombstones the events of every block whose task is
+ * deferred or dropped and removes the blocks; drainTombstones does the Google deletes
+ * through the machinery replans already use. Done work is untouched — a completed task's
+ * event is history, not clutter.
+ */
+export function pruneRetiredTaskBlocks(db: Db): { pruned: number } {
+  const calId = getSetting(db, "pos_calendar_id");
+  const rows = db.prepare(
+    `SELECT b.id, b.gcal_event_id FROM block b JOIN task t ON t.id = b.task_id
+      WHERE t.status IN ('deferred','dropped')`
+  ).all() as { id: number; gcal_event_id: string | null }[];
+  if (rows.length === 0) return { pruned: 0 };
+  const bury = db.prepare("INSERT INTO gcal_tombstone (event_id, calendar_id) VALUES (?, ?)");
+  const drop = db.prepare("DELETE FROM block WHERE id = ?");
+  for (const r of rows) {
+    if (r.gcal_event_id) bury.run(r.gcal_event_id, calId);
+    drop.run(r.id);
+  }
+  return { pruned: rows.length };
+}
 
 // ── the calendar must match the plan, not accumulate it ──────────────────────
 //

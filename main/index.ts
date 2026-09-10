@@ -15,6 +15,7 @@ import {
 } from "./ipc.ts";
 import { startWorkers, cleanupTentativeTasksV2, cleanupTentativeTasksV3 } from "./workers.ts";
 import { reconcileGoogleTasks } from "./gtasks-sync.ts";
+import { setAnchorsRefreshedNotifier } from "./gcal/sync.ts";
 import { purgeBulkContactsOnce } from "./crm/review.ts";
 import { loadDoctrine } from "./engine/doctrine.ts";
 import { closePanel } from "./webpanel.ts";
@@ -318,6 +319,11 @@ app.whenReady().then(() => {
   });
   startWorkers(db, secrets, llm(), (msg: string) => {
     win?.webContents.send("pos:notify", msg);
+  });
+  // When a background anchors refresh finds the served snapshot was stale (event added or
+  // deleted from Apple/Google on another device), ping the day view so it re-pulls that date.
+  setAnchorsRefreshedNotifier((dateISO: string) => {
+    if (win && !win.isDestroyed()) win.webContents.send("pos:day-changed", dateISO);
   });
   // Owner report 2026-08-06: "I just marked as completed several google tasks. This didn't
   // reflect on the app." The 15-minute tick is the durability net; this is the latency fix —

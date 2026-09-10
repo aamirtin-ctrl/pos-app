@@ -15,7 +15,7 @@ mac:
     - target: dir
       arch: [arm64]
   category: public.app-category.productivity
-  identity: null   # unsigned local build; sign before distributing beyond this machine
+  identity: "POS Dev"  # stable self-signed identity so TCC grants survive rebuilds (2026-08-24)
   # TCC reads these from Info.plist at the moment it prompts. Electron ships generic
   # defaults ("This app needs access to the microphone"); override them so the prompts
   # name POS and say what the data is used for. Missing NSCalendars/NSAppleEvents keys

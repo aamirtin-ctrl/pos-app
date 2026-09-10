@@ -20,7 +20,7 @@ type LlmHealth = {
 };
 // canWrite is false when the stored token predates the calendar-write scope widening:
 // it still refreshes, so nothing looks disconnected, but every push is refused with 403.
-type GcalState = { connected: boolean; hasCreds: boolean; canWrite: boolean };
+type GcalState = { connected: boolean; hasCreds: boolean; canWrite: boolean; tokenDead?: boolean };
 type AdherenceRow = { blockType: string; planned: number; completed: number; rate: number };
 
 // workers.ts is still landing — normalize whatever row shape sync.status() returns.
@@ -459,6 +459,12 @@ function Integrations() {
           onToggle={() => toggle("imessage")}
           refetchSync={refetchSync}
         />
+        <AppleNotesCard
+          row={syncRow("applenotes")}
+          open={openCard === "applenotes"}
+          onToggle={() => toggle("applenotes")}
+          refetchSync={refetchSync}
+        />
         <MsgPlansCard
           row={syncRow("msgplans")}
           open={openCard === "msgplans"}
@@ -850,6 +856,108 @@ function MorningCaptureCard({
   );
 }
 
+// Apple Notes people drop-box (main/connectors/applenotes.ts): one designated note the
+// owner dumps people-info into; POS files it and clears the note. Empty title = off.
+function AppleNotesCard({
+  row,
+  open,
+  onToggle,
+  refetchSync,
+}: {
+  row: SyncRow;
+  open: boolean;
+  onToggle: () => void;
+  refetchSync: () => void;
+}) {
+  const [title, setTitle] = useState("");
+  const [savedTitle, setSavedTitle] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      const r = await window.pos.settings.get("applenotes_capture_note");
+      if (r.ok && typeof r.data === "string") {
+        setTitle(r.data);
+        setSavedTitle(r.data);
+      }
+      setLoaded(true);
+    })();
+  }, []);
+
+  const save = async () => {
+    if (saving) return;
+    setSaving(true);
+    const v = title.trim();
+    const r = await window.pos.settings.set("applenotes_capture_note", v);
+    if (r.ok) setSavedTitle(v);
+    else setMsg(r.error ?? "could not save");
+    setSaving(false);
+  };
+
+  const scan = async () => {
+    setBusy(true);
+    setMsg(null);
+    const r = await window.pos.sync.run("applenotes");
+    const d = r.data as (RawSyncRow & { ingested?: unknown }) | undefined;
+    const err = r.ok ? str(d?.error) : (r.error ?? "scan failed");
+    if (err) setMsg(err);
+    else setMsg(num(d?.ingested) ? "Captured — it'll be filed within a few minutes." : "Nothing new in the note.");
+    setBusy(false);
+    refetchSync();
+  };
+
+  const status: IntegrationStatus = savedTitle.trim() ? "connected" : "needs-setup";
+
+  return (
+    <IntegrationCard
+      name="People notes"
+      description="An Apple Note you dump people-info into — POS files it and clears the note"
+      status={status}
+      open={open}
+      onToggle={onToggle}
+      steps={[
+        "Create a note in Apple Notes (any account that syncs to this Mac) and enter its exact title below.",
+        "Dump anything about people you've met — names, loose facts, numbers. No format needed.",
+        "POS reads it each sync once you've left it alone for 5 minutes, files the facts, and clears the note. Unsure matches show up in Review.",
+      ]}
+    >
+      <div className="flex gap-2 mb-2">
+        <input
+          type="text"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") save(); }}
+          disabled={!loaded}
+          placeholder="POS Inbox"
+          className="flex-1 border rounded-md px-2 py-1 text-sm bg-white"
+          style={{ borderColor: "var(--line)" }}
+        />
+        <button
+          onClick={save}
+          disabled={saving || !loaded || title.trim() === savedTitle.trim()}
+          className="px-3 py-1 rounded-md text-sm border bg-white disabled:opacity-40"
+          style={{ borderColor: "var(--line)" }}
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+      </div>
+      <button
+        onClick={scan}
+        disabled={busy || !savedTitle.trim()}
+        className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-40"
+        style={{ borderColor: "var(--line)" }}
+      >
+        {busy ? "Scanning…" : "Scan now"}
+      </button>
+      <LastRunLine row={row} />
+      {msg && <p className="text-xs mt-1" style={{ color: "var(--muted)" }}>{msg}</p>}
+    </IntegrationCard>
+  );
+}
+
 function GoogleCard({
   gcal,
   present,
@@ -902,6 +1010,40 @@ function GoogleCard({
       const locked = (r.data as { locked?: number } | undefined)?.locked ?? 0;
       setMsg(locked === 0 ? "Nothing moved." : `${locked} moved event${locked === 1 ? "" : "s"} locked in.`);
     } else setMsg(r.error ?? "reconcile failed");
+    setBusy(null);
+  };
+
+  // Two-step on purpose: the first click only counts, and the button becomes the confirm.
+  // Deleting Google rows is not undoable from here, and the count is the whole reassurance
+  // — 1200 scanned, 38 kept — so it has to be seen before anything goes.
+  const [purge, setPurge] = useState<PurgePreview | null>(null);
+
+  const previewPurge = async () => {
+    setBusy("purge");
+    setMsg(null);
+    setPurge(null);
+    const r = await window.pos.gtasks.purgePreview();
+    if (r.ok) {
+      const d = (r.data ?? {}) as PurgePreview;
+      setPurge(d);
+      setMsg(
+        d.deleted === 0
+          ? `Nothing to clean — all ${d.kept} POS task${d.kept === 1 ? "" : "s"} in Google are still live.`
+          : `${d.deleted} orphaned row${d.deleted === 1 ? "" : "s"} to delete, ${d.kept} kept. Click again to confirm.`
+      );
+    } else setMsg(r.error ?? "preview failed");
+    setBusy(null);
+  };
+
+  const applyPurge = async () => {
+    setBusy("purge");
+    setMsg(null);
+    const r = await window.pos.gtasks.purgeApply();
+    if (r.ok) {
+      const d = (r.data ?? {}) as PurgePreview;
+      setMsg(`Deleted ${d.deleted} orphaned Google task${d.deleted === 1 ? "" : "s"}. ${d.kept} kept.`);
+    } else setMsg(r.error ?? "purge failed");
+    setPurge(null);
     setBusy(null);
   };
 
@@ -967,12 +1109,12 @@ function GoogleCard({
               style={{ borderColor: "var(--danger)", background: "color-mix(in srgb, var(--danger) 8%, white)" }}
             >
               <p className="text-sm font-medium" style={{ color: "var(--danger)" }}>
-                Google needs re-authorizing
+                {gcal.tokenDead ? "Google sign-in expired" : "Google needs re-authorizing"}
               </p>
               <p className="text-xs mt-1" style={{ color: "var(--muted)" }}>
-                POS&rsquo;s calendar permissions changed — it now creates its own
-                &lsquo;POS — Planned&rsquo; calendar, which the older sign-in did not allow. Pushes are
-                refused until you reconnect. Nothing is lost; this just re-grants access.
+                {gcal.tokenDead
+                  ? "Google no longer accepts the saved sign-in, so task sync, calendar anchors, and automatic replanning are all paused. Nothing is lost — reconnect to resume."
+                  : "POS\u2019s calendar permissions changed — it now creates its own \u2018POS — Planned\u2019 calendar, which the older sign-in did not allow. Pushes are refused until you reconnect. Nothing is lost; this just re-grants access."}
               </p>
               <button
                 onClick={connect}
@@ -995,14 +1137,38 @@ function GoogleCard({
             On: accepting a plan sends it straight to Google, and anything that didn&rsquo;t get
             through is retried in the background every 15 minutes.
           </p>
-          <button
-            onClick={reconcile}
-            disabled={busy === "reconcile"}
-            className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-50"
-            style={{ borderColor: "var(--line)" }}
-          >
-            {busy === "reconcile" ? "Checking…" : "Re-check moved events"}
-          </button>
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              onClick={reconcile}
+              disabled={busy === "reconcile"}
+              className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-50"
+              style={{ borderColor: "var(--line)" }}
+            >
+              {busy === "reconcile" ? "Checking…" : "Re-check moved events"}
+            </button>
+            <button
+              onClick={purge && purge.deleted > 0 ? applyPurge : previewPurge}
+              disabled={busy === "purge"}
+              className="px-3 py-1.5 rounded-md text-sm border bg-white disabled:opacity-50"
+              style={
+                purge && purge.deleted > 0
+                  ? { borderColor: "var(--danger)", color: "var(--danger)" }
+                  : { borderColor: "var(--line)" }
+              }
+            >
+              {busy === "purge"
+                ? "Working…"
+                : purge && purge.deleted > 0
+                  ? `Delete ${purge.deleted} orphaned task${purge.deleted === 1 ? "" : "s"}`
+                  : "Clean up orphaned tasks"}
+            </button>
+          </div>
+          {purge && purge.deleted > 0 && purge.samples.length > 0 && (
+            <p className="text-[11px] mt-1.5 leading-relaxed" style={{ color: "var(--muted)" }}>
+              e.g. {purge.samples.slice(0, 4).join(" · ")}
+              {purge.deleted > 4 ? " …" : ""}
+            </p>
+          )}
         </>
       )}
       {msg && <p className="text-xs mt-2" style={{ color: "var(--muted)" }}>{msg}</p>}
@@ -1016,6 +1182,9 @@ function GoogleCard({
  */
 type AppleAvailability = { ok: boolean; error?: string; calendars?: number };
 type MirrorCounts = { created?: number; updated?: number; deleted?: number; skipped?: number; events?: number };
+
+/** gtasks.purgePreview / purgeApply result (main/gtasks-sync.PurgeResult). */
+type PurgePreview = { scanned: number; deleted: number; kept: number; samples: string[] };
 
 const EXCLUDED_KEY = "apple_calendars_excluded";
 const parseExcluded = (raw: unknown): string[] =>

@@ -282,6 +282,29 @@ describe("Google-only tasks", () => {
     expect(commitment(cid).status).toBe("done");
   });
 
+  // Regression (2026-08-10): commitmentToTask's tentative push wrote no pos:task marker,
+  // so whenever the local gtasks_id write did not land, the row came back through here
+  // looking owner-typed and was imported as a fresh task — every sync. One commitment
+  // reached 31 Google rows and 220 local "Tentative: …" duplicates. The marker is written
+  // at the source now; this guard covers the unmarked rows already in the account.
+  it("never imports POS's own 'Tentative:' rows, even with no pos:task marker", async () => {
+    const res = await reconcileGoogleTasks(
+      db,
+      connected,
+      fakeDeps([
+        [
+          { id: "t1", title: "Tentative: Set alarm for namaaz", status: "needsAction" },
+          { id: "t2", title: "tentative: lowercase counts too", status: "needsAction" },
+          { id: "ok1", title: "Buy cables", status: "needsAction" },
+        ],
+      ])
+    );
+    expect(res.pulled).toBe(1); // only the genuine phone-created row
+    expect(db.prepare("SELECT COUNT(*) c FROM task WHERE title LIKE 'Tentative:%' OR title LIKE 'tentative:%'").get())
+      .toEqual({ c: 0 });
+    expect((db.prepare("SELECT title FROM task").get() as any).title).toBe("Buy cables");
+  });
+
   it("does not re-import a Google task that a local done task still points at", async () => {
     addTask({ title: "Finished", gtasksId: "g1", status: "done" });
     const res = await reconcileGoogleTasks(db, connected, fakeDeps([[{ id: "g1", title: "Finished", status: "completed" }]]));
