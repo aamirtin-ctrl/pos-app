@@ -60,6 +60,22 @@ type GroupRow = { id: number; name: string; suppress_follow_ups: number };
 const TIER_LABELS = ["Inner", "Active", "Network", "Archive"] as const;
 const tierLabel = (t: number) => TIER_LABELS[t] ?? `Tier ${t}`;
 
+/**
+ * "34d over" was the whole misunderstanding (owner report 2026-09-10): it meant
+ * 34 days PAST the tier's cadence — Tejas at "34d over" had actually been quiet
+ * for 154 days (120-day tier + 34) — but it reads like recent contact, so the
+ * list looked like it was nagging about people texted a month ago. Show the
+ * fact itself instead: how long since the last touch.
+ */
+function sinceContactText(lastContactAt: string | null): string {
+  if (!lastContactAt) return "never contacted";
+  const days = Math.floor((Date.now() - new Date(lastContactAt.replace(" ", "T")).getTime()) / 86_400_000);
+  if (days < 60) return `${days}d since contact`;
+  if (days < 365) return `${Math.round(days / 30.44)}mo since contact`;
+  const y = days / 365.25;
+  return `${y >= 3 ? Math.round(y) : y.toFixed(1)}y since contact`;
+}
+
 function freshnessText(days: number | null): string {
   if (days == null) return "never contacted";
   if (days === 0) return "today";
@@ -422,8 +438,12 @@ export default function Home() {
                   >
                     {tierLabel(r.tier)}
                   </span>
-                  <span className="text-xs tabular-nums shrink-0" style={{ color: "var(--danger)" }}>
-                    {r.overdue_days}d over
+                  <span
+                    className="text-xs tabular-nums shrink-0"
+                    title={r.last_contact_at ? `Last contact ${r.last_contact_at.slice(0, 10)}` : undefined}
+                    style={{ color: "var(--danger)" }}
+                  >
+                    {sinceContactText(r.last_contact_at)}
                   </span>
                   {/* Snooze / dismiss (gap #22): hidden until the row is hovered or opened. */}
                   <span
