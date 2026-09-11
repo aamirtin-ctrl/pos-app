@@ -278,11 +278,16 @@ export function purgeNamelessNumbers(db: Db, days = 30): { deleted: number } {
 
 export function adoptSavedNames(db: Db, ab: NameIndex): { renamed: number } {
   if (ab.index.size === 0) return { renamed: 0 };
+  // apple_card_id IS NULL: a person whose card POS itself created must NOT be verified
+  // by finding that same card in AddressBook — the card carries "Inferred by POS" for
+  // exactly this reason. Their verification is a USER EDIT of the card (or its deletion
+  // mirroring back), both handled by the daily crm/apple-bios.ts sync.
   const people = db
     .prepare(
       `SELECT DISTINCT p.id, p.display_name, p.org FROM person p
        LEFT JOIN person_tag t ON t.person_id = p.id AND t.tag = 'unverified'
-       WHERE p.name_inferred_at IS NOT NULL OR t.tag IS NOT NULL`
+       WHERE (p.name_inferred_at IS NOT NULL OR t.tag IS NOT NULL)
+         AND p.apple_card_id IS NULL`
     )
     .all() as { id: number; display_name: string; org: string | null }[];
 

@@ -710,4 +710,46 @@ CREATE INDEX IF NOT EXISTS idx_interaction_extract_scan ON interaction(extracted
 ALTER TABLE person ADD COLUMN name_inferred_at TEXT;
 `,
   },
+  {
+    version: 22,
+    name: "interaction_read_at",
+    sql: `
+-- Owner ask 2026-09-11: the Messaging dot must mean UNREAD, mirrored from the sources
+-- (chat.db is_read / date_read for iMessage, the IMAP \\Seen flag for mail), not "nobody has
+-- replied yet" — which is what it used to show, so every conversation where the other
+-- person spoke last carried the dot forever. NULL = unread.
+--
+-- Backfill: outbound/mutual rows, rows from channels with no read source (LinkedIn, mail-file
+-- imports, notes, manual), and anything older than 30 days are read. Recent inbound mail and
+-- iMessage stay NULL until the first sync (which runs at launch) mirrors their true state from
+-- the source. The mirror only ever SETS read_at — nothing flips a row back to unread — so
+-- leaving these NULL is safe: whatever the source says is read becomes read within one tick.
+ALTER TABLE interaction ADD COLUMN read_at TEXT;
+UPDATE interaction
+   SET read_at = COALESCE(occurred_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+ WHERE direction IS NOT 'inbound'
+    OR channel NOT IN ('gmail', 'outlook', 'icloud', 'imessage')
+    OR occurred_at IS NULL
+    OR occurred_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-30 days');
+-- Partial index: the unread set is small and both mirror passes and listInbox filter on it.
+CREATE INDEX IF NOT EXISTS idx_interaction_unread ON interaction(channel, occurred_at) WHERE read_at IS NULL;
+`,
+  },
+  {
+    version: 23,
+    name: "person_apple_card_link",
+    sql: `
+-- Owner ask 2026-09-11 (second half): POS MAY create Apple cards for inferred people, with
+-- "Inferred by POS" as the note's last line so a card can never masquerade as user-made.
+-- Verification flips on USER EDIT of that card; deleting the card deletes the POS person.
+-- Both signals need an exact link, not a phone-number guess:
+--   apple_card_id          the Contacts record id POS created or matched (NULL = no card)
+--   apple_card_written_at  when POS last wrote that card. modificationDate later than this
+--                          (with slack) = the user touched it — the verification signal.
+--                          Refreshed on every POS write, so POS's own updates never read
+--                          as user edits.
+ALTER TABLE person ADD COLUMN apple_card_id TEXT;
+ALTER TABLE person ADD COLUMN apple_card_written_at TEXT;
+`,
+  },
 ];

@@ -1548,6 +1548,8 @@ export function startWorkers(
           if (b.updated > 0 || b.created > 0) {
             notify?.(`Apple Contacts: ${b.updated} bio${b.updated === 1 ? "" : "s"} updated, ${b.created} contact${b.created === 1 ? "" : "s"} created`);
           }
+          if (b.verifiedByEdit > 0) notify?.(`Verified ${b.verifiedByEdit} contact${b.verifiedByEdit === 1 ? "" : "s"} — you edited their card`);
+          if (b.deletedMirrored > 0) notify?.(`Removed ${b.deletedMirrored} contact${b.deletedMirrored === 1 ? "" : "s"} deleted from Apple Contacts`);
         }
       } catch (e) {
         console.warn(`workers: apple contact bio sync failed: ${(e as Error).message}`);

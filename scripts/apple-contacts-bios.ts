@@ -15,7 +15,7 @@ const APPLY = process.argv.includes("apply");
   const db = openDb(join(os.homedir(), "Library/Application Support/POS/pos.db"));
   const r = await syncAppleContactBios(db, { apply: APPLY });
   console.log(
-    `${APPLY ? "" : "(dry run) "}matched=${r.matched} notes-updated=${r.updated} contacts-created=${r.created} skipped-bare-numbers=${r.skippedUncreatable}`
+    `${APPLY ? "" : "(dry run) "}matched=${r.matched} notes-updated=${r.updated} contacts-created=${r.created} skipped-bare-numbers=${r.skippedUncreatable} verified-by-edit=${r.verifiedByEdit} deleted-mirrored=${r.deletedMirrored}`
   );
   if (r.ambiguous.length) console.log(`ambiguous names (several Apple cards, untouched): ${r.ambiguous.join(", ")}`);
 })().catch((e) => {
