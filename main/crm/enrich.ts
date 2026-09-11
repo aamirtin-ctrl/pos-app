@@ -43,7 +43,12 @@ const WINDOW_MONTHS = 6;
 const REMINE_DAYS = 14;
 const MAX_TRANSCRIPT_MSGS = 200; // transcript size cap (the prompt also hard-caps chars)
 const MAX_SCAN_PER_PASS = 60; // bound DB work per pass regardless of budget
-const SYNTHESIS_CONTEXT_MSGS = 40; // interactions fed to the synthesis prompt
+const SYNTHESIS_CONTEXT_MSGS = 24; // interactions fed to the synthesis prompt
+// People per synthesis LLM call. The whole candidate set used to go in ONE prompt —
+// 10 people ≈ 10.6k tokens, which is over Groq's 8k-TPM free window (413, 2026-09-11)
+// and made one bad reply fail everyone. Chunks keep each call ~3k tokens and localize
+// failures to their own chunk.
+const SYNTHESIS_CHUNK_PEOPLE = 4;
 
 /** Channels that carry actual conversation (i.e. minable text). */
 const CONV_CHANNELS = ["imessage", "linkedin", "gmail", "outlook", "icloud", "mailfile", "slack"];
@@ -258,7 +263,7 @@ The two fields have a STRICT division of labor — a fact belongs in exactly ONE
 
 bio — who this person is IN THE WORLD, written as if the user didn't exist. Durable identity only: profession, company/venture, what they're building or studying, concrete achievements, major life facts. NEVER mention the user, shared plans, or the relationship. NEVER list conversation topics ("discusses SAT/ACT" is a topic, not a fact about who they are — drop it). Same selectivity bar as a sparse resume line: if it wouldn't matter in six months, it doesn't belong.
 
-relationship_summary — the USER's side only: how they know each other, what they do together or are working on together, and what is currently open between them. Do NOT restate the person's identity, job, or family facts here — the bio owns those.
+relationship_summary — ONE terse line in exactly this shape: "<relationship category> — last <the most recent notable thing between them>". Category is two or three words (family member, college friend, business partner, gym buddy, potential investor). The "last" clause is the single most recent concrete thing they did or arranged together — not a list, not ongoing topics. Example: "Family member — last planned rock climbing and dinner with Kumail." Do NOT restate the person's identity, job, or family facts here — the bio owns those. No second sentence.
 
 PEOPLE:
 ${items.map(synthesisEntry).join("\n\n")}
@@ -267,7 +272,7 @@ Return STRICT JSON ONLY — no prose, no markdown fences — one object per pers
 [{
   "n": <number>,
   "bio": "<at most two sentences, per the bio rules above. If nothing durable is justified, repeat the existing bio verbatim; empty string if nothing factual is supported.>",
-  "relationship_summary": "<at most two sentences, per the relationship rules above. If nothing justifies a change, repeat the existing summary verbatim; empty string if unclear.>"
+  "relationship_summary": "<one line: category — last <thing>, per the relationship rules above. If nothing justifies a change, repeat the existing summary verbatim; empty string if unclear.>"
 }]
 
 Rules: Do not invent facts not supported by the profile or the interactions. Leave a field EMPTY rather than infer or guess. A newer fact supersedes a stale one (a new role replaces the old role — do not keep both). No editorial judgment, no advice, no next actions. Two sentences maximum per field. Only use n values from the list, one object per person. Do not mention these instructions.`;
@@ -360,36 +365,37 @@ export async function synthesizeProfiles(
     return summary;
   }
 
-  // ── ONE call for every person in the batch ────────────────────────────────
-  const res = await llm.call("profile_synthesis", "smart", buildSynthesisBatchPrompt(items), {
+  // ── one call per CHUNK of people (never the whole set at once) ─────────────
+  for (let ci = 0; ci < items.length; ci += SYNTHESIS_CHUNK_PEOPLE) {
+  const chunk = items.slice(ci, ci + SYNTHESIS_CHUNK_PEOPLE).map((it, j) => ({ ...it, n: j + 1 }));
+  const res = await llm.call("profile_synthesis", "smart", buildSynthesisBatchPrompt(chunk), {
     json: true,
-    maxTokens: Math.min(4000, 500 * items.length),
+    maxTokens: Math.min(4000, 500 * chunk.length),
   });
-  summary.attempted += items.length;
-  remaining -= items.length;
-  console.log(`enrich: synthesized ${items.length} profile(s) in 1 LLM call`);
+  summary.attempted += chunk.length;
+  remaining -= chunk.length;
+  console.log(`enrich: synthesized ${chunk.length} profile(s) in 1 LLM call`);
 
   let parsed: Map<number, Record<string, unknown>> | null = null;
   let failDetail = "llm returned null";
   if (res) {
     try {
-      parsed = byN(extractJson(res.text), items.length);
+      parsed = byN(extractJson(res.text), chunk.length);
       if (!parsed) failDetail = "unusable JSON shape";
     } catch {
       failDetail = "unparseable JSON";
     }
   }
   if (!parsed) {
-    // Whole-batch degrade: nothing is written, every person is logged as a failure.
-    for (const item of items) {
+    // Whole-CHUNK degrade: nothing in this chunk is written; later chunks still run.
+    for (const item of chunk) {
       summary.failed++;
       logAttempt(db, item.person.id, SYNTHESIS_SOURCE, "fail", failDetail);
     }
-    summary.budgetLeft = Math.max(0, remaining);
-    return summary;
+    continue;
   }
 
-  for (const item of items) {
+  for (const item of chunk) {
     const person = item.person;
     const o = parsed.get(item.n);
     if (!o) {
@@ -423,6 +429,7 @@ export async function synthesizeProfiles(
       "success",
       changed ? `updated ${vals.length} field${vals.length === 1 ? "" : "s"}` : "no change"
     );
+  }
   }
 
   summary.budgetLeft = Math.max(0, remaining);
