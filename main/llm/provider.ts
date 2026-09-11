@@ -76,7 +76,7 @@ export class LlmClient {
     }
     // A quota refusal seconds ago answers for this call too. Without this every feature in
     // the tick pays its own doomed round-trip to be told the same thing. See QUOTA_COOLDOWN_MS.
-    if (inQuotaCooldown(lastFailure(this.db))) {
+    if (inQuotaCooldown(lastFailure(this.db), new Date(), tier)) {
       console.warn(`llm: within quota cooldown; '${feature}' degrading to deterministic`);
       return null;
     }
@@ -93,22 +93,62 @@ export class LlmClient {
     } catch (e) {
       // Classified and remembered so the UI can say WHY the app went deterministic —
       // silence here is what let an exhausted quota look like a styling change.
-      const f = recordFailure(this.db, e);
+      const f = recordFailure(this.db, e, new Date(), tier);
       console.warn(`llm(${feature}/${model}) failed [${f.code}]: ${(e as Error).message}`);
+      // Smart tier starved → degrade to the fast model ONCE rather than to nothing.
+      // Free-tier pro quota is a few calls a day, and every smart-tier feature (bio
+      // mining, profile synthesis, notes glean) had NEVER completed because of it
+      // (found 2026-09-11: zero llm_call rows ever for all three). A flash answer is
+      // worse than a pro answer and far better than a feature that has not run in the
+      // app's lifetime. Quota only — a malformed request would fail identically on
+      // both models and deserves to surface.
+      if (f.code === "quota" && tier === "smart" && !inQuotaCooldown(lastFailure(this.db), new Date(), "fast")) {
+        const fastModel = MODELS[provider].fast;
+        try {
+          const res =
+            provider === "anthropic"
+              ? await this.callAnthropic(fastModel, prompt, opts)
+              : await this.callGemini(fastModel, prompt, opts);
+          recordCall(this.db, feature, res.model, res.inputTokens, res.outputTokens);
+          console.warn(`llm(${feature}) served by ${fastModel} — smart tier over quota`);
+          return res;
+        } catch (e2) {
+          const f2 = recordFailure(this.db, e2, new Date(), "fast");
+          console.warn(`llm(${feature}/${fastModel}) fallback failed [${f2.code}]: ${(e2 as Error).message}`);
+        }
+      }
       return null;
     }
   }
 
   private async callGemini(model: string, prompt: string, opts: LlmOptions): Promise<LlmResult> {
     const ai = new GoogleGenAI({ apiKey: this.secrets.get("GEMINI_API_KEY")! });
-    const response = await ai.models.generateContent({
-      model,
-      contents: opts.system ? `${opts.system}\n\n${prompt}` : prompt,
-      config: {
-        ...(opts.json ? { responseMimeType: "application/json" } : {}),
-        ...(opts.maxTokens ? { maxOutputTokens: opts.maxTokens } : {}),
-      },
-    });
+    // One retry on 503 UNAVAILABLE ("high demand… usually temporary" — Google's words).
+    // A single overload blip used to void a whole feature for the tick (2026-09-11: a
+    // verify batch no-op'd this way). Deliberately NOT retrying 429s — quota belongs to
+    // the cooldown/fallback machinery in call(), not a blind hammer here.
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model,
+        contents: opts.system ? `${opts.system}\n\n${prompt}` : prompt,
+        config: {
+          ...(opts.json ? { responseMimeType: "application/json" } : {}),
+          ...(opts.maxTokens ? { maxOutputTokens: opts.maxTokens } : {}),
+        },
+      });
+    } catch (e) {
+      if (!/UNAVAILABLE|"code"\s*:\s*503|high demand/i.test(String((e as Error).message ?? e))) throw e;
+      await new Promise((r) => setTimeout(r, 2_500));
+      response = await ai.models.generateContent({
+        model,
+        contents: opts.system ? `${opts.system}\n\n${prompt}` : prompt,
+        config: {
+          ...(opts.json ? { responseMimeType: "application/json" } : {}),
+          ...(opts.maxTokens ? { maxOutputTokens: opts.maxTokens } : {}),
+        },
+      });
+    }
     const u = response.usageMetadata;
     return {
       text: response.text ?? "",

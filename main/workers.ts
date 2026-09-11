@@ -282,8 +282,15 @@ export async function runSync(
         if (getSetting(db, AUTO_TASKS_ENABLED_KEY) === "1") {
           await autoTentativeTasks(db, secrets, beforeMax);
         }
-        // Batched Gemini gate: fresh commitments stay invisible until one call per
-        // batch confirms them real and rewrites the headline (owner ask 2026-08-24).
+      }
+      // Batched Gemini gate — OUTSIDE the extracted-anything block on purpose: a row left
+      // pending when its tick's verify call failed (quota cooldown, a flash 503) used to
+      // wait for the next tick that ALSO extracted something new, which in a quiet inbox
+      // is days (found 2026-09-11: row 191 stranded overnight). Pending rows now retry
+      // every tick; verifyPendingCommitments exits instantly when there are none.
+      if (llm) {
+        // Fresh commitments stay invisible until one call per batch confirms them real
+        // and rewrites the headline (owner ask 2026-08-24).
         const vr = await verifyPendingCommitments(db, llm);
         if (vr.verified + vr.dropped > 0) {
           console.log(`workers: commitment verify — ${vr.verified} confirmed, ${vr.dropped} rejected, ${vr.waiting} still pending`);
@@ -1557,7 +1564,13 @@ export function startWorkers(
             notify?.(`Named ${ni.named} unsaved sender${ni.named === 1 ? "" : "s"} from conversation`);
           }
           const e = await runEnrichment(db, llm);
-          setSetting(db, enrichDayKey(), new Date().toISOString());
+          // The day is only "done" when it did something or had nothing to do. A day
+          // where every call failed (all-smart-tier starvation, 2026-09-11) used to
+          // stamp the key anyway — one bad minute cost a whole day of enrichment.
+          // The enrichment_attempt ledger still caps daily spend, so retries stay bounded.
+          if (e.synthesized + e.mined > 0 || e.calls === 0) {
+            setSetting(db, enrichDayKey(), new Date().toISOString());
+          }
           if (e.synthesized > 0 || e.mined > 0) {
             notify?.(
               `Profiles: ${e.synthesized} synthesized, ${e.mined} bio${e.mined === 1 ? "" : "s"} enriched`

@@ -84,6 +84,11 @@ export interface LlmFailure {
   at: string;
   /** Truncated provider message, for the Settings card. Never contains the API key. */
   message: string;
+  /** Which tier failed. Gemini free-tier quotas are PER MODEL, so a starved smart tier
+   * must not gag fast-tier calls — tier-blind cooldown was silently stalling the whole
+   * pipeline (commitment verification included) every time the pro model 429'd
+   * (found 2026-09-11). Absent on failures recorded before this field existed. */
+  tier?: "fast" | "smart";
 }
 
 /** Setting key holding the last failure as JSON, so the state survives a restart. */
@@ -111,8 +116,15 @@ export const FAILURE_WINDOW_MS = 60 * 60 * 1000;
 export const QUOTA_COOLDOWN_MS = 60 * 1000;
 
 /** True when a quota refusal is recent enough that the next call would certainly fail too. */
-export function inQuotaCooldown(f: LlmFailure | null, now: Date = new Date()): boolean {
+export function inQuotaCooldown(
+  f: LlmFailure | null,
+  now: Date = new Date(),
+  tier?: "fast" | "smart"
+): boolean {
   if (!f || f.code !== "quota") return false;
+  // A recorded tier only answers for calls of the SAME tier (per-model quotas).
+  // A legacy failure without a tier keeps the old provider-wide behavior.
+  if (f.tier && tier && f.tier !== tier) return false;
   const at = Date.parse(f.at);
   return Number.isFinite(at) && now.getTime() - at < QUOTA_COOLDOWN_MS;
 }
@@ -196,11 +208,17 @@ export function lastFailure(db: Db): LlmFailure | null {
 }
 
 /** Classify and remember a failed call. Returns what was recorded. */
-export function recordFailure(db: Db, err: unknown, now: Date = new Date()): LlmFailure {
+export function recordFailure(
+  db: Db,
+  err: unknown,
+  now: Date = new Date(),
+  tier?: "fast" | "smart"
+): LlmFailure {
   const failure: LlmFailure = {
     code: classifyLlmError(err),
     at: now.toISOString(),
     message: String((err as Error)?.message ?? err ?? "").slice(0, 300),
+    ...(tier ? { tier } : {}),
   };
   failureState = failure;
   setSetting(db, LLM_LAST_FAILURE_KEY, JSON.stringify(failure));

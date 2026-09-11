@@ -551,7 +551,10 @@ export async function purgeOrphanedGoogleTasks(
 
   const liveTask = db.prepare("SELECT gtasks_id FROM task WHERE id = ?");
   const liveCommitment = db.prepare(
-    "SELECT 1 FROM commitment WHERE id = ? AND status IN ('open','scheduled')"
+    // pending_verify counts as alive: it is a freshly extracted row awaiting the Gemini
+    // gate, and deleting its Google marker here would make the pull reconcile read the
+    // tombstone as "the owner deleted this on his phone" and drop the commitment.
+    "SELECT 1 FROM commitment WHERE id = ? AND status IN ('open','scheduled','pending_verify')"
   );
   // Duplicate copies of LIVE items (owner report 2026-08-17: 3,298 rows in the POS list).
   // The blind commitment push re-inserted the same live commitments for days, and this purge

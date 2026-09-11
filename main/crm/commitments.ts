@@ -772,14 +772,27 @@ export async function verifyPendingCommitments(
   cap = 25
 ): Promise<{ verified: number; dropped: number; waiting: number; verifiedIds: number[] }> {
   const rows = db
-    .prepare("SELECT id, description, direction FROM commitment WHERE status = 'pending_verify' ORDER BY id LIMIT ?")
-    .all(cap) as { id: number; description: string; direction: string }[];
+    .prepare(
+      `SELECT c.id, c.description, c.direction,
+              substr(coalesce(i.body_summary, i.subject, ''), 1, 140) AS src
+         FROM commitment c LEFT JOIN interaction i ON i.id = c.source_interaction_id
+        WHERE c.status = 'pending_verify' ORDER BY c.id LIMIT ?`
+    )
+    .all(cap) as { id: number; description: string; direction: string; src: string }[];
   const waiting = (db.prepare("SELECT COUNT(*) AS n FROM commitment WHERE status = 'pending_verify'").get() as { n: number }).n;
   if (rows.length === 0) return { verified: 0, dropped: 0, waiting: 0, verifiedIds: [] };
   if (!llm) return { verified: 0, dropped: 0, waiting, verifiedIds: [] };
 
-  const listing = rows.map((r, i) => `${i + 1}. [${r.direction}] ${r.description.slice(0, 200)}`).join("\n");
-  const prompt = `These lines were auto-extracted from the owner's messages as possible commitments (things he owes someone or someone owes him). For EACH, decide if it is a REAL, actionable commitment — not chatter, not a question, not something already finished, not scheduling noise.
+  // The source snippet is the difference between judging a headline and judging a fact:
+  // without it, real-but-terse asks ("Add girls to group chat", extracted at 0.9) read as
+  // chatter and died (found 2026-09-11 auditing the gate's verdicts).
+  const listing = rows
+    .map((r, i) => {
+      const src = (r.src ?? "").replace(/\s+/g, " ").trim();
+      return `${i + 1}. [${r.direction}] ${r.description.slice(0, 200)}${src ? `\n   (from message: "${src}")` : ""}`;
+    })
+    .join("\n");
+  const prompt = `These lines were auto-extracted from the owner's messages as possible commitments (things he owes someone or someone owes him). Each may carry the source message it came from, as context. For EACH, decide if it is a REAL, actionable commitment — not chatter, not a question, not something already finished, not scheduling noise. A small or mundane task (an errand, adding someone to a chat, sending an address) IS real if someone is actually expected to do it.
 
 ${listing}
 
