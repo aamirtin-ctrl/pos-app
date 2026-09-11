@@ -249,6 +249,33 @@ export async function inferUnknownNames(
  * built; on a hit, adopt the saved name (and org, if ours is blank), clear the stamp and the
  * tag. display_name/org are the ONLY person fields touched — bio and everything else stay.
  */
+/**
+ * Owner ask 2026-09-11: a bare number that stays nameless for 30 days gets DELETED —
+ * "if there aren't any messages that allow that or if I haven't created an apple contact,
+ * POS should delete that unsaved number from the database". Nameless = display_name still
+ * a handle after every chance: inference found nothing and no saved contact matched.
+ * The delete cascades (aliases, interactions, tags, drafts); commitments/msg_plans keep
+ * their rows with person_id nulled. chat.db still holds the raw history, so a number that
+ * texts again later simply starts over as a fresh unverified person with a fresh 30 days.
+ */
+export function purgeNamelessNumbers(db: Db, days = 30): { deleted: number } {
+  const rows = db
+    .prepare(
+      `SELECT id, display_name FROM person
+       WHERE name_inferred_at IS NULL
+         AND created_at <= datetime('now', ?)`
+    )
+    .all(`-${days} days`) as { id: number; display_name: string }[];
+  const doomed = rows.filter((r) => isHandleLikeName(r.display_name));
+  const del = db.prepare("DELETE FROM person WHERE id = ?");
+  const tx = db.transaction((ids: number[]) => {
+    for (const id of ids) del.run(id);
+  });
+  tx(doomed.map((r) => r.id));
+  if (doomed.length > 0) console.log(`name-infer: purged ${doomed.length} nameless number(s) older than ${days}d`);
+  return { deleted: doomed.length };
+}
+
 export function adoptSavedNames(db: Db, ab: NameIndex): { renamed: number } {
   if (ab.index.size === 0) return { renamed: 0 };
   const people = db

@@ -15,6 +15,7 @@ import {
   isHandleLikeName,
   nameCorroborated,
   nameInferCandidates,
+  purgeNamelessNumbers,
 } from "../main/crm/name-infer.ts";
 
 let dir: string;
@@ -156,5 +157,32 @@ describe("adoptSavedNames", () => {
     const r = adoptSavedNames(db, index([["+12149120031", { name: "Somebody Else", company: null }]]));
     expect(r.renamed).toBe(0);
     expect((db.prepare("SELECT display_name d FROM person WHERE id = ?").get(p) as { d: string }).d).toBe("Luke Nettune");
+  });
+});
+
+describe("purgeNamelessNumbers", () => {
+  const backdate = (id: number, days: number) =>
+    db.prepare(`UPDATE person SET created_at = datetime('now', '-${days} days') WHERE id = ?`).run(id);
+
+  it("deletes a 30-day-old nameless number, messages and aliases with it", () => {
+    const p = addPerson("+14243751482", { unverified: true });
+    db.prepare("INSERT INTO alias (person_id, kind, value) VALUES (?, 'imessage_handle', '+14243751482')").run(p);
+    addMsgs(p, MSGS);
+    backdate(p, 31);
+    expect(purgeNamelessNumbers(db).deleted).toBe(1);
+    expect(db.prepare("SELECT COUNT(*) n FROM person WHERE id = ?").get(p)).toEqual({ n: 0 });
+    expect(db.prepare("SELECT COUNT(*) n FROM interaction WHERE person_id = ?").get(p)).toEqual({ n: 0 });
+    expect(db.prepare("SELECT COUNT(*) n FROM alias WHERE person_id = ?").get(p)).toEqual({ n: 0 });
+  });
+  it("spares the young, the inferred, and the named", () => {
+    const young = addPerson("+19999999990", { unverified: true });
+    backdate(young, 10);
+    const inferred = addPerson("Jake", { unverified: true, inferredAt: "2026-08-01" });
+    backdate(inferred, 90);
+    const named = addPerson("Luke Nettune");
+    backdate(named, 400);
+    expect(purgeNamelessNumbers(db).deleted).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) n FROM person").get()).toEqual({ n: 3 });
+    void young; void inferred; void named;
   });
 });

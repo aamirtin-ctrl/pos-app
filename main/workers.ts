@@ -23,7 +23,7 @@ import { verifyPendingCommitments,
 import { dateUndatedTasks } from "./crm/taskdates.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { runEnrichment } from "./crm/enrich.ts";
-import { inferUnknownNames } from "./crm/name-infer.ts";
+import { inferUnknownNames, purgeNamelessNumbers } from "./crm/name-infer.ts";
 import { resolveNamedDate } from "./context.ts";
 import { commitmentToTask, commitmentToEvent, closeGoogleTask, drainTombstones, pruneRetiredTaskBlocks, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
 import { hasCalendarWriteScope, isGoogleConnected, googleScopeStatus } from "./gcal/auth.ts";
@@ -1551,6 +1551,19 @@ export function startWorkers(
         }
       } catch (e) {
         console.warn(`workers: apple contact bio sync failed: ${(e as Error).message}`);
+      }
+
+      // Nameless-number expiry: once per day (owner ask 2026-09-11). A bare number that
+      // 30 days of inference and Contacts syncs never named is deleted outright.
+      try {
+        const purgeKey = `nameless_purge_day_${todayISO()}`;
+        if (!getSetting(db, purgeKey)) {
+          const pg = purgeNamelessNumbers(db);
+          setSetting(db, purgeKey, new Date().toISOString());
+          if (pg.deleted > 0) notify?.(`Expired ${pg.deleted} nameless number${pg.deleted === 1 ? "" : "s"} (30 days, no name)`);
+        }
+      } catch (e) {
+        console.warn(`workers: nameless purge failed: ${(e as Error).message}`);
       }
 
       // Profile synthesis + bio-mining: once per day. The daily LLM budget lives in

@@ -4,6 +4,7 @@
 import { todayISO } from "./dates.ts";
 import { ipcMain, shell, dialog, BrowserWindow } from "electron";
 import type { Db } from "./db/db.ts";
+import { isHandleLikeName } from "./crm/name-infer.ts";
 import { getSetting, setSetting, hasVec } from "./db/db.ts";
 import { SecretStore, SECRET_NAMES } from "./secrets.ts";
 import { LlmClient, llmHealth } from "./llm/provider.ts";
@@ -357,7 +358,13 @@ export function registerIpc(deps: IpcDeps) {
   h("people.list", (q?: string) => {
     const archived = hiddenPersonIds(db);
     const rows = listPeople(db, q);
-    return archived.size === 0 ? rows : rows.filter((p) => !archived.has(p.id));
+    // Owner ask 2026-09-11: a contact whose "name" is still a bare number/handle never
+    // appears in the Contacts list. The person row and their messages stay in the DB
+    // (Messaging still shows the conversation via inbox.list); they surface here only
+    // once a name attaches — saved contact or corroborated inference. After 30 nameless
+    // days the daily purge deletes them outright (crm/name-infer.ts).
+    const named = rows.filter((p) => !isHandleLikeName(p.display_name));
+    return archived.size === 0 ? named : named.filter((p) => !archived.has(p.id));
   });
   h("people.get", (id: number) => getPerson(db, id));
   h("people.patch", (id: number, fields: Record<string, unknown>) => patchPerson(db, id, fields));
