@@ -86,6 +86,8 @@ export class LlmClient {
         effectiveTier = "fast";
         console.warn(`llm: smart tier cooling down; '${feature}' served by fast tier`);
       } else {
+        const g = await this.tryGroqBackstop(feature, prompt, opts);
+        if (g) return g;
         console.warn(`llm: within quota cooldown; '${feature}' degrading to deterministic`);
         return null;
       }
@@ -127,6 +129,84 @@ export class LlmClient {
           console.warn(`llm(${feature}/${fastModel}) fallback failed [${f2.code}]: ${(e2 as Error).message}`);
         }
       }
+      if (f.code === "quota") {
+        const g = await this.tryGroqBackstop(feature, prompt, opts);
+        if (g) return g;
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Groq free-tier backstop (owner decision 2026-09-11: "groq solution as a backup").
+   * Only reached when Gemini's request-count quota is spent — the failure mode that
+   * froze the app for hours a day on the free tier. OpenAI-compatible endpoint; the
+   * browser User-Agent matters (Groq sits behind Cloudflare, which 403s bare clients —
+   * the same lesson the old watcher learned). llama-3.3-70b serves both tiers.
+   */
+  /** Groq model chosen from the LIVE list, once per process. Pinning is what killed
+   * gemini-2.5-pro and (an hour after wiring this) llama-3.3-70b — retired mid-2026.
+   * Preference order, else the first plausible chat model. */
+  private groqModel: string | null = null;
+  private async pickGroqModel(key: string, ua: string): Promise<string> {
+    if (this.groqModel) return this.groqModel;
+    const r = await fetch("https://api.groq.com/openai/v1/models", {
+      headers: { Authorization: `Bearer ${key}`, "User-Agent": ua },
+    });
+    if (!r.ok) throw new Error(`groq models ${r.status}`);
+    const ids = (((await r.json()) as any).data ?? []).map((m: any) => String(m.id));
+    const prefer = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b", "groq/compound-mini"];
+    this.groqModel =
+      prefer.find((p) => ids.includes(p)) ??
+      ids.find((id: string) => !/whisper|guard|orpheus|tts|embed/i.test(id)) ??
+      null;
+    if (!this.groqModel) throw new Error("groq: no usable chat model in /models");
+    return this.groqModel;
+  }
+
+  private async callGroq(prompt: string, opts: LlmOptions): Promise<LlmResult> {
+    const key = this.secrets.get("GROQ_API_KEY");
+    if (!key) throw new Error("no GROQ_API_KEY");
+    const ua =
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+    const model = await this.pickGroqModel(key, ua);
+    const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${key}`,
+        "User-Agent": ua,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          ...(opts.system ? [{ role: "system", content: opts.system }] : []),
+          { role: "user", content: prompt },
+        ],
+        ...(opts.json ? { response_format: { type: "json_object" } } : {}),
+        ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
+      }),
+    });
+    if (!r.ok) throw new Error(`groq ${r.status}: ${(await r.text()).slice(0, 200)}`);
+    const j = (await r.json()) as any;
+    return {
+      text: j.choices?.[0]?.message?.content ?? "",
+      model,
+      inputTokens: j.usage?.prompt_tokens ?? 0,
+      outputTokens: j.usage?.completion_tokens ?? 0,
+    };
+  }
+
+  /** Try the Groq backstop; null (never a throw) when it too is unavailable. */
+  private async tryGroqBackstop(feature: string, prompt: string, opts: LlmOptions): Promise<LlmResult | null> {
+    if (!this.secrets.get("GROQ_API_KEY")) return null;
+    try {
+      const res = await this.callGroq(prompt, opts);
+      recordCall(this.db, feature, res.model, res.inputTokens, res.outputTokens);
+      console.warn(`llm(${feature}) served by groq backstop — gemini quota spent`);
+      return res;
+    } catch (e) {
+      console.warn(`llm(${feature}) groq backstop failed: ${(e as Error).message}`);
       return null;
     }
   }
