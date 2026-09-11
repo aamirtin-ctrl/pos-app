@@ -263,7 +263,7 @@ The two fields have a STRICT division of labor — a fact belongs in exactly ONE
 
 bio — who this person is IN THE WORLD, written as if the user didn't exist. Durable identity only: profession, company/venture, what they're building or studying, concrete achievements, major life facts. NEVER mention the user, shared plans, or the relationship. NEVER list conversation topics ("discusses SAT/ACT" is a topic, not a fact about who they are — drop it). Same selectivity bar as a sparse resume line: if it wouldn't matter in six months, it doesn't belong.
 
-relationship_summary — ONE terse line in exactly this shape: "<relationship category> — last <the most recent notable thing between them>". Category is two or three words (family member, college friend, business partner, gym buddy, potential investor). The "last" clause is the single most recent concrete thing they did or arranged together — not a list, not ongoing topics. Example: "Family member — last planned rock climbing and dinner with Kumail." Do NOT restate the person's identity, job, or family facts here — the bio owns those. No second sentence.
+relationship_summary — exactly two short sentences, no dashes: "<Relationship category>. Last <the most recent concrete thing they did or arranged together>." Category is two or three words (Family member, College friend, Business partner, Potential investor). If the existing summary already names a category, KEEP that category — the owner may have corrected it by hand; never change it unless the messages plainly contradict it. The "Last" sentence is the single most recent concrete thing — include its salient detail when the messages state it (whose place, what event, which project). Example: "Family member. Last planned a sleepover at their house." Do NOT restate the person's identity, job, or family facts here — the bio owns those.
 
 PEOPLE:
 ${items.map(synthesisEntry).join("\n\n")}
@@ -272,7 +272,7 @@ Return STRICT JSON ONLY — no prose, no markdown fences — one object per pers
 [{
   "n": <number>,
   "bio": "<at most two sentences, per the bio rules above. If nothing durable is justified, repeat the existing bio verbatim; empty string if nothing factual is supported.>",
-  "relationship_summary": "<one line: category — last <thing>, per the relationship rules above. If nothing justifies a change, repeat the existing summary verbatim; empty string if unclear.>"
+  "relationship_summary": "<two short sentences: category, then Last <thing>, per the relationship rules above. If nothing justifies a change, repeat the existing summary verbatim; empty string if unclear.>"
 }]
 
 Rules: Do not invent facts not supported by the profile or the interactions. Leave a field EMPTY rather than infer or guess. A newer fact supersedes a stale one (a new role replaces the old role — do not keep both). No editorial judgment, no advice, no next actions. Two sentences maximum per field. Only use n values from the list, one object per person. Do not mention these instructions.`;
@@ -404,7 +404,18 @@ export async function synthesizeProfiles(
       continue;
     }
     const bio = typeof o.bio === "string" ? o.bio.trim() : "";
-    const rel = typeof o.relationship_summary === "string" ? o.relationship_summary.trim() : "";
+    let rel = typeof o.relationship_summary === "string" ? o.relationship_summary.trim() : "";
+    // Category stickiness (owner directive 2026-09-11: "change insiya to family member and
+    // make sure it sticks"): the first sentence of the summary is the relationship CATEGORY,
+    // and once one exists — model-written or hand-corrected — the model may not swap it.
+    // Deterministic guard, not prompt faith: splice the existing category onto the model's
+    // "Last …" sentence. (Legacy "Category — last x" summaries split on the dash.)
+    const existingRel = (person.relationship_summary ?? "").trim();
+    if (rel && existingRel) {
+      const cat = existingRel.split(/\s+—\s+/)[0].split(/\.\s/)[0].replace(/\.$/, "").trim();
+      const rest = rel.replace(/^[^.—]+(?:\.\s*|\s+—\s+)/, "").trim();
+      if (cat && rest) rel = `${cat}. ${rest.replace(/^last\b/, "Last")}${rest.endsWith(".") ? "" : "."}`;
+    }
 
     // Fail-safe: empty output never overwrites a good record.
     const sets: string[] = [];
