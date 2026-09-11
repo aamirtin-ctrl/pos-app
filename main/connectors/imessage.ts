@@ -315,7 +315,12 @@ function windowFloorNs(months: number | null): bigint {
 export function isAutomatedImessageHandle(rawHandle: string, emailNorm: string | null): boolean {
   if (emailNorm) return bulkAddressReason(emailNorm) !== null;
   const digits = rawHandle.replace(/\D/g, "");
-  return digits.length > 0 && digits.length <= 6;
+  if (digits.length > 0 && digits.length <= 6) return true;
+  // US toll-free numbers are businesses' outbound SMS lines, not people — "+18779263717"
+  // was sitting in the CRM as a contact (2026-09-11 audit). Same creation-only gate:
+  // an already-known contact on such a number keeps its history.
+  const nanp = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+  return nanp.length === 10 && /^(800|833|844|855|866|877|888)/.test(nanp);
 }
 
 /**
