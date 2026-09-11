@@ -19,9 +19,6 @@ interface SqliteDatabase {
   prepare(sql: string): SqliteStatement;
   close(): void;
 }
-interface SqliteModule {
-  DatabaseSync: new (path: string, options?: { readOnly?: boolean }) => SqliteDatabase;
-}
 const req: ReturnType<typeof createRequire> =
   typeof require === "function" ? require : createRequire(import.meta.url);
 
@@ -67,13 +64,17 @@ export interface NameIndex {
 }
 
 /** Build a phone/email → name index from all AddressBook DBs. Never throws. */
-export function buildNameIndex(): NameIndex {
+export function buildNameIndex(paths: string[] = dbPaths()): NameIndex {
   const index = new Map<string, NameHit>();
   let sources = 0;
 
-  let DatabaseSync: SqliteModule["DatabaseSync"];
+  // better-sqlite3's export IS the Database class — hold it directly and `new` it below.
+  // (The previous arrow-function wrapper here was NOT a constructor: every `new
+  // DatabaseSync(...)` threw, the per-source catch ate it, and this returned an empty
+  // index for months — which is how every saved contact still texted as a bare number.)
+  let Db3: new (path: string, opts: { readonly: boolean; fileMustExist: boolean }) => SqliteDatabase;
   try {
-    DatabaseSync = ((pth: string, o?: { readOnly?: boolean }) => new (req("better-sqlite3"))(pth, { readonly: !!o?.readOnly, fileMustExist: true })) as unknown as SqliteModule["DatabaseSync"];
+    Db3 = req("better-sqlite3");
   } catch {
     return { index, people: 0, sources: 0 };
   }
@@ -82,13 +83,13 @@ export function buildNameIndex(): NameIndex {
     if (key && !index.has(key)) index.set(key, hit);
   };
 
-  for (const src of dbPaths()) {
+  for (const src of paths) {
     const workDir = mkdtempSync(join(tmpdir(), "pos-ab-"));
     const work = join(workDir, "ab.abcddb");
     try {
       copyFileSync(src, work);
       for (const ext of ["-wal", "-shm"]) if (existsSync(src + ext)) copyFileSync(src + ext, work + ext);
-      const db = new DatabaseSync(work, { readOnly: true });
+      const db = new Db3(work, { readonly: true, fileMustExist: true });
       db.exec("PRAGMA query_only = ON;");
       sources++;
 
@@ -121,12 +122,19 @@ export function buildNameIndex(): NameIndex {
       }
 
       db.close();
-    } catch {
-      /* skip this source — best-effort */
+    } catch (e) {
+      // Best-effort per SOURCE, but never silent: a swallowed error here is exactly how
+      // the arrow-constructor bug hid for months. One line per failed source.
+      console.warn(`addressbook: skipped ${src}: ${(e as Error).message}`);
     } finally {
       rmSync(workDir, { recursive: true, force: true });
     }
   }
 
+  if (paths.length > 0 && sources === 0) {
+    console.warn(
+      `addressbook: ALL ${paths.length} Contacts DB(s) unreadable — saved names unavailable this run`
+    );
+  }
   return { index, people: index.size, sources };
 }
