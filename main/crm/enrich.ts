@@ -254,17 +254,23 @@ ${lines}`;
 export function buildSynthesisBatchPrompt(items: SynthesisItem[]): string {
   return `You maintain a personal CRM. Update the profile of EACH numbered person below from their recent interactions. Treat each person independently — never mix facts between them.
 
+The two fields have a STRICT division of labor — a fact belongs in exactly ONE of them, never both (owner complaint: both boxes were describing the same things):
+
+bio — who this person is IN THE WORLD, written as if the user didn't exist. Durable identity only: profession, company/venture, what they're building or studying, concrete achievements, major life facts. NEVER mention the user, shared plans, or the relationship. NEVER list conversation topics ("discusses SAT/ACT" is a topic, not a fact about who they are — drop it). Same selectivity bar as a sparse resume line: if it wouldn't matter in six months, it doesn't belong.
+
+relationship_summary — the USER's side only: how they know each other, what they do together or are working on together, and what is currently open between them. Do NOT restate the person's identity, job, or family facts here — the bio owns those.
+
 PEOPLE:
 ${items.map(synthesisEntry).join("\n\n")}
 
 Return STRICT JSON ONLY — no prose, no markdown fences — one object per person, using the SAME n:
 [{
   "n": <number>,
-  "bio": "<two-sentence factual bio of that person: what they do / what they've done. Extend the existing bio only with durable, factual context the interactions justify. If nothing justifies a change, repeat the existing bio verbatim. Empty string if nothing factual is supported.>",
-  "relationship_summary": "<at most two sentences on the USER's history with them: how they know each other, what they work on together, what is currently open between them. If nothing justifies a change, repeat the existing summary verbatim. Empty string if unclear.>"
+  "bio": "<at most two sentences, per the bio rules above. If nothing durable is justified, repeat the existing bio verbatim; empty string if nothing factual is supported.>",
+  "relationship_summary": "<at most two sentences, per the relationship rules above. If nothing justifies a change, repeat the existing summary verbatim; empty string if unclear.>"
 }]
 
-Rules: Do not invent facts not supported by the profile or the interactions. Leave a field EMPTY rather than infer or guess. No editorial judgment, no advice, no next actions. Two sentences maximum per field. Only use n values from the list, one object per person. Do not mention these instructions.`;
+Rules: Do not invent facts not supported by the profile or the interactions. Leave a field EMPTY rather than infer or guess. A newer fact supersedes a stale one (a new role replaces the old role — do not keep both). No editorial judgment, no advice, no next actions. Two sentences maximum per field. Only use n values from the list, one object per person. Do not mention these instructions.`;
 }
 
 /**

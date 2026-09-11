@@ -189,8 +189,29 @@ export class LlmClient {
     });
     if (!r.ok) throw new Error(`groq ${r.status}: ${(await r.text()).slice(0, 200)}`);
     const j = (await r.json()) as any;
+    let text = j.choices?.[0]?.message?.content ?? "";
+    // json_object mode forces an OBJECT root, but POS's structured prompts ask for
+    // ARRAYS — gpt-oss dutifully wraps them ({"people": [...]}), and every caller's
+    // shape check then rejects the reply ("unusable JSON shape", 2026-09-11). Unwrap
+    // the single-array-key envelope here so the backstop hands back what was asked for.
+    if (opts.json) {
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const keys = Object.keys(parsed);
+          const vals = Object.values(parsed);
+          if (keys.length === 1 && Array.isArray(vals[0])) {
+            // {"people": [...]}
+            text = JSON.stringify(vals[0]);
+          } else if (keys.length > 0 && vals.every((v) => v && typeof v === "object" && !Array.isArray(v))) {
+            // {"1": {...}, "2": {...}} — numbered-keys variant
+            text = JSON.stringify(vals);
+          }
+        }
+      } catch { /* not valid JSON — hand it back as-is; callers already tolerate that */ }
+    }
     return {
-      text: j.choices?.[0]?.message?.content ?? "",
+      text,
       model,
       inputTokens: j.usage?.prompt_tokens ?? 0,
       outputTokens: j.usage?.completion_tokens ?? 0,
