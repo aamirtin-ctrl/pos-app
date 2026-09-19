@@ -167,6 +167,8 @@ export default function Home() {
   const [rankError, setRankError] = useState<string | null>(null);
 
   const [reconnect, setReconnect] = useState<ReconnectRow[]>([]);
+  // An IPC failure must read as a failure, not as an empty ("Nobody is overdue") list.
+  const [reconnectError, setReconnectError] = useState<string | null>(null);
   const [commitments, setCommitments] = useState<CommitmentRow[]>([]);
   const [peopleById, setPeopleById] = useState<Map<number, PersonLite>>(new Map());
   const [groupFilter, setGroupFilter] = useState<string | null>(null);
@@ -214,6 +216,7 @@ export default function Home() {
       window.pos.groups.list(),
     ]);
     setReconnect(rec.ok ? (rec.data as ReconnectRow[]) : []);
+    setReconnectError(rec.ok ? null : (rec.error ?? "unknown error"));
     setCommitments(com.ok ? (com.data as CommitmentRow[]) : []);
     if (ppl.ok) {
       setPeopleById(new Map((ppl.data as PersonLite[]).map((p) => [p.id, p])));
@@ -365,7 +368,14 @@ export default function Home() {
             muted={mutedSet}
             onToggleMute={toggleMute}
           />
-          {reconnectShown.length === 0 ? (
+          {reconnectError ? (
+            <p className="text-sm py-2" style={{ color: "var(--danger)" }}>
+              Couldn't load the reconnect list ({reconnectError}).{" "}
+              <button type="button" className="underline" onClick={() => void refetch()}>
+                Retry
+              </button>
+            </p>
+          ) : reconnectShown.length === 0 ? (
             <p className="text-sm py-2" style={{ color: "var(--muted)" }}>
               {activeFilter && mutedSet.has(activeFilter)
                 ? "Follow-ups are muted for this group."

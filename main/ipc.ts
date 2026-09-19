@@ -44,8 +44,7 @@ import { resolveNoteChunk, dismissNoteChunk } from "./crm/notesglean.ts";
 import { exportContactsCsv, defaultCsvFilename } from "./crm/export.ts";
 import { rank } from "./crm/ranking.ts";
 import {
-  reconnectDue,
-  refreshNextTouch,
+  loadReconnect,
   dismissPerson,
   undismissPerson,
   type DismissKind,
@@ -379,10 +378,9 @@ export function registerIpc(deps: IpcDeps) {
   // Quick-delete from Messaging/Contacts: hard-removes the person; aliases,
   // interactions and drafts cascade, commitments/tasks keep rows with refs nulled.
   h("people.delete", (id: number) => ({ deleted: deletePerson(db, id) }));
-  h("people.reconnect", () => {
-    refreshNextTouch(db);
-    return reconnectDue(db);
-  });
+  // loadReconnect: a failed re-stamp (SQLITE_BUSY from an external script) must never
+  // come back as an empty list — the read still serves the last good stamps.
+  h("people.reconnect", () => loadReconnect(db));
   // Reconnect row → Snooze 30d / 90d / Dismiss (#22). snoozeDays omitted = indefinite;
   // reconnectDue already skips anyone with a live dismissal of this kind.
   h("people.dismissReconnect", (personId: number, snoozeDays?: number | null, kind?: DismissKind) =>

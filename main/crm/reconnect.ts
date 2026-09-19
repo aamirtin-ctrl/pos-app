@@ -152,6 +152,23 @@ export function reconnectDue(
   }));
 }
 
+/**
+ * What the Reconnect panel loads. refreshNextTouch WRITES (it re-stamps every person's
+ * next_touch_due_at) and a write can fail transiently — SQLITE_BUSY while another process
+ * (a CLI sync, a one-off script) holds the file. On 2026-09-19 such a failure reached the
+ * owner as an empty panel captioned "Nobody is overdue. Nice." The stamps are recomputed on
+ * every call anyway, so a failed refresh is worth a warning, never a blank list: the read
+ * still runs against the last good stamps.
+ */
+export function loadReconnect(db: Db, now: Date = new Date()): ReconnectRow[] {
+  try {
+    refreshNextTouch(db);
+  } catch (e) {
+    console.warn(`reconnect: refreshNextTouch failed, serving last stamps: ${(e as Error).message}`);
+  }
+  return reconnectDue(db, now);
+}
+
 // ── Dismiss / snooze (gap #22; PersonalCRM2 app/api/dismiss + lib/dashboard addDismissal) ──
 
 export type DismissKind = "stale" | "followup" | "linkedin" | "datagap";
