@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { openDb, type Db } from "../../main/db/db.ts";
+import { openDb, setSetting, type Db } from "../../main/db/db.ts";
 import { MINED_MARKER } from "../../main/crm/enrich.ts";
 import {
   parseGleanChunks,
@@ -53,6 +53,11 @@ describe("parseGleanChunks", () => {
     expect(parseGleanChunks("nope")).toEqual([]);
     expect(parseGleanChunks([null, 5, {}, { facts: [] }, { name: "X", facts: [1, "ok", ""] }])).toEqual([
       { name: "X", facts: ["ok"] },
+    ]);
+  });
+  it("a lone chunk object (one-person note through Groq's object-only JSON mode) is one chunk", () => {
+    expect(parseGleanChunks({ name: "Max Meyer", facts: ["Making a Stanford calendar"] })).toEqual([
+      { name: "Max Meyer", facts: ["Making a Stanford calendar"] },
     ]);
   });
 });
@@ -133,6 +138,15 @@ const addPhoneAlias = (personId: number, value: string) =>
   db.prepare("INSERT INTO alias (person_id, kind, value) VALUES (?, 'phone', ?)").run(personId, value);
 
 describe("gleanNotes", () => {
+  it("the note's own title line never reaches the model (it became a junk review card)", async () => {
+    setSetting(db, "applenotes_capture_note", "POS Contacts");
+    let sent = "";
+    const llm = {
+      call: async (_f: string, _t: string, prompt: string) => ((sent = prompt), { text: "[]" }),
+    } as unknown as LlmClient;
+    await gleanNotes(db, llm, "POS Contacts\n\n\nMax Meyer\nMaking Stanford calendar");
+    expect(sent.endsWith("NOTE:\nMax Meyer\nMaking Stanford calendar")).toBe(true);
+  });
   it("phone in the note attaches by identifier even when names differ", async () => {
     const id = addPerson("Abdeali Diwan");
     addPhoneAlias(id, "+15551112222");

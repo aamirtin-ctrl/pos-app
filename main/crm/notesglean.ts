@@ -35,6 +35,10 @@ const CHUNK_STRING_FIELDS = ["name", "org", "role", "phone", "email"] as const;
 
 /** Validate the model's JSON array. Junk-tolerant: bad elements drop, never throw. */
 export function parseGleanChunks(raw: unknown): NoteChunk[] {
+  // A one-person note through Groq's object-only JSON mode comes back as the bare chunk
+  // ({"name": ..., "facts": [...]}) — reading that as "not an array" silently lost the
+  // whole note (Max Meyer, 2026-09-21: chunks 0, note already wiped).
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) raw = [raw];
   if (!Array.isArray(raw)) return [];
   const out: NoteChunk[] = [];
   for (const item of raw) {
@@ -174,7 +178,13 @@ export interface GleanResult {
  * the model is unavailable so the capture drain keeps the row and retries.
  */
 export async function gleanNotes(db: Db, llm: LlmClient, rawText: string): Promise<GleanResult> {
-  const res = await llm.call("notesglean", "smart", GLEAN_PROMPT_HEAD + rawText.slice(0, 8000), {
+  // The capture keeps the note's title line (it is the raw record); the model must not see
+  // it — "POS Contacts" alone came back as a nameless fact and sat in the review queue.
+  const title = (getSetting(db, "applenotes_capture_note") ?? "").trim();
+  const lines = rawText.replace(/\r\n/g, "\n").split("\n");
+  if (title && lines[0]?.trim() === title) lines.shift();
+  const body = lines.join("\n").trim();
+  const res = await llm.call("notesglean", "smart", GLEAN_PROMPT_HEAD + body.slice(0, 8000), {
     json: true,
     maxTokens: 2048,
   });

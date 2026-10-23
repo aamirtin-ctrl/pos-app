@@ -68,4 +68,8 @@ describe("wasUserEdited", () => {
     expect(wasUserEdited(null, "2026-09-11T10:00:00Z")).toBe(false);
     expect(wasUserEdited("2026-09-11T10:10:00Z", null)).toBe(false); // no baseline → never assume
   });
+  it("reads the stored stamp (SQLite datetime('now'), zone-less) as UTC, not local time", () => {
+    expect(wasUserEdited("2026-09-11T10:10:00Z", "2026-09-11 10:00:00")).toBe(true);
+    expect(wasUserEdited("2026-09-11T10:00:30Z", "2026-09-11 10:00:00")).toBe(false);
+  });
 });

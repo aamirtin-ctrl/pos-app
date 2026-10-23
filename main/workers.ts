@@ -23,6 +23,7 @@ import { verifyPendingCommitments,
 import { dateUndatedTasks } from "./crm/taskdates.ts";
 import { refreshNextTouch } from "./crm/reconnect.ts";
 import { runEnrichment } from "./crm/enrich.ts";
+import { runWebEnrichment } from "./crm/webenrich.ts";
 import { inferUnknownNames, purgeNamelessNumbers } from "./crm/name-infer.ts";
 import { resolveNamedDate } from "./context.ts";
 import { commitmentToTask, commitmentToEvent, closeGoogleTask, drainTombstones, pruneRetiredTaskBlocks, readAnchors, type GcalPushDeps } from "./gcal/sync.ts";
@@ -83,6 +84,9 @@ export type ConnectorFn = (deps: ConnectorDeps, extra?: string) => Promise<SyncR
 
 /** Cap on interactions fed to commitment extraction per run (newest first). */
 const EXTRACT_CAP = 50;
+/** SQLite-format time of the last Apple Contacts mirror — compared against processed_at. */
+const APPLE_BIOS_LAST_KEY = "apple_bios_last_run";
+const sqlNow = (db: Db): string => (db.prepare("SELECT datetime('now') t").get() as { t: string }).t;
 
 /**
  * How far back extraction may look, as a SQLite datetime modifier. Nothing older than this
@@ -1536,25 +1540,6 @@ export function startWorkers(
         const d = await distillWeek(db, llm);
         if (d.inserted > 0) notify?.(`Worklog: distilled ${d.inserted} entr${d.inserted === 1 ? "y" : "ies"} for the week`);
       }
-      // Mirror bios into Apple Contacts: once per day (owner ask 2026-08-20). Updates the
-      // managed ―― POS ―― note block on matched cards and creates cards for named people the
-      // Mac doesn't know — which also teaches iMessage their names. First run prompts for
-      // Contacts automation permission.
-      try {
-        const bioKey = `apple_bios_day_${todayISO()}`;
-        if (!getSetting(db, bioKey)) {
-          const b = await syncAppleContactBios(db, { apply: true });
-          setSetting(db, bioKey, new Date().toISOString());
-          if (b.updated > 0 || b.created > 0) {
-            notify?.(`Apple Contacts: ${b.updated} bio${b.updated === 1 ? "" : "s"} updated, ${b.created} contact${b.created === 1 ? "" : "s"} created`);
-          }
-          if (b.verifiedByEdit > 0) notify?.(`Verified ${b.verifiedByEdit} contact${b.verifiedByEdit === 1 ? "" : "s"} — you edited their card`);
-          if (b.deletedMirrored > 0) notify?.(`Removed ${b.deletedMirrored} contact${b.deletedMirrored === 1 ? "" : "s"} deleted from Apple Contacts`);
-        }
-      } catch (e) {
-        console.warn(`workers: apple contact bio sync failed: ${(e as Error).message}`);
-      }
-
       // Nameless-number expiry: once per day (owner ask 2026-09-11). A bare number that
       // 30 days of inference and Contacts syncs never named is deleted outright.
       try {
@@ -1578,6 +1563,13 @@ export function startWorkers(
           if (ni.named > 0) {
             notify?.(`Named ${ni.named} unsaved sender${ni.named === 1 ? "" : "s"} from conversation`);
           }
+          // Outbound lookups (PDL / web search) BEFORE synthesis, so today's synthesis
+          // prompt already sees the org and role they filled.
+          const w = !llmHealth(db, secrets).ok ? null : await runWebEnrichment(db, llm, {
+            pdl: secrets.get("PDL_API_KEY"),
+            firecrawl: secrets.get("FIRECRAWL_API_KEY"),
+          });
+          if (w && w.enriched > 0) notify?.(`Looked up ${w.enriched} contact${w.enriched === 1 ? "" : "s"} on the web`);
           const e = await runEnrichment(db, llm);
           // The day is only "done" when it did something or had nothing to do. A day
           // where every call failed (all-smart-tier starvation, 2026-09-11) used to
@@ -1594,6 +1586,35 @@ export function startWorkers(
         }
       } catch (e) {
         console.warn(`workers: enrichment failed: ${(e as Error).message}`);
+      }
+      // Mirror bios into Apple Contacts (owner ask 2026-08-20). Runs AFTER enrichment so
+      // today's lookups and synthesis reach the cards today, and again as soon as an Apple
+      // Notes entry has been filed onto someone (owner ask 2026-10-20: notes should show up
+      // in Contacts on their own) — not once a day before anything new existed. Updates the
+      // managed ―― POS ―― note block on matched cards and creates cards for named people
+      // the Mac doesn't know — which also teaches iMessage their names.
+      try {
+        const bioKey = `apple_bios_day_${todayISO()}`;
+        const last = getSetting(db, APPLE_BIOS_LAST_KEY);
+        const newNotes = last
+          ? (db
+              .prepare(
+                "SELECT COUNT(*) n FROM capture_inbox WHERE source = 'apple_notes' AND processed_at > ?"
+              )
+              .get(last) as { n: number }).n
+          : 0;
+        if (!getSetting(db, bioKey) || newNotes > 0) {
+          const b = await syncAppleContactBios(db, { apply: true });
+          setSetting(db, bioKey, new Date().toISOString());
+          setSetting(db, APPLE_BIOS_LAST_KEY, sqlNow(db));
+          if (b.updated > 0 || b.created > 0) {
+            notify?.(`Apple Contacts: ${b.updated} bio${b.updated === 1 ? "" : "s"} updated, ${b.created} contact${b.created === 1 ? "" : "s"} created`);
+          }
+          if (b.verifiedByEdit > 0) notify?.(`Verified ${b.verifiedByEdit} contact${b.verifiedByEdit === 1 ? "" : "s"} — you edited their card`);
+          if (b.deletedMirrored > 0) notify?.(`Removed ${b.deletedMirrored} contact${b.deletedMirrored === 1 ? "" : "s"} deleted from Apple Contacts`);
+        }
+      } catch (e) {
+        console.warn(`workers: apple contact bio sync failed: ${(e as Error).message}`);
       }
     } catch (e) {
       console.warn(`workers: scheduled sync failed: ${(e as Error).message}`);

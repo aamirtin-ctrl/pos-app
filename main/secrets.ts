@@ -61,6 +61,9 @@ export class SecretStore {
         return null;
       }
     }
+    // A plaintext entry (seeded from outside the app) is upgraded to Keychain-backed
+    // encryption the first time the packaged app reads it.
+    if (safeStorage?.isEncryptionAvailable()) this.set(name, e.v);
     return e.v;
   }
 
@@ -87,5 +90,8 @@ export const SECRET_NAMES = [
   "GOOGLE_OAUTH_CLIENT_SECRET",
   "GOOGLE_OAUTH_TOKENS",
   "NOTION_TOKEN",
+  "GROQ_API_KEY",
+  "PDL_API_KEY",
+  "FIRECRAWL_API_KEY",
 ] as const;
 export type SecretName = (typeof SECRET_NAMES)[number];

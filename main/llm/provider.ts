@@ -43,7 +43,10 @@ const MODELS: Record<"anthropic" | "gemini", Record<LlmTier, string>> = {
   // (315 'llm returned null' rows in the enrichment ledger). The alias tracks whatever
   // pro-class model Google currently serves, so a model retirement can never silently
   // kill half the app again.
-  gemini: { fast: "gemini-2.5-flash", smart: "gemini-pro-latest" },
+  // 2026-10-20: gemini-pro-latest now resolves to gemini-3.1-pro, whose FREE-tier limit is
+  // 0 — every smart call 429'd before falling back. flash-latest tracks the current Flash
+  // (stronger than the pinned 2.5) and draws on its own quota bucket, not fast's.
+  gemini: { fast: "gemini-2.5-flash", smart: "gemini-flash-latest" },
 };
 
 export type LlmProvider = "anthropic" | "gemini";
@@ -74,67 +77,47 @@ export class LlmClient {
       console.warn(`llm: monthly ceiling reached; '${feature}' degrading to deterministic`);
       return null;
     }
-    // A quota refusal seconds ago answers for this call too. Without this every feature in
-    // the tick pays its own doomed round-trip to be told the same thing. See QUOTA_COOLDOWN_MS.
-    let effectiveTier = tier;
-    if (inQuotaCooldown(lastFailure(this.db), new Date(), tier)) {
-      // Smart in cooldown → serve from fast NOW rather than nothing: the second smart
-      // feature in a tick (bio mining, after synthesis burned the pro quota) was being
-      // refused outright while flash sat idle (2026-09-11 E2E). Fast in cooldown stays
-      // a hard no — there is nothing cheaper to fall to.
-      if (tier === "smart" && !inQuotaCooldown(lastFailure(this.db), new Date(), "fast")) {
-        effectiveTier = "fast";
-        console.warn(`llm: smart tier cooling down; '${feature}' served by fast tier`);
-      } else {
-        const g = await this.tryGroqBackstop(feature, prompt, opts);
-        if (g) return g;
-        console.warn(`llm: within quota cooldown; '${feature}' degrading to deterministic`);
-        return null;
+    // Order: the asked-for tier, then the OTHER tier — a separate model with its own quota
+    // bucket — then the Groq backstop. Smart→fast came first (2026-09-11: free-tier pro
+    // quota is a few calls a day); fast→smart closed the mirror gap (2026-10-20: a month's
+    // catch-up spent 2.5-flash's daily quota and every fast feature fell straight to Groq,
+    // whose per-minute cap then cut them off, while flash-latest sat unused). A tier that
+    // was refused seconds ago is skipped (QUOTA_COOLDOWN_MS) rather than re-asked.
+    const order = ([tier, tier === "smart" ? "fast" : "smart"] as LlmTier[]).filter(
+      (t) => !inQuotaCooldown(lastFailure(this.db), new Date(), t)
+    );
+    for (const t of order) {
+      const model = MODELS[provider][t];
+      try {
+        const res =
+          provider === "anthropic"
+            ? await this.callAnthropic(model, prompt, opts)
+            : await this.callGemini(model, prompt, opts);
+        recordCall(this.db, feature, res.model, res.inputTokens, res.outputTokens);
+        // A call that lands — on any tier — is the proof the app can be served, so health
+        // (which gates the capture drain and enrichment) must not keep reporting an outage.
+        clearFailure(this.db);
+        if (t !== tier) console.warn(`llm(${feature}) served by ${model} — ${tier} tier over quota`);
+        return res;
+      } catch (e) {
+        // Classified and remembered so the UI can say WHY the app went deterministic —
+        // silence here is what let an exhausted quota look like a styling change.
+        const f = recordFailure(this.db, e, new Date(), t);
+        console.warn(`llm(${feature}/${model}) failed [${f.code}]: ${(e as Error).message}`);
+        // Quota or a transient overload (503 "high demand" from flash-latest, 2026-10-20)
+        // moves on; a malformed request would fail identically on every model and
+        // deserves to surface.
+        const overloaded = /\b503\b|UNAVAILABLE|overloaded|high demand/i.test(String((e as Error)?.message ?? ""));
+        if (f.code !== "quota" && !overloaded) return null;
       }
     }
-    const model = MODELS[provider][effectiveTier];
-    try {
-      const res =
-        provider === "anthropic"
-          ? await this.callAnthropic(model, prompt, opts)
-          : await this.callGemini(model, prompt, opts);
-      recordCall(this.db, feature, res.model, res.inputTokens, res.outputTokens);
-      // A call that lands is the only proof the provider is healthy again.
+    const g = await this.tryGroqBackstop(feature, prompt, opts);
+    if (g) {
       clearFailure(this.db);
-      return res;
-    } catch (e) {
-      // Classified and remembered so the UI can say WHY the app went deterministic —
-      // silence here is what let an exhausted quota look like a styling change.
-      const f = recordFailure(this.db, e, new Date(), effectiveTier);
-      console.warn(`llm(${feature}/${model}) failed [${f.code}]: ${(e as Error).message}`);
-      // Smart tier starved → degrade to the fast model ONCE rather than to nothing.
-      // Free-tier pro quota is a few calls a day, and every smart-tier feature (bio
-      // mining, profile synthesis, notes glean) had NEVER completed because of it
-      // (found 2026-09-11: zero llm_call rows ever for all three). A flash answer is
-      // worse than a pro answer and far better than a feature that has not run in the
-      // app's lifetime. Quota only — a malformed request would fail identically on
-      // both models and deserves to surface.
-      if (f.code === "quota" && effectiveTier === "smart" && !inQuotaCooldown(lastFailure(this.db), new Date(), "fast")) {
-        const fastModel = MODELS[provider].fast;
-        try {
-          const res =
-            provider === "anthropic"
-              ? await this.callAnthropic(fastModel, prompt, opts)
-              : await this.callGemini(fastModel, prompt, opts);
-          recordCall(this.db, feature, res.model, res.inputTokens, res.outputTokens);
-          console.warn(`llm(${feature}) served by ${fastModel} — smart tier over quota`);
-          return res;
-        } catch (e2) {
-          const f2 = recordFailure(this.db, e2, new Date(), "fast");
-          console.warn(`llm(${feature}/${fastModel}) fallback failed [${f2.code}]: ${(e2 as Error).message}`);
-        }
-      }
-      if (f.code === "quota") {
-        const g = await this.tryGroqBackstop(feature, prompt, opts);
-        if (g) return g;
-      }
-      return null;
+      return g;
     }
+    if (order.length === 0) console.warn(`llm: within quota cooldown; '${feature}' degrading to deterministic`);
+    return null;
   }
 
   /**

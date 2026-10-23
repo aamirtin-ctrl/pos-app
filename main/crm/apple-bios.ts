@@ -74,7 +74,9 @@ export function isCreatableName(name: string): boolean {
 export function wasUserEdited(modifiedISO: string | null, writtenISO: string | null): boolean {
   if (!modifiedISO || !writtenISO) return false;
   const m = Date.parse(modifiedISO);
-  const w = Date.parse(writtenISO);
+  // POS stamps with SQLite datetime('now'): UTC with no zone, which Date.parse would read
+  // as LOCAL time — 7h off in Pacific, hiding every edit made within 7h of a write.
+  const w = Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(writtenISO) ? writtenISO : `${writtenISO.replace(" ", "T")}Z`);
   if (Number.isNaN(m) || Number.isNaN(w)) return false;
   return m > w + EDIT_SLACK_MS;
 }
@@ -93,7 +95,7 @@ const DUMP = `
   const P = app.people;
   const out = { ids: P.id(), names: P.name(), notes: P.note(),
                 phones: P.phones.value(), emails: P.emails.value(),
-                modified: P.modificationDate() };
+                modified: P.modificationDate(), orgs: P.organization(), titles: P.jobTitle() };
   return JSON.stringify(out);
 })()`;
 
@@ -105,14 +107,19 @@ function run(argv) {
   const app = Application("Contacts");
   let updated = 0;
   for (const u of payload.updates) {
-    const hits = app.people.whose({ id: u.id })();
-    if (hits.length !== 1) continue;
-    hits[0].note = u.note;
+    // byId, not whose({id}): whose scans every card (~130ms each vs ~8ms), and a month's
+    // backlog of updates pushed one apply past the 2-minute AppleEvent timeout.
+    const c = app.people.byId(u.id);
+    try { c.id(); } catch (e) { continue; } // card vanished since the dump
+    c.note = u.note;
+    if (u.org) c.organization = u.org;
+    if (u.title) c.jobTitle = u.title;
     updated++;
   }
   const made = [];
   for (const c of payload.creates) {
-    const p = app.Person({ firstName: c.first, lastName: c.last, note: c.note });
+    const p = app.Person({ firstName: c.first, lastName: c.last, note: c.note,
+                           organization: c.org || "", jobTitle: c.title || "" });
     app.people.push(p);
     for (const ph of c.phones) p.phones.push(app.Phone({ label: "mobile", value: ph }));
     for (const em of c.emails) p.emails.push(app.Email({ label: "home", value: em }));
@@ -167,6 +174,7 @@ export async function syncAppleContactBios(
   const dump = JSON.parse(await jxa(DUMP)) as {
     ids: string[]; names: string[]; notes: (string | null)[];
     phones: string[][]; emails: string[][]; modified: (string | null)[];
+    orgs: (string | null)[]; titles: (string | null)[];
   };
 
   const byPhone = new Map<string, number>();
@@ -251,16 +259,19 @@ export async function syncAppleContactBios(
   //    even before any bio is mined, so iMessage learns the name and the flag is visible).
   const people = db
     .prepare(
-      `SELECT id, display_name, bio, name_inferred_at, apple_card_id FROM person
+      `SELECT id, display_name, bio, org, role, name_inferred_at, apple_card_id FROM person
        WHERE (bio IS NOT NULL AND bio != '') OR name_inferred_at IS NOT NULL`
     )
     .all() as {
-    id: number; display_name: string; bio: string | null;
+    id: number; display_name: string; bio: string | null; org: string | null; role: string | null;
     name_inferred_at: string | null; apple_card_id: string | null;
   }[];
 
-  const updates: { id: string; personId: number; note: string }[] = [];
-  const creates: { personId: number; first: string; last: string; note: string; phones: string[]; emails: string[] }[] = [];
+  const updates: { id: string; personId: number; note: string; org?: string; title?: string }[] = [];
+  const creates: {
+    personId: number; first: string; last: string; note: string; org?: string; title?: string;
+    phones: string[]; emails: string[];
+  }[] = [];
 
   for (const p of people) {
     const al = aliasByPerson.get(p.id) ?? { phones: [], emails: [] };
@@ -277,8 +288,11 @@ export async function syncAppleContactBios(
       }
       if (!body) continue; // nothing to write into the block
       const next = spliceBlock(dump.notes[idx], body);
-      if ((dump.notes[idx] ?? "").trim() !== next.trim()) {
-        updates.push({ id: dump.ids[idx], personId: p.id, note: next });
+      // Company / job title: fill-only — a card field he typed is never overwritten.
+      const org = !(dump.orgs?.[idx] ?? "").trim() && p.org ? p.org : undefined;
+      const title = !(dump.titles?.[idx] ?? "").trim() && p.role ? p.role : undefined;
+      if ((dump.notes[idx] ?? "").trim() !== next.trim() || org || title) {
+        updates.push({ id: dump.ids[idx], personId: p.id, note: next, org, title });
       }
       continue;
     }
@@ -292,7 +306,10 @@ export async function syncAppleContactBios(
       continue;
     }
     const { first, last } = splitName(p.display_name);
-    creates.push({ personId: p.id, first, last, note: spliceBlock(null, body), phones: al.phones, emails: al.emails });
+    creates.push({
+      personId: p.id, first, last, note: spliceBlock(null, body),
+      org: p.org ?? undefined, title: p.role ?? undefined, phones: al.phones, emails: al.emails,
+    });
   }
 
   if (opts.apply && (updates.length || creates.length)) {
