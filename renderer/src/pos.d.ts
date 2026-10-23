@@ -99,6 +99,7 @@ declare global {
       people: {
         list: Call; get: Call; patch: Call; patchWithExtract: Call; merge: Call; delete: Call;
         reconnect: Call; dismissReconnect: Call; undismissReconnect: Call; exportCsv: Call;
+        reconnectDraft: Call; openReconnectDraft: Call; markReachedOut: Call;
       };
       query: { rank: Call };
       review: {

@@ -1,9 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { openReview, useReviewCount, REVIEW_CHANGED_EVENT } from "./ReviewModal.tsx";
+import ReconnectComposer from "./ReconnectComposer.tsx";
+import BulkReconnect from "./BulkReconnect.tsx";
 
 // Relationships dashboard: query hero → ranked results, plus the two standing
 // panels — Reconnect (cadence debt) and Commitments (extracted obligations).
-// Every card routes to Contact Detail; nothing is composed or sent from here.
+// Every card routes to Contact Detail. Reconnect rows can draft a note and open it
+// prefilled in Messages / Mail / LinkedIn (ReconnectComposer) — nothing is sent from here.
 
 type RankPerson = {
   id: number;
@@ -176,6 +179,8 @@ export default function Home() {
   // appear in `reconnect`, so the chips have to come from the group list itself.
   const [mutedGroups, setMutedGroups] = useState<string[]>([]);
   const [snoozeFor, setSnoozeFor] = useState<number | null>(null);
+  const [composeFor, setComposeFor] = useState<number | null>(null);
+  const [bulkFor, setBulkFor] = useState<number[] | null>(null);
 
   // Multi-select over the reconnect list (owner ask 2026-09-10): cmd-click toggles,
   // shift-click extends from the last clicked row, Esc clears. Plain clicks still
@@ -393,6 +398,14 @@ export default function Home() {
                   <span style={{ color: "var(--muted)" }}>{selected.size} selected</span>
                   <span className="flex-1" />
                   <button
+                    onClick={() => { setBulkFor(Array.from(selected)); setSelected(new Set()); }}
+                    title="Draft a catch-up note for everyone selected, then open each prefilled"
+                    className="px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
+                    style={{ borderColor: "var(--line)", color: "var(--accent)" }}
+                  >
+                    Reach out to all
+                  </button>
+                  <button
                     onClick={() => bulkSnooze(30)}
                     className="px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
                     style={{ borderColor: "var(--line)", color: "var(--accent)" }}
@@ -494,6 +507,15 @@ export default function Home() {
                         </button>
                       </>
                     ) : (
+                      <>
+                      <button
+                        onClick={() => setComposeFor(r.id)}
+                        title="Draft a catch-up note and open it in Messages, Mail or LinkedIn"
+                        className="text-[11px] px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
+                        style={{ borderColor: "var(--line)", color: "var(--accent)" }}
+                      >
+                        Reach out
+                      </button>
                       <button
                         onClick={() => setSnoozeFor(r.id)}
                         className="text-[11px] px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
@@ -501,11 +523,22 @@ export default function Home() {
                       >
                         Snooze
                       </button>
+                      </>
                     )}
                   </span>
                 </div>
               ))}
             </div>
+          )}
+          {composeFor !== null && (
+            <ReconnectComposer
+              personId={composeFor}
+              onClose={() => setComposeFor(null)}
+              onSent={() => { setComposeFor(null); void refetch(); }}
+            />
+          )}
+          {bulkFor && (
+            <BulkReconnect personIds={bulkFor} onClose={() => { setBulkFor(null); void refetch(); }} onDone={() => {}} />
           )}
           {hover && (
             <div

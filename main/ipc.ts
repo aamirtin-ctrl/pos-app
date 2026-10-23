@@ -2,7 +2,7 @@
 // Channel names mirror the window.pos.* surface in renderer/src/pos.d.ts.
 
 import { todayISO } from "./dates.ts";
-import { ipcMain, shell, dialog, BrowserWindow } from "electron";
+import { ipcMain, shell, dialog, clipboard, BrowserWindow } from "electron";
 import type { Db } from "./db/db.ts";
 import { isHandleLikeName } from "./crm/name-infer.ts";
 import { getSetting, setSetting, hasVec } from "./db/db.ts";
@@ -49,6 +49,13 @@ import {
   undismissPerson,
   type DismissKind,
 } from "./crm/reconnect.ts";
+import {
+  draftReconnect,
+  markReachedOut,
+  openUrlFor,
+  reconnectTargets,
+  type ReconnectChannel,
+} from "./crm/reconnect-draft.ts";
 import { listCommitments, confirmCommitment } from "./crm/commitments.ts";
 import {
   journal,
@@ -383,6 +390,31 @@ export function registerIpc(deps: IpcDeps) {
   // loadReconnect: a failed re-stamp (SQLITE_BUSY from an external script) must never
   // come back as an empty list — the read still serves the last good stamps.
   h("people.reconnect", () => loadReconnect(db));
+  // Reconnect drafts (owner ask 2026-10-23): write the note, open it prefilled, never send.
+  h("people.reconnectDraft", (personId: number, channel?: ReconnectChannel) =>
+    draftReconnect(db, deps.llm(), personId, channel)
+  );
+  // The URL is built here from the handles on file — the renderer only sends the text.
+  // The text also goes on the clipboard: LinkedIn has no prefill URL, and if Messages
+  // drops the body the message is one paste away.
+  h(
+    "people.openReconnectDraft",
+    async (args: { personId: number; channel: ReconnectChannel; body: string; subject?: string | null }) => {
+      const p = db.prepare("SELECT display_name FROM person WHERE id = ?").get(args.personId) as
+        | { display_name: string }
+        | undefined;
+      if (!p) throw new Error("person not found");
+      const body = String(args.body ?? "").trim();
+      if (!body) throw new Error("empty message");
+      const url = openUrlFor(args.channel, reconnectTargets(db, args.personId), p.display_name, body, args.subject ?? null);
+      clipboard.writeText(args.channel === "email" && args.subject ? `${args.subject}\n\n${body}` : body);
+      await shell.openExternal(url);
+      return { opened: true, copied: true };
+    }
+  );
+  h("people.markReachedOut", (personId: number, channel: ReconnectChannel, body: string) =>
+    markReachedOut(db, personId, channel, String(body ?? ""))
+  );
   // Reconnect row → Snooze 30d / 90d / Dismiss (#22). snoozeDays omitted = indefinite;
   // reconnectDue already skips anyone with a live dismissal of this kind.
   h("people.dismissReconnect", (personId: number, snoozeDays?: number | null, kind?: DismissKind) =>
