@@ -229,6 +229,7 @@ function openChatDbCopy(srcPath: string): ChatDbSession {
 const CHAT_MESSAGE_SQL = `
   SELECT m.ROWID AS rowid, m.guid AS guid, m.text AS text, m.attributedBody AS body,
          m.date AS date, m.is_from_me AS is_from_me,
+         m.is_read AS is_read, m.date_read AS date_read,
          CASE WHEN pc.n = 1 THEN ch1.id ELSE sh.id END AS counterpart,
          CASE WHEN pc.n > 1 THEN c.guid END AS chat_guid,
          CASE WHEN pc.n > 1 THEN NULLIF(c.display_name, '') END AS chat_name,
@@ -260,6 +261,9 @@ interface ChatMessageRow {
   body: Uint8Array | null;
   date: bigint;
   is_from_me: bigint;
+  /** chat.db read receipt for INBOUND rows (is_from_me = 0); date_read is 0 when unread. */
+  is_read: bigint;
+  date_read: bigint;
   counterpart: string | null;
   chat_guid: string | null;
   chat_name: string | null;
@@ -291,6 +295,17 @@ function scanMessages(chat: SqliteDatabase, sinceRowid: bigint, dateFloor: bigin
       return "";
     },
   };
+}
+
+/**
+ * read_at for a chat.db row (owner ask 2026-09-11: the dot means unread). Outbound is read
+ * by definition; inbound follows is_read, stamped with date_read (falling back to the
+ * message date for the rare read row with no receipt time); unread → null.
+ */
+function chatRowReadAt(row: ChatMessageRow, occurredAt: string): string | null {
+  if (row.is_from_me === 1n) return occurredAt;
+  if (row.is_read !== 1n) return null;
+  return appleDateToDate(row.date_read > 0n ? row.date_read : row.date).toISOString();
 }
 
 /** Apple-epoch ns floor for a lookback window in months; 0n when unbounded. */
@@ -467,15 +482,17 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
       }
 
       const rawText = row.text ?? decodeAttributedBody(row.body);
+      const occurredAt = appleDateToDate(row.date).toISOString();
       const inserted = insertInteraction(db, {
         personId,
         channel: "imessage",
         direction: row.is_from_me === 1n ? "outbound" : "inbound",
-        occurredAt: appleDateToDate(row.date).toISOString(),
+        occurredAt,
         bodySummary: rawText ? rawText.replace(/\s+/g, " ").trim().slice(0, SNIPPET_MAX) || null : null,
         externalId: row.guid ?? `imessage:${row.rowid}`,
         threadExternalId: row.chat_guid ?? undefined,
         subject: row.chat_name ?? undefined,
+        readAt: chatRowReadAt(row, occurredAt),
       });
       if (inserted) report.ingested++;
       else {
@@ -483,6 +500,10 @@ export async function syncImessage(deps: ConnectorDeps, opts: ImessageOptions = 
         report.skippedDuplicates++;
       }
     }
+
+    // Read receipts for rows ingested on an EARLIER tick (he read them on his phone since).
+    const mirrored = mirrorImessageReadState(db, session.chat);
+    if (mirrored.marked > 0) console.log(`imessage: mirrored ${mirrored.marked} read receipt(s)`);
   } catch (e) {
     return { ...report, error: isFdaError(e) ? "full_disk_access" : (e as Error).message };
   } finally {
@@ -544,6 +565,65 @@ export interface BackfillReport {
  * lookback window that has no alias in POS. Read-only against chat.db, idempotent
  * against pos.db, and it never deletes or renames an existing person.
  */
+// ── read-state mirror ────────────────────────────────────────────────────────
+
+const READ_CURSOR = "imessage_read";
+const READ_RECEIPTS_SQL = `
+  SELECT m.ROWID AS rowid, m.guid AS guid, m.date_read AS date_read
+  FROM message m
+  WHERE m.is_from_me = 0 AND m.is_read = 1 AND m.date_read > ?
+  ORDER BY m.date_read ASC
+`;
+// A message read on another device can arrive with is_read = 1 and NO date_read. Those
+// never cross the receipt cursor above, so they get a second, window-bounded look — only
+// while POS still holds unread iMessage rows in that window, so the steady state is free.
+const READ_NO_RECEIPT_SQL = `
+  SELECT m.ROWID AS rowid, m.guid AS guid
+  FROM message m
+  WHERE m.is_from_me = 0 AND m.is_read = 1 AND m.date_read = 0 AND m.date > ?
+`;
+
+/**
+ * Unread → read only (owner ask 2026-09-11). Scans chat.db for inbound messages read since
+ * the last pass (cursor `imessage_read` = newest date_read seen, Apple-epoch ns; first run
+ * looks back one month) and stamps read_at on the matching POS rows that are still unread.
+ * A row POS already marked read — he opened it in Messaging — keeps its own timestamp.
+ * Nothing here ever clears read_at. Exported for tests; syncImessage calls it every tick.
+ */
+export function mirrorImessageReadState(db: Db, chat: SqliteDatabase): { marked: number } {
+  const cursor = getCursor(db, READ_CURSOR);
+  const floor = cursor && /^\d+$/.test(cursor) ? BigInt(cursor) : windowFloorNs(1);
+  const stmt = chat.prepare(READ_RECEIPTS_SQL);
+  stmt.safeIntegers(true);
+  const rows = stmt.all(floor) as { rowid: bigint; guid: string | null; date_read: bigint }[];
+  const upd = db.prepare(
+    `UPDATE interaction SET read_at = ? WHERE channel = 'imessage' AND read_at IS NULL AND external_id IN (?, ?)`
+  );
+  let marked = 0;
+  let max = floor;
+  for (const r of rows) {
+    marked += upd.run(appleDateToDate(r.date_read).toISOString(), r.guid ?? "", `imessage:${r.rowid}`).changes;
+    if (r.date_read > max) max = r.date_read;
+  }
+  if (max > floor) setCursor(db, READ_CURSOR, max.toString());
+
+  const windowStart = new Date(Date.now() - 30 * 86_400_000).toISOString();
+  const pending = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM interaction WHERE channel = 'imessage' AND read_at IS NULL AND occurred_at >= ?"
+    )
+    .get(windowStart) as { n: number };
+  if (pending.n > 0) {
+    const noReceipt = chat.prepare(READ_NO_RECEIPT_SQL);
+    noReceipt.safeIntegers(true);
+    const now = new Date().toISOString();
+    for (const r of noReceipt.all(windowFloorNs(1)) as { rowid: bigint; guid: string | null }[]) {
+      marked += upd.run(now, r.guid ?? "", `imessage:${r.rowid}`).changes;
+    }
+  }
+  return { marked };
+}
+
 export async function backfillMissingSenders(
   db: Db,
   chatDbPath: string = DEFAULT_CHAT_DB,
@@ -600,15 +680,17 @@ export async function backfillMissingSenders(
       if (personId === null) continue; // only the people this backfill invented
 
       const rawText = row.text ?? decodeAttributedBody(row.body);
+      const occurredAt = appleDateToDate(row.date).toISOString();
       const inserted = insertInteraction(db, {
         personId,
         channel: "imessage",
         direction: row.is_from_me === 1n ? "outbound" : "inbound",
-        occurredAt: appleDateToDate(row.date).toISOString(),
+        occurredAt,
         bodySummary: rawText ? rawText.replace(/\s+/g, " ").trim().slice(0, SNIPPET_MAX) || null : null,
         externalId: row.guid ?? `imessage:${row.rowid}`,
         threadExternalId: row.chat_guid ?? undefined,
         subject: row.chat_name ?? undefined,
+        readAt: chatRowReadAt(row, occurredAt),
       });
       if (inserted) report.ingested++;
     }

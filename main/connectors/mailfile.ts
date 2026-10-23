@@ -184,6 +184,7 @@ export async function syncMailfile(deps: ConnectorDeps, filePath: string): Promi
         subject: row.subject,
         bodySummary: row.snippet,
         externalId: row.externalId,
+        readAt: row.occurredAt ? row.occurredAt.toISOString() : new Date().toISOString(), // historical import
       });
       if (inserted) report.ingested++;
       else report.skipped++; // already ingested — idempotent

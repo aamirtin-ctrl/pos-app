@@ -12,7 +12,9 @@
 // Incremental: sync_state(source=`gmail:<user>`).cursor = last internalDate ISO; the
 // pre-multi-account cursor under source 'gmail' migrates on first per-account run.
 // First run backfills 12 months. Idempotent via UNIQUE(channel, external_id) on the
-// Message-ID. Stores a ≤200-char snippet only — never the full body.
+// Message-ID. Stores the ≤200-char snippet AND (owner decision 2026-09-11, mail only) the
+// plain-text body in body_raw so Messaging can show an email as an email; read state comes
+// from the \Seen flag at ingest and from mail-read.ts's mirror pass on every tick.
 
 import crypto from "node:crypto";
 import { ImapFlow } from "imapflow";
@@ -33,6 +35,7 @@ import {
   isBulkMail,
 } from "./common.ts";
 import { parseForwardedHeaders, stripFwdPrefix } from "./email-utils.ts";
+import { mailBodyText, mirrorMailReadState } from "./mail-read.ts";
 
 const FIRST_RUN_MONTHS = 12;
 
@@ -201,6 +204,37 @@ function firstAddr(field: AddressObject | AddressObject[] | undefined): EmailAdd
 }
 
 /**
+ * An ImapFlow client for one account — constructed, NOT connected. Throws the typed
+ * errors 'not-configured' (no user / no password) and 'oauth_expired' (OAuth grant
+ * gone). Shared by the sync and by mail-read.ts's \Seen write-back so both authenticate
+ * the same way.
+ *
+ * XOAUTH2 (Workspace accounts without app passwords): a fresh access token per
+ * connection, refreshed via the stored grant.
+ */
+export async function openImapClient(secrets: SecretStore, account: MailAccount): Promise<ImapFlow> {
+  const user = account.user.trim();
+  const isOAuth = account.auth === "oauth";
+  if (!user || (!isOAuth && !account.password)) throw new Error("not-configured");
+  let imapAuth: { user: string; pass?: string; accessToken?: string };
+  if (isOAuth) {
+    const accessToken = await freshAccessToken(secrets, mailOAuthKey(user));
+    if (!accessToken) throw new Error("oauth_expired");
+    imapAuth = { user, accessToken };
+  } else {
+    imapAuth = { user, pass: account.password };
+  }
+  return new ImapFlow({
+    host: account.host,
+    port: account.port,
+    secure: true,
+    auth: imapAuth,
+    logger: false,
+    tls: imapTlsOptions(),
+  });
+}
+
+/**
  * Sync one IMAP account (INBOX + its provider's sent folder). Per-account cursor lives
  * under sync_state source `gmail:<user>`; the legacy single-account cursor 'gmail'
  * migrates on first run (copied when the per-account cursor is missing).
@@ -213,19 +247,12 @@ export async function syncMailAccount(
   const report: SyncReport = { source: "gmail", ingested: 0, skipped: 0, created: 0 };
 
   const user = account.user.trim();
-  const isOAuth = account.auth === "oauth";
-  if (!user || (!isOAuth && !account.password)) return { ...report, error: "not-configured" };
-
-  // XOAUTH2 (Workspace accounts without app passwords): a fresh access token per
-  // sync, refreshed via the stored grant. Missing/failed refresh → typed error so
-  // the UI can prompt a re-connect.
-  let imapAuth: { user: string; pass?: string; accessToken?: string };
-  if (isOAuth) {
-    const accessToken = await freshAccessToken(deps.secrets, mailOAuthKey(user));
-    if (!accessToken) return { ...report, error: "oauth_expired" };
-    imapAuth = { user, accessToken };
-  } else {
-    imapAuth = { user, pass: account.password };
+  // Missing credentials / expired OAuth grant → typed error so the UI can prompt.
+  let client: ImapFlow;
+  try {
+    client = await openImapClient(deps.secrets, account);
+  } catch (e) {
+    return { ...report, error: (e as Error).message };
   }
   // Your own address — used to classify direction and never treat yourself as counterpart.
   const selfSet = new Set([user.toLowerCase()]);
@@ -246,15 +273,6 @@ export async function syncMailAccount(
 
   const mailboxes = ["INBOX", PROVIDER_PRESETS[account.provider].sentFolder];
 
-  const client = new ImapFlow({
-    host: account.host,
-    port: account.port,
-    secure: true,
-    auth: imapAuth,
-    logger: false,
-    tls: imapTlsOptions(),
-  });
-
   let matched = 0;
   let attempted = 0;
   let maxDate = since.getTime();
@@ -271,12 +289,11 @@ export async function syncMailAccount(
         }
         try {
           const uids = (await client.search({ since }, { uid: true })) || [];
-          if (!uids.length) continue;
-          for await (const msg of client.fetch(
-            uids,
-            { uid: true, source: true, internalDate: true },
-            { uid: true }
-          )) {
+          // No new mail is the common case — the read-state mirror below must still run.
+          const fresh = uids.length
+            ? client.fetch(uids, { uid: true, source: true, internalDate: true, flags: true }, { uid: true })
+            : [];
+          for await (const msg of fresh) {
             const parsed = await simpleParser(msg.source as Buffer);
             const body =
               parsed.text ||
@@ -383,9 +400,28 @@ export async function syncMailAccount(
               subject,
               bodySummary: snippet(snippetSrc),
               externalId,
+              // Read state from the server; outbound (sent folder) is read by definition.
+              readAt: outbound
+                ? when.toISOString()
+                : msg.flags?.has("\\Seen")
+                  ? new Date().toISOString()
+                  : null,
+              bodyRaw: mailBodyText(parsed),
             });
             if (inserted) report.ingested++;
             else report.skipped++; // already ingested — idempotent
+          }
+          // Read receipts for rows already ingested (+ bodies for rows that predate
+          // body storage). Same lock, same connection; a failure here never fails the sync.
+          if (box === "INBOX") {
+            try {
+              const m = await mirrorMailReadState(db, client);
+              if (m.markedRead || m.bodiesFilled) {
+                console.log(`mail(${user}): mirrored ${m.markedRead} read receipt(s), filled ${m.bodiesFilled} body(ies)`);
+              }
+            } catch (e) {
+              console.warn(`mail(${user}): read-state mirror failed: ${(e as Error).message}`);
+            }
           }
         } finally {
           lock.release();

@@ -161,7 +161,7 @@ declare global {
       prefs: { get: Call; set: Call; reveal: Call };
       assistant: { command: Call };
       stt: { transcribe: Call };
-      inbox: { list: Call; sendEmail: Call; sendIMessage: Call; sendIMessageChat: Call; handles: Call };
+      inbox: { list: Call; sendEmail: Call; sendIMessage: Call; sendIMessageChat: Call; handles: Call; markRead: Call };
       drafts: { list: Call; generate: Call; setStatus: Call };
       voice: { synthesize: Call; get: Call };
       /**

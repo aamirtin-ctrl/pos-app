@@ -303,6 +303,7 @@ export async function syncLinkedin(deps: ConnectorDeps, exportPath: string): Pro
           bodySummary: row.snippet,
           externalId: row.externalId,
           threadExternalId: row.conversationId || null,
+          readAt: row.occurredAt ? row.occurredAt.toISOString() : new Date().toISOString(), // export import
         });
         if (inserted) report.ingested++;
         else report.skipped++;

@@ -2,7 +2,9 @@
 // resolves identity inline (crm/identity.ts) and writes directly to `interaction`.
 // UNIQUE(channel, external_id) + INSERT OR IGNORE make every connector idempotent.
 // Privacy contract (ported from PersonalCRM2 Doc 2 §0): store a ≤200-char snippet in
-// body_summary, NEVER the full body.
+// body_summary. Owner decision 2026-09-11 relaxes this for MAIL ONLY: the mail connector
+// also keeps the plain-text body in body_raw (capped, see mail-read.ts MAIL_BODY_MAX) so
+// Messaging can show an email as an email. Every other channel still stores the snippet only.
 
 import type { Db } from "../db/db.ts";
 import type { SecretStore } from "../secrets.ts";
@@ -72,15 +74,31 @@ export interface NewInteraction {
   bodySummary?: string | null;
   externalId: string;
   threadExternalId?: string | null;
+  /**
+   * When the message was read (ISO). Omitted → inbound rows are UNREAD (null) and every
+   * other direction is read at occurredAt. Connectors with a real read source (chat.db,
+   * IMAP \Seen) pass the source's answer; connectors without one pass occurredAt so
+   * imports never show up as a wall of unread.
+   */
+  readAt?: string | null;
+  /** Full plain-text body — mail only (owner decision 2026-09-11); null everywhere else. */
+  bodyRaw?: string | null;
 }
 
 /** INSERT OR IGNORE into interaction. Returns true when a NEW row was written. */
 export function insertInteraction(db: Db, r: NewInteraction): boolean {
+  const readAt =
+    r.readAt !== undefined
+      ? r.readAt
+      : r.direction === "inbound"
+        ? null
+        : (r.occurredAt ?? new Date().toISOString());
   const res = db
     .prepare(
       `INSERT OR IGNORE INTO interaction
-         (person_id, channel, direction, occurred_at, subject, body_summary, external_id, thread_external_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+         (person_id, channel, direction, occurred_at, subject, body_summary, external_id, thread_external_id,
+          read_at, body_raw)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       r.personId,
@@ -90,7 +108,9 @@ export function insertInteraction(db: Db, r: NewInteraction): boolean {
       r.subject ?? null,
       r.bodySummary ?? null,
       r.externalId,
-      r.threadExternalId ?? null
+      r.threadExternalId ?? null,
+      readAt,
+      r.bodyRaw ?? null
     );
   return res.changes > 0;
 }

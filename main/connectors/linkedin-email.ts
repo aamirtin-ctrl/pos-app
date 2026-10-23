@@ -266,6 +266,7 @@ function applyEvent(
     subject: eventLabel(ev.kind),
     bodySummary,
     externalId,
+    readAt: when.toISOString(), // notification mail has no read state worth mirroring
   });
   if (inserted) t.ingested++;
   else t.skipped++; // already ingested — idempotent via UNIQUE(channel, external_id)

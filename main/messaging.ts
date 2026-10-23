@@ -29,6 +29,10 @@ export interface ThreadMessage {
   occurred_at: string | null;
   /** Display name of the interaction's person (the sender for inbound rows). */
   sender_name: string | null;
+  /** When it was read (ISO); null = unread. Outbound rows are always read. */
+  read_at: string | null;
+  /** Full plain-text body — mail rows only (owner decision 2026-09-11); null elsewhere. */
+  body: string | null;
 }
 
 export interface InboxItem {
@@ -55,6 +59,8 @@ export interface InboxItem {
   answered: 0 | 1;
   /** has_draft OR not answered — these sort first. */
   unanswered: 0 | 1;
+  /** 1 when any inbound message in the conversation has read_at NULL. THE dot. */
+  unread: 0 | 1;
   /** The conversation's recent messages, both directions, oldest → newest. */
   thread: ThreadMessage[];
 }
@@ -97,8 +103,8 @@ export { isTapback } from "./connectors/common.ts";
 
 type InboxRow = Omit<
   InboxItem,
-  "unanswered" | "thread" | "thread_key" | "is_group" | "group_name" | "answered"
->;
+  "unanswered" | "thread" | "thread_key" | "is_group" | "group_name" | "answered" | "unread"
+> & { read_at: string | null };
 
 /** One collapsed conversation, before threads/answered are filled in. */
 interface Bucket {
@@ -110,6 +116,8 @@ interface Bucket {
   draft: { id: number | null; body: string | null } | null;
   /** Newest inbound timestamp in the conversation — what "recent" means for the cut. */
   latestAt: string;
+  /** Any inbound row in the scan window with read_at NULL. */
+  unread: boolean;
 }
 
 /**
@@ -145,7 +153,7 @@ export function listInbox(
   const rows = db
     .prepare(
       `SELECT i.id, i.person_id, p.display_name AS person_name, i.channel, i.subject,
-              i.body_summary, i.occurred_at, i.external_id, i.thread_external_id,
+              i.body_summary, i.occurred_at, i.external_id, i.thread_external_id, i.read_at,
               d.id AS draft_id, d.body AS draft_body,
               CASE WHEN d.id IS NOT NULL THEN 1 ELSE 0 END AS has_draft
        FROM interaction i
@@ -167,7 +175,7 @@ export function listInbox(
     const tapback = isTapback(r.body_summary);
     let b = byKey.get(key);
     if (!b) {
-      b = { key, rep: r, repIsTapback: tapback, draft: null, latestAt: at };
+      b = { key, rep: r, repIsTapback: tapback, draft: null, latestAt: at, unread: false };
       byKey.set(key, b);
     } else if (b.repIsTapback && !tapback) {
       // Prefer the newest NON-tapback message as the conversation's headline.
@@ -175,6 +183,7 @@ export function listInbox(
       b.repIsTapback = false;
     }
     if (at > b.latestAt) b.latestAt = at;
+    if (r.read_at === null) b.unread = true;
     if (r.has_draft && !b.draft) b.draft = { id: r.draft_id, body: r.draft_body };
   }
 
@@ -198,7 +207,7 @@ export function listInbox(
   // joined to its own person for sender_name. 1:1 threads keep the person query.
   const chatThreadStmt = db.prepare(
     `SELECT i.id, i.channel, i.direction, i.subject, i.body_summary, i.occurred_at,
-            p.display_name AS sender_name
+            p.display_name AS sender_name, i.read_at, i.body_raw AS body
      FROM interaction i JOIN person p ON p.id = i.person_id
      WHERE i.thread_external_id = ?
      ORDER BY i.occurred_at DESC LIMIT ${THREAD_LIMIT}`
@@ -209,7 +218,7 @@ export function listInbox(
   // 1:1 thread — mail conversations are never rendered as group chats.
   const personThreadStmt = db.prepare(
     `SELECT i.id, i.channel, i.direction, i.subject, i.body_summary, i.occurred_at,
-            p.display_name AS sender_name
+            p.display_name AS sender_name, i.read_at, i.body_raw AS body
      FROM interaction i JOIN person p ON p.id = i.person_id
      WHERE i.person_id = ?
        AND (i.thread_external_id IS NULL OR i.channel IN (${EMAIL_CHANNELS.map(() => "?").join(",")}))
@@ -235,8 +244,9 @@ export function listInbox(
       ? 1
       : 0;
     const hasDraft: 0 | 1 = r.has_draft || b.draft ? 1 : 0;
+    const { read_at: _readAt, ...rest } = r;
     items.push({
-      ...r,
+      ...rest,
       has_draft: hasDraft,
       draft_id: r.has_draft ? r.draft_id : (b.draft?.id ?? null),
       draft_body: r.has_draft ? r.draft_body : (b.draft?.body ?? null),
@@ -245,6 +255,7 @@ export function listInbox(
       is_group: isGroup ? 1 : 0,
       group_name: groupName,
       unanswered: hasDraft || !answered ? 1 : 0,
+      unread: b.unread ? 1 : 0,
       thread,
     });
   }
@@ -252,6 +263,60 @@ export function listInbox(
     if (a.unanswered !== b.unanswered) return b.unanswered - a.unanswered;
     return (b.occurred_at ?? "").localeCompare(a.occurred_at ?? "");
   });
+}
+
+// ── read state ───────────────────────────────────────────────────────────────
+
+/**
+ * Mark every unread INBOUND message in a conversation read — the user opened it in
+ * Messaging (owner ask 2026-09-11). Scope mirrors the thread queries above: a group key
+ * (`chat:<guid>`) is every row with that thread id; a person key (`person:<id>`) is that
+ * person's rows that are not group-chat rows (mail rows keep their Message-ID chain in
+ * thread_external_id and still belong to the 1:1, exactly as in personThreadStmt).
+ *
+ * Returns the affected MAIL Message-IDs so the caller can push \Seen to the server
+ * (connectors/mail-read.ts markSeenOnServer). Idempotent: already-read rows are skipped.
+ */
+export function markConversationRead(
+  db: Db,
+  threadKey: string
+): { marked: number; mailIds: string[] } {
+  type Row = { id: number; channel: string; external_id: string | null };
+  let rows: Row[];
+  if (threadKey.startsWith("chat:")) {
+    rows = db
+      .prepare(
+        `SELECT id, channel, external_id FROM interaction
+         WHERE thread_external_id = ? AND direction = 'inbound' AND read_at IS NULL`
+      )
+      .all(threadKey.slice(5)) as Row[];
+  } else if (threadKey.startsWith("person:")) {
+    const personId = Number(threadKey.slice(7));
+    if (!Number.isInteger(personId)) return { marked: 0, mailIds: [] };
+    rows = db
+      .prepare(
+        `SELECT id, channel, external_id FROM interaction
+         WHERE person_id = ? AND direction = 'inbound' AND read_at IS NULL
+           AND (thread_external_id IS NULL OR channel IN (${EMAIL_CHANNELS.map(() => "?").join(",")}))`
+      )
+      .all(personId, ...EMAIL_CHANNELS) as Row[];
+  } else {
+    return { marked: 0, mailIds: [] };
+  }
+  if (rows.length === 0) return { marked: 0, mailIds: [] };
+
+  const now = new Date().toISOString();
+  const upd = db.prepare("UPDATE interaction SET read_at = ? WHERE id = ? AND read_at IS NULL");
+  db.transaction(() => {
+    for (const r of rows) upd.run(now, r.id);
+  })();
+
+  const mail = new Set<string>(EMAIL_CHANNELS);
+  const mailIds = rows
+    .filter((r) => mail.has(r.channel))
+    .map((r) => normalizeMessageId(r.external_id))
+    .filter((id): id is string => id !== null);
+  return { marked: rows.length, mailIds };
 }
 
 // ── recipient resolution ─────────────────────────────────────────────────────

@@ -186,6 +186,7 @@ contextBridge.exposeInMainWorld("pos", {
     sendIMessage: call("inbox.sendIMessage"),
     sendIMessageChat: call("inbox.sendIMessageChat"),
     handles: call("inbox.handles"),
+    markRead: call("inbox.markRead"),
   },
   drafts: { list: call("drafts.list"), generate: call("drafts.generate"), setStatus: call("drafts.setStatus") },
   voice: { synthesize: call("voice.synthesize"), get: call("voice.get") },

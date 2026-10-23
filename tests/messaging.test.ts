@@ -9,6 +9,7 @@ import path from "node:path";
 import { openDb, type Db } from "../main/db/db.ts";
 import {
   listInbox,
+  markConversationRead,
   isTapback,
   DEFAULT_CONVERSATION_LIMIT,
   personHandles,
@@ -48,13 +49,19 @@ function addInteraction(
     subject?: string | null;
     body?: string | null;
     threadExternalId?: string | null;
+    externalId?: string;
+    /** Default: inbound rows unread (NULL), everything else read at occurredAt. */
+    readAt?: string | null;
+    bodyRaw?: string | null;
   }
 ): number {
+  const readAt =
+    o.readAt !== undefined ? o.readAt : o.direction === "inbound" ? null : o.occurredAt;
   return Number(
     db
       .prepare(
-        `INSERT INTO interaction (person_id, channel, direction, occurred_at, subject, body_summary, external_id, thread_external_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO interaction (person_id, channel, direction, occurred_at, subject, body_summary, external_id, thread_external_id, read_at, body_raw)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         personId,
@@ -63,8 +70,10 @@ function addInteraction(
         o.occurredAt,
         o.subject ?? null,
         o.body ?? null,
-        `ext-${Math.random().toString(36).slice(2)}`,
-        o.threadExternalId ?? null
+        o.externalId ?? `ext-${Math.random().toString(36).slice(2)}`,
+        o.threadExternalId ?? null,
+        readAt,
+        o.bodyRaw ?? null
       ).lastInsertRowid
   );
 }
@@ -404,6 +413,61 @@ describe("listInbox group threading", () => {
     expect(solo.thread).toHaveLength(1);
     expect(solo.thread[0].body_summary).toBe("just us");
     expect(solo.thread[0].sender_name).toBe("Ada");
+  });
+});
+
+describe("read state (owner ask 2026-09-11: the dot means UNREAD)", () => {
+  it("unread is 1 when any inbound row in the conversation has read_at NULL; thread rows carry read_at + body", () => {
+    const a = addPerson("A");
+    addInteraction(a, {
+      channel: "imessage", direction: "inbound", occurredAt: "2026-09-01T10:00:00Z",
+      body: "hi", readAt: "2026-09-01T11:00:00Z",
+    });
+    addInteraction(a, {
+      direction: "inbound", occurredAt: "2026-09-02T10:00:00Z", body: "mail", bodyRaw: "full mail body",
+    });
+    const b = addPerson("B");
+    addInteraction(b, { direction: "inbound", occurredAt: "2026-09-03T10:00:00Z", readAt: "2026-09-03T10:05:00Z" });
+
+    const items = listInbox(db);
+    const ia = items.find((i) => i.person_id === a)!;
+    const ib = items.find((i) => i.person_id === b)!;
+    expect(ia.unread).toBe(1);
+    expect(ib.unread).toBe(0);
+    expect(ia.thread.map((m) => m.read_at === null)).toEqual([false, true]);
+    expect(ia.thread[1].body).toBe("full mail body");
+    expect(ia.thread[0].body).toBeNull();
+  });
+
+  it("markConversationRead scopes a 1:1 by person — mail rows with a thread id included, group rows excluded — and returns mail ids", () => {
+    const a = addPerson("A");
+    addInteraction(a, {
+      direction: "inbound", occurredAt: "2026-09-02T10:00:00Z",
+      externalId: "<m1@x.com>", threadExternalId: "<root@x.com>",
+    });
+    addInteraction(a, { channel: "imessage", direction: "inbound", occurredAt: "2026-09-02T11:00:00Z", externalId: "g1" });
+    addInteraction(a, {
+      channel: "imessage", direction: "inbound", occurredAt: "2026-09-02T12:00:00Z",
+      externalId: "g2", threadExternalId: "chat-guid",
+    });
+    addInteraction(a, { direction: "outbound", occurredAt: "2026-09-02T13:00:00Z", externalId: "<sent@x.com>" });
+
+    const r = markConversationRead(db, `person:${a}`);
+    expect(r).toEqual({ marked: 2, mailIds: ["<m1@x.com>"] });
+    const readAt = (id: string) =>
+      (db.prepare("SELECT read_at FROM interaction WHERE external_id = ?").get(id) as { read_at: string | null }).read_at;
+    expect(readAt("<m1@x.com>")).not.toBeNull();
+    expect(readAt("g1")).not.toBeNull();
+    expect(readAt("g2")).toBeNull(); // the group row is its own conversation
+    expect(markConversationRead(db, `person:${a}`)).toEqual({ marked: 0, mailIds: [] }); // idempotent
+    expect(markConversationRead(db, "chat:chat-guid")).toEqual({ marked: 1, mailIds: [] });
+    expect(readAt("g2")).not.toBeNull();
+    expect(listInbox(db).every((i) => i.unread === 0)).toBe(true);
+  });
+
+  it("ignores keys it does not understand", () => {
+    expect(markConversationRead(db, "bogus")).toEqual({ marked: 0, mailIds: [] });
+    expect(markConversationRead(db, "person:abc")).toEqual({ marked: 0, mailIds: [] });
   });
 });
 

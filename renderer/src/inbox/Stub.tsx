@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { splitQuoted } from "./quoted.ts";
 
 // Messaging: a real two-pane unified inbox. Left = conversations (one row per
 // conversation key from listInbox — group chats keyed by chat guid, 1:1 by
@@ -7,7 +8,10 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 // via inbox.sendEmail, 1:1 iMessage → inbox.sendIMessage, group iMessage →
 // inbox.sendIMessageChat, LinkedIn → open the real site in the docked panel +
 // copy the draft (no fake send). Every send is an explicit user click — POS never
-// auto-sends. The header also docks Snapchat / Instagram DMs / LinkedIn as a
+// auto-sends. The dot on a row means UNREAD (read state mirrored from chat.db / IMAP,
+// owner ask 2026-09-11); clicking a row marks it read locally and, for mail, on the
+// server. Mail rows in a thread render as mail cards (subject, body, previous emails
+// behind a toggle), everything else as chat bubbles. The header also docks Snapchat / Instagram DMs / LinkedIn as a
 // native web view on the right (main/webpanel.ts) — services with no API worth
 // integrating, so the real site is the integration.
 
@@ -15,6 +19,9 @@ type ThreadMessage = {
   id: number; channel: string; direction: string | null;
   subject: string | null; body_summary: string | null; occurred_at: string | null;
   sender_name: string | null;
+  read_at: string | null;
+  /** Full plain-text body — mail rows only; null elsewhere (and for mail ingested before 2026-09-11 until the fill pass reaches it). */
+  body: string | null;
 };
 type InboxItem = {
   id: number; person_id: number; person_name: string; channel: string;
@@ -22,14 +29,14 @@ type InboxItem = {
   external_id: string | null; thread_external_id: string | null;
   thread_key: string; is_group: 0 | 1; group_name: string | null;
   has_draft: 0 | 1; draft_id: number | null;
-  draft_body: string | null; answered: 0 | 1; unanswered: 0 | 1; thread: ThreadMessage[];
+  draft_body: string | null; answered: 0 | 1; unanswered: 0 | 1; unread: 0 | 1; thread: ThreadMessage[];
 };
 type Handles = { email: string | null; imessage: string | null };
 type MailAccount = { id: string; provider: string; user: string; host: string };
 
 type Conversation = {
   key: string; personId: number; name: string; channel: string; latest: InboxItem;
-  unanswered: boolean; draft: string | null; isGroup: boolean;
+  unanswered: boolean; unread: boolean; draft: string | null; isGroup: boolean;
 };
 
 const EMAIL_CHANNELS = new Set(["gmail", "outlook", "icloud", "mailfile"]);
@@ -131,6 +138,54 @@ function PanelServiceIcon({ id, size = 15 }: { id: string; size?: number }) {
   return <ChannelIcon channel="linkedin" size={size} />;
 }
 
+/**
+ * A mail row as mail, not as a chat bubble: full width, subject bold on top, a quiet
+ * sender/date line, the body with its line breaks, and the quoted history ("previous
+ * emails on the chain") folded behind a toggle at the bottom. Rows ingested before full
+ * bodies were stored fall back to the snippet until the sync's fill pass reaches them.
+ */
+function MailCard({ m, out }: { m: ThreadMessage; out: boolean }) {
+  const [showQuoted, setShowQuoted] = useState(false);
+  const split = m.body ? splitQuoted(m.body) : { visible: m.body_summary ?? "", quoted: null };
+  return (
+    <div className="rounded-xl border px-4 py-3"
+      style={out
+        ? { background: "linear-gradient(160deg, var(--pink-1), var(--wash))", borderColor: "var(--pink-2)", color: "var(--ink)" }
+        : { background: "white", borderColor: "var(--line)", color: "var(--ink)" }}>
+      <div className="text-sm font-semibold leading-snug">{m.subject || "(no subject)"}</div>
+      <div className="text-[11px] mt-0.5 flex items-center gap-1.5" style={{ color: "var(--muted)" }}>
+        <ChannelIcon channel={m.channel} size={10} />
+        <span>{out ? "You" : m.sender_name ?? "Unknown sender"}</span>
+        <span aria-hidden="true">·</span>
+        <span>{fmtDate(m.occurred_at)}</span>
+      </div>
+      <div className="text-sm leading-relaxed mt-2 whitespace-pre-wrap break-words">
+        {split.visible || <span style={{ color: "var(--muted)" }}>(no preview)</span>}
+      </div>
+      {split.quoted && (
+        <>
+          <button type="button" onClick={() => setShowQuoted((v) => !v)}
+            aria-expanded={showQuoted}
+            className="mt-2 text-[11px] flex items-center gap-1 rounded px-1 -ml-1 hover:bg-black/[0.05]"
+            style={{ color: "var(--muted)" }}>
+            <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"
+              style={{ transform: showQuoted ? "rotate(180deg)" : "none", transition: "transform 120ms" }}>
+              <path d="M2 3.5 5 6.5 8 3.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            {showQuoted ? "Hide previous emails" : "Show previous emails"}
+          </button>
+          {showQuoted && (
+            <div className="mt-2 pl-3 border-l text-xs leading-relaxed whitespace-pre-wrap break-words"
+              style={{ borderColor: "var(--line)", color: "var(--muted)" }}>
+              {split.quoted}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function fmtDate(iso: string | null): string {
   if (!iso) return "";
   const d = new Date(iso);
@@ -177,6 +232,21 @@ export default function Inbox() {
       if (list.length > 0) setAccountUser(list[0].user);
     });
   }, [refetch]);
+  // Read state changes behind the app's back — he reads a text on his phone, the 15-minute
+  // sync mirrors it — so the list can't be a one-shot snapshot. Refetch when the window
+  // comes back into focus and on a slow interval; selection and compose live in their own
+  // state, so a refetch never disturbs a reply in progress.
+  useEffect(() => {
+    const onFocus = () => { if (document.visibilityState === "visible") refetch(); };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    const timer = setInterval(refetch, 60_000);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onFocus);
+      clearInterval(timer);
+    };
+  }, [refetch]);
 
   // listInbox already collapses to one row per conversation key, sorted
   // unanswered-first then newest — a straight map is all that's left.
@@ -189,11 +259,34 @@ export default function Inbox() {
         channel: it.channel,
         latest: it,
         unanswered: it.unanswered === 1,
+        unread: it.unread === 1,
         draft: it.draft_body,
         isGroup: it.is_group === 1,
       })),
     [items]
   );
+
+  // An explicit click/Enter on a row is "I read this": flip the row locally right away
+  // (no refetch flicker) and tell main, which also pushes \Seen to the mail server. The
+  // auto-selected first conversation is NOT marked read — opening the tab never silently
+  // clears something he hasn't looked at.
+  const choose = (c: Conversation) => {
+    setSelected(c.key);
+    if (!c.unread) return;
+    const now = new Date().toISOString();
+    setItems((prev) =>
+      prev.map((it) =>
+        it.thread_key === c.key
+          ? {
+              ...it,
+              unread: 0,
+              thread: it.thread.map((m) => (m.direction === "inbound" && m.read_at === null ? { ...m, read_at: now } : m)),
+            }
+          : it
+      )
+    );
+    void window.pos.inbox.markRead({ threadKey: c.key });
+  };
 
   const convo = conversations.find((c) => c.key === selected) ?? null;
 
@@ -433,22 +526,22 @@ export default function Inbox() {
                   const active = c.key === selected;
                   const confirming = confirmKey === c.key;
                   return (
-                    <div key={c.key} onClick={() => setSelected(c.key)}
+                    <div key={c.key} onClick={() => choose(c)}
                       role="button" tabIndex={0}
-                      onKeyDown={(e) => { if (e.key === "Enter") setSelected(c.key); }}
+                      onKeyDown={(e) => { if (e.key === "Enter") choose(c); }}
                       className="group w-full text-left px-3 py-2.5 border-b block cursor-pointer"
                       style={{
                         borderColor: "var(--line)",
                         background: active ? "linear-gradient(160deg, white, var(--wash))" : "transparent",
                       }}>
                       <div className="flex items-center gap-1.5">
-                        {c.unanswered && (
-                          <span className="w-2 h-2 rounded-full shrink-0" style={{ background: "var(--petal)" }} title="Needs a reply" />
+                        {c.unread && (
+                          <span className="w-2 h-2 rounded-full shrink-0" style={{ background: "var(--petal-deep)" }} title="Unread" />
                         )}
                         {c.isGroup && (
                           <span className="shrink-0" style={{ color: "var(--accent)" }} title="Group chat"><GroupIcon /></span>
                         )}
-                        <span className="text-sm font-medium truncate" style={{ color: "var(--ink)" }}>{c.name}</span>
+                        <span className={`text-sm truncate ${c.unread ? "font-semibold" : "font-medium"}`} style={{ color: "var(--ink)" }}>{c.name}</span>
                         <span className="ml-auto shrink-0 flex items-center gap-1.5">
                           <span style={{ color: "var(--accent)" }}><ChannelIcon channel={c.channel} /></span>
                           <span className="text-[10px]" style={{ color: "var(--muted)" }}>{fmtDate(c.latest.occurred_at)}</span>
@@ -524,6 +617,7 @@ export default function Inbox() {
                     <div className="flex-1 overflow-y-auto px-4 py-3 space-y-2">
                       {convo.latest.thread.map((m) => {
                         const out = m.direction === "outbound";
+                        if (EMAIL_CHANNELS.has(m.channel)) return <MailCard key={m.id} m={m} out={out} />;
                         return (
                           <div key={m.id} className={`flex ${out ? "justify-end" : "justify-start"}`}>
                             <div className="max-w-[78%] rounded-xl px-3 py-2 text-sm leading-relaxed border"

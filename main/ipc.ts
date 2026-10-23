@@ -72,6 +72,7 @@ import { transcribe } from "./stt.ts";
 import { generateDrafts, listDrafts, setDraftStatus, synthesizeVoices, getVoices } from "./crm/drafts.ts";
 import {
   listInbox,
+  markConversationRead,
   sendEmail,
   sendIMessage,
   sendIMessageToChat,
@@ -80,6 +81,7 @@ import {
   type SendIMessageArgs,
   type SendIMessageChatArgs,
 } from "./messaging.ts";
+import { markSeenOnServer } from "./connectors/mail-read.ts";
 import { captureOutcomes, adherenceStats, applyLearning } from "./engine/learning.ts";
 import { runSync, syncStatus } from "./workers.ts";
 import { composeDigest, sendMorningDigest } from "./digest.ts";
@@ -799,6 +801,17 @@ export function registerIpc(deps: IpcDeps) {
   h("inbox.sendIMessage", (args: SendIMessageArgs) => sendIMessage(db, args));
   h("inbox.sendIMessageChat", (args: SendIMessageChatArgs) => sendIMessageToChat(db, args));
   h("inbox.handles", (personId: number) => personHandles(db, personId));
+  // He opened a conversation. Local read state is immediate; the mail \Seen write-back is
+  // fire-and-forget (owner decision 2026-09-11) — never blocks the UI, failures only log.
+  h("inbox.markRead", (args: { threadKey: string }) => {
+    const r = markConversationRead(db, args.threadKey);
+    if (r.mailIds.length > 0) {
+      void markSeenOnServer(secrets, r.mailIds).catch((e) =>
+        console.warn(`mail: \\Seen write-back failed: ${(e as Error).message}`)
+      );
+    }
+    return r;
+  });
 
   // ── messaging drafts + voices ──
   h("drafts.list", () => listDrafts(db));
