@@ -5,6 +5,8 @@ import path from "node:path";
 import { openDb, type Db } from "../../main/db/db.ts";
 import type { LlmClient } from "../../main/llm/provider.ts";
 import {
+  newsSentence,
+  fallbackSentences,
   draftReconnect,
   markReachedOut,
   openUrlFor,
@@ -117,5 +119,17 @@ describe("reconnect drafts", () => {
     expect(reconnectDue(db, now).map((r) => r.id)).not.toContain(id);
     const row = db.prepare("SELECT channel, direction, body_summary FROM interaction WHERE person_id = ?").get(id);
     expect(row).toEqual({ channel: "manual", direction: "outbound", body_summary: null });
+  });
+});
+
+describe("my news (his one-line update)", () => {
+  it("becomes sentence two of the fallback and keeps the note at three sentences", () => {
+    const s = fallbackSentences("Sam", [], "Just moved to SF and started at a new startup. Also got a dog");
+    expect(s).toHaveLength(3);
+    expect(s[1]).toBe("Just moved to SF and started at a new startup.");
+  });
+  it("adds closing punctuation and ignores blank input", () => {
+    expect(newsSentence("Started a new job")).toBe("Started a new job.");
+    expect(newsSentence("   ")).toBeNull();
   });
 });

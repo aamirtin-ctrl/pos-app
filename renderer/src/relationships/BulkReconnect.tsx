@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { getMyNews } from "./myNews.ts";
 
 // Bulk reconnect (owner ask 2026-10-23): select several people on the Reconnect list,
 // and POS drafts every note at once — each person on their own best channel. Then one
@@ -45,7 +46,7 @@ export default function BulkReconnect({
 
   useEffect(() => {
     void pool(personIds, 3, async (id) => {
-      const r = await window.pos.people.reconnectDraft(id);
+      const r = await window.pos.people.reconnectDraft(id, undefined, getMyNews() || null);
       if (r.ok) patch(id, { draft: r.data as Draft, status: "ready" });
       else patch(id, { error: r.error ?? "couldn't write a draft", status: "skipped" });
     });

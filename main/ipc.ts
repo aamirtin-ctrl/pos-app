@@ -391,8 +391,9 @@ export function registerIpc(deps: IpcDeps) {
   // come back as an empty list — the read still serves the last good stamps.
   h("people.reconnect", () => loadReconnect(db));
   // Reconnect drafts (owner ask 2026-10-23): write the note, open it prefilled, never send.
-  h("people.reconnectDraft", (personId: number, channel?: ReconnectChannel) =>
-    draftReconnect(db, deps.llm(), personId, channel)
+  // myNews: his one-line life update from the Reconnect panel, used as sentence two.
+  h("people.reconnectDraft", (personId: number, channel?: ReconnectChannel, myNews?: string | null) =>
+    draftReconnect(db, deps.llm(), personId, channel, new Date(), typeof myNews === "string" ? myNews : null)
   );
   // The URL is built here from the handles on file — the renderer only sends the text.
   // The text also goes on the clipboard: LinkedIn has no prefill URL, and if Messages

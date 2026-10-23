@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
+import { getMyNews } from "./myNews.ts";
 
 // Reconnect composer (owner ask 2026-10-23): a three-sentence "how are you + my news"
 // note, editable, opened prefilled in Messages / Mail / LinkedIn. Nothing is sent from
@@ -41,7 +42,7 @@ export default function ReconnectComposer({
     async (channel?: Channel) => {
       setLoading(true);
       setError(null);
-      const r = await window.pos.people.reconnectDraft(personId, channel);
+      const r = await window.pos.people.reconnectDraft(personId, channel, getMyNews() || null);
       if (r.ok) {
         const d = r.data as Draft;
         setDraft(d);

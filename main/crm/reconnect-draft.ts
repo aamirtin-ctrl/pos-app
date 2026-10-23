@@ -121,10 +121,12 @@ export function sentences(text: string): string[] {
 }
 
 /** The deterministic three sentences — only ever claims true, generic things. */
-export function fallbackSentences(first: string | null, news: WorklogEntry[]): string[] {
+export function fallbackSentences(first: string | null, news: WorklogEntry[], myNews?: string | null): string[] {
   const hi = first ? `Hey ${first}! ` : "Hey! ";
-  const update =
-    news.length > 0
+  const mine = myNews ? newsSentence(myNews) : null;
+  const update = mine
+    ? mine
+    : news.length > 0
       ? `Quick update from my end: ${news
           .slice(0, 2)
           .map((e) => e.title.replace(/[.!?]+$/, "").replace(/^\p{Lu}(?=\p{Ll})/u, (c) => c.toLowerCase()))
@@ -135,6 +137,17 @@ export function fallbackSentences(first: string | null, news: WorklogEntry[]): s
     update,
     "Would love to catch up soon, maybe a quick call or coffee whenever works for you?",
   ];
+}
+
+/**
+ * His own one-line life update, typed once on the Reconnect panel and used by every note.
+ * Made into exactly one sentence so the note stays at three: first sentence only, ends in
+ * punctuation.
+ */
+export function newsSentence(myNews: string): string | null {
+  const first = sentences(myNews)[0]?.trim();
+  if (!first) return null;
+  return /[.!?]["')\]]*$/.test(first) ? first : `${first}.`;
 }
 
 /** Email framing around the three sentences, from his learned email voice. */
@@ -183,7 +196,8 @@ export async function draftReconnect(
   llm: LlmClient | null,
   personId: number,
   channel?: ReconnectChannel,
-  now: Date = new Date()
+  now: Date = new Date(),
+  myNews?: string | null
 ): Promise<ReconnectDraft> {
   const p = personRow(db, personId);
   const targets = reconnectTargets(db, personId);
@@ -196,7 +210,8 @@ export async function draftReconnect(
   const news = entriesSince(db, since).slice(0, 12); // newest first
   const about = contextBlock(db);
 
-  let three = fallbackSentences(first, news).join(" ");
+  const mine = myNews?.trim() ? myNews.trim().slice(0, 400) : null;
+  let three = fallbackSentences(first, news, mine).join(" ");
   let subject: string | null = ch === "email" ? SUBJECT_FALLBACK : null;
   let usedLlm = false;
 
@@ -216,12 +231,14 @@ export async function draftReconnect(
       }.
 EXACTLY 3 sentences, sweet and inviting:
 1. Greet them${first ? ` by first name (${first})` : ""} and warmly ask how they're doing — mention something specific about them only if it is stated below.
-2. Catch them up on the user's life in one sentence, drawn ONLY from the worklog / about-the-user facts below. If there is nothing notable, keep it light and true without specifics.
+2. Catch them up on the user's life in one sentence, drawn ONLY from ${
+        mine ? "MY NEWS below (the user wrote it; keep its facts, smooth the wording)" : "the worklog / about-the-user facts below"
+      }. If there is nothing notable, keep it light and true without specifics.
 3. An inviting close — suggest catching up (call, coffee, etc.) without naming a date or claiming a plan exists.
 Rules: never invent facts, shared memories, places or news. No subject line, no sign-off, no emoji unless the voice notes call for them. Plain text.
 VOICE (${category}): tone "${voice?.tone ?? "warm, casual"}"; quirks: ${voice?.notes?.join("; ") || "none"}.
 ${about}
-WORKLOG SINCE ${since.slice(0, 10)}:
+${mine ? `MY NEWS (from the user, use this for sentence 2): ${mine}\n` : ""}WORKLOG SINCE ${since.slice(0, 10)}:
 ${news.length ? news.map((e) => `- ${e.happened_at.slice(0, 10)}: ${e.title}${e.detail ? ` — ${e.detail}` : ""}`).join("\n") : "- (nothing logged)"}
 ABOUT THEM:
 ${them || "- (nothing on file)"}

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { openReview, useReviewCount, REVIEW_CHANGED_EVENT } from "./ReviewModal.tsx";
 import ReconnectComposer from "./ReconnectComposer.tsx";
 import BulkReconnect from "./BulkReconnect.tsx";
+import { getMyNews, setMyNews } from "./myNews.ts";
 
 // Relationships dashboard: query hero → ranked results, plus the two standing
 // panels — Reconnect (cadence debt) and Commitments (extracted obligations).
@@ -186,6 +187,7 @@ export default function Home() {
   // shift-click extends from the last clicked row, Esc clears. Plain clicks still
   // navigate to the contact — selection only engages while a modifier is held.
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [myNews, setMyNewsState] = useState<string>(() => getMyNews());
   const [selectAnchor, setSelectAnchor] = useState<number | null>(null);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setSelected(new Set()); };
@@ -390,6 +392,27 @@ export default function Home() {
             </p>
           ) : (
             <div className="space-y-0.5">
+              {/* His news for every reach-out note (sentence two). Blank = POS uses the worklog. */}
+              <div className="flex items-center gap-2 mb-1 text-xs">
+                <span className="shrink-0" style={{ color: "var(--muted)" }}>My news:</span>
+                <input
+                  value={myNews}
+                  onChange={(e) => { setMyNewsState(e.target.value); setMyNews(e.target.value); }}
+                  placeholder="One line on what's new with you, used in every Reach out note"
+                  className="flex-1 rounded border px-2 py-1 bg-white"
+                  style={{ borderColor: "var(--line)" }}
+                />
+                {selected.size === 0 && (
+                  <button
+                    onClick={() => setSelected(new Set(reconnectShown.map((r) => r.id)))}
+                    title="Select everyone shown (cmd-click or shift-click picks some)"
+                    className="shrink-0 px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
+                    style={{ borderColor: "var(--line)", color: "var(--muted)" }}
+                  >
+                    Select all
+                  </button>
+                )}
+              </div>
               {selected.size > 0 && (
                 <div
                   className="flex items-center gap-2 rounded-md border px-2 py-1.5 mb-1 text-xs bg-white"
