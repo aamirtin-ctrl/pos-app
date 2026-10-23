@@ -207,13 +207,14 @@ export async function catchUpParagraph(
 
   const res = await llm.call(
     "worklog_catchup",
-    "smart",
+    "fast",
     `Write a 60-120 word "since we last talked" update FROM the user TO ${p.display_name}, first person, in the user's ${category} voice.
 VOICE: tone "${voice?.tone ?? "warm, direct"}"; quirks: ${voice?.notes?.join("; ") || "none"}.
 Rules: no greeting, no signoff, no invented facts — only what the worklog below says. Natural prose, not a list. Plain text only.
 WORKLOG SINCE ${since.slice(0, 10)}:
 ${entries.map((e) => `- ${e.happened_at.slice(0, 10)}: ${e.title}${e.detail ? ` — ${e.detail}` : ""}`).join("\n")}`,
-    { maxTokens: 300 }
+    // Fast tier + a deadline: someone is watching "Writing…" while this runs (2026-10-23).
+    { maxTokens: 400, deadlineMs: 20_000 }
   );
   if (res?.text.trim()) return { paragraph: res.text.trim(), entries, usedLlm: true, channel: category };
   return { paragraph: fallback, entries, usedLlm: false, channel: category };

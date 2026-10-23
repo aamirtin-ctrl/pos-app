@@ -81,3 +81,21 @@ describe("LlmClient.call fallback", () => {
     expect(tried).toEqual(["gemini-2.5-flash"]);
   });
 });
+
+describe("LlmClient.call deadline (2026-10-23: Reconnect stuck on 'Writing…')", () => {
+  it("a provider that never answers returns null within the deadline, health untouched", async () => {
+    const c = new LlmClient(db, secrets);
+    const tried: string[] = [];
+    (c as any).callGemini = (model: string) => { tried.push(model); return new Promise(() => {}); };
+    (c as any).callGroq = () => { tried.push("groq"); return new Promise(() => {}); };
+    const t0 = Date.now();
+    expect(await c.call("t", "fast", "p", { deadlineMs: 50 })).toBeNull();
+    expect(Date.now() - t0).toBeLessThan(1_000);
+    expect(tried).toEqual(["gemini-2.5-flash"]);
+    expect(llmHealth(db, secrets).ok).toBe(true);
+  });
+  it("an answer inside the deadline is still served", async () => {
+    const { c } = client({ "gemini-2.5-flash": "ok" });
+    expect((await c.call("t", "fast", "p", { deadlineMs: 5_000 }))?.model).toBe("gemini-2.5-flash");
+  });
+});

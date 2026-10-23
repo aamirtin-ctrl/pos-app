@@ -164,6 +164,9 @@ export function wrapEmail(first: string | null, three: string, voice: VoiceProfi
   return `${greeting}\n\n${body}\n\n${signoffLines}`;
 }
 
+/** How long a Reach out note may take before the plain version is shown instead. */
+export const RECONNECT_DEADLINE_MS = 15_000;
+
 export const SUBJECT_FALLBACK = "It's been a while!";
 
 function personRow(db: Db, personId: number): PersonRow {
@@ -223,9 +226,12 @@ export async function draftReconnect(
       p.last_contact_at ? `- Last talked: ${p.last_contact_at.slice(0, 10)}` : "",
     ].filter(Boolean).join("\n");
     const convo = lastExchange(db, personId);
+    // Fast tier on purpose: three sentences need no reasoning model, and the smart tier's
+    // hidden thinking ate the 300-token cap and the user's patience (2026-10-23, "Writing…"
+    // with no end). The deadline hands back the plain draft rather than keep him waiting.
     const res = await llm.call(
       "reconnect_draft",
-      "smart",
+      "fast",
       `Write a reconnect message FROM the user TO ${first ?? p.display_name}, someone they haven't talked to in a while, sent by ${
         ch === "text" ? "text message" : ch === "email" ? "email" : "LinkedIn message"
       }.
@@ -244,7 +250,7 @@ ABOUT THEM:
 ${them || "- (nothing on file)"}
 ${convo.length ? `LAST MESSAGES BETWEEN US (context only — do not quote):\n${convo.join("\n")}` : ""}
 Return STRICT JSON: {"message":"<the 3 sentences>"${ch === "email" ? ',"subject":"<3-6 word friendly subject>"' : ""}}`,
-      { json: true, maxTokens: 300 }
+      { json: true, maxTokens: 400, deadlineMs: RECONNECT_DEADLINE_MS }
     );
     if (res?.text) {
       try {

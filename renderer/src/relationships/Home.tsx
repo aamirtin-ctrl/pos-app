@@ -183,9 +183,10 @@ export default function Home() {
   const [composeFor, setComposeFor] = useState<number | null>(null);
   const [bulkFor, setBulkFor] = useState<number[] | null>(null);
 
-  // Multi-select over the reconnect list (owner ask 2026-09-10): cmd-click toggles,
-  // shift-click extends from the last clicked row, Esc clears. Plain clicks still
-  // navigate to the contact — selection only engages while a modifier is held.
+  // Multi-select over the reconnect list (owner ask 2026-09-10): cmd-click or a two-finger
+  // click toggles (2026-10-23), shift-click extends from the last clicked row, Esc clears.
+  // With nothing selected a plain click navigates to the contact; once a selection exists,
+  // plain clicks keep adding/removing rows until it is cleared.
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [myNews, setMyNewsState] = useState<string>(() => getMyNews());
   const [selectAnchor, setSelectAnchor] = useState<number | null>(null);
@@ -316,7 +317,10 @@ export default function Home() {
   };
 
   const rowClick = (e: React.MouseEvent, id: number) => {
-    if (!e.metaKey && !e.ctrlKey && !e.shiftKey) return; // plain click = navigate
+    // The row's own buttons (Reach out, Snooze…) act; they never toggle the selection.
+    if ((e.target as HTMLElement).closest("button")) return;
+    const selecting = e.metaKey || e.ctrlKey || e.shiftKey || e.type === "contextmenu" || selected.size > 0;
+    if (!selecting) return; // plain click = navigate
     e.preventDefault();
     setSelected((cur) => {
       const next = new Set(cur);
@@ -405,7 +409,7 @@ export default function Home() {
                 {selected.size === 0 && (
                   <button
                     onClick={() => setSelected(new Set(reconnectShown.map((r) => r.id)))}
-                    title="Select everyone shown (cmd-click or shift-click picks some)"
+                    title="Select everyone shown (two-finger click, cmd-click or shift-click picks some)"
                     className="shrink-0 px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
                     style={{ borderColor: "var(--line)", color: "var(--muted)" }}
                   >
@@ -426,7 +430,7 @@ export default function Home() {
                     className="px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
                     style={{ borderColor: "var(--line)", color: "var(--accent)" }}
                   >
-                    Reach out to all
+                    Reach out to all {selected.size}
                   </button>
                   <button
                     onClick={() => bulkSnooze(30)}
@@ -467,6 +471,7 @@ export default function Home() {
                     background: selected.has(r.id) ? "color-mix(in srgb, var(--accent) 12%, white)" : undefined,
                   }}
                   onClick={(e) => rowClick(e, r.id)}
+                  onContextMenu={(e) => rowClick(e, r.id)}
                   onMouseEnter={(e) => showPreview(r.id, e.currentTarget)}
                   onMouseLeave={hidePreview}
                 >
@@ -474,7 +479,7 @@ export default function Home() {
                     href={`#/contact/${r.id}`}
                     className="flex-1 truncate"
                     style={{ color: "var(--ink)" }}
-                    onClick={(e) => { if (e.metaKey || e.ctrlKey || e.shiftKey) e.preventDefault(); }}
+                    onClick={(e) => { if (e.metaKey || e.ctrlKey || e.shiftKey || selected.size > 0) e.preventDefault(); }}
                   >
                     {r.display_name}
                   </a>
@@ -494,7 +499,7 @@ export default function Home() {
                   {/* Snooze / dismiss (gap #22): hidden until the row is hovered or opened. */}
                   <span
                     className={`flex gap-1 shrink-0 ${
-                      snoozeFor === r.id ? "" : "opacity-0 group-hover:opacity-100 transition-opacity duration-[120ms]"
+                      snoozeFor === r.id || selected.has(r.id) ? "" : "opacity-0 group-hover:opacity-100 transition-opacity duration-[120ms]"
                     }`}
                   >
                     {snoozeFor === r.id ? (
@@ -532,12 +537,24 @@ export default function Home() {
                     ) : (
                       <>
                       <button
-                        onClick={() => setComposeFor(r.id)}
-                        title="Draft a catch-up note and open it in Messages, Mail or LinkedIn"
+                        onClick={() => {
+                          // With a selection, Reach out covers everyone picked (this row too).
+                          if (selected.size > 0) {
+                            setBulkFor(Array.from(new Set([...selected, r.id])));
+                            setSelected(new Set());
+                          } else setComposeFor(r.id);
+                        }}
+                        title={
+                          selected.size > 0
+                            ? "Draft a catch-up note for everyone selected, then open each prefilled"
+                            : "Draft a catch-up note and open it in Messages, Mail or LinkedIn"
+                        }
                         className="text-[11px] px-1.5 py-0.5 rounded border bg-white hover:shadow-sm active:scale-95"
                         style={{ borderColor: "var(--line)", color: "var(--accent)" }}
                       >
-                        Reach out
+                        {selected.size > 0
+                          ? `Reach out to all ${new Set([...selected, r.id]).size}`
+                          : "Reach out"}
                       </button>
                       <button
                         onClick={() => setSnoozeFor(r.id)}

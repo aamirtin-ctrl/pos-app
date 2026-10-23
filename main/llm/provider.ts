@@ -33,6 +33,29 @@ export interface LlmOptions {
   json?: boolean;
   system?: string;
   maxTokens?: number;
+  /**
+   * Wall-clock budget for the WHOLE call, every tier and the Groq backstop included.
+   * Past it, call() returns null and the caller's deterministic path takes over. Without
+   * one a stalled provider left the Reconnect composer on "Writing…" forever (2026-10-23).
+   */
+  deadlineMs?: number;
+}
+
+/** Budget when the caller names none: long enough for a slow smart call, never forever. */
+export const DEFAULT_DEADLINE_MS = 90_000;
+
+class LlmTimeout extends Error {}
+
+/** Reject after `ms`. Does not cancel `p`; a late answer is simply dropped. */
+function raceDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  if (ms <= 0) return Promise.reject(new LlmTimeout("llm deadline passed"));
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new LlmTimeout(`llm gave no answer within ${Math.round(ms / 1000)}s`)), ms);
+    p.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); }
+    );
+  });
 }
 
 const MODELS: Record<"anthropic" | "gemini", Record<LlmTier, string>> = {
@@ -86,13 +109,16 @@ export class LlmClient {
     const order = ([tier, tier === "smart" ? "fast" : "smart"] as LlmTier[]).filter(
       (t) => !inQuotaCooldown(lastFailure(this.db), new Date(), t)
     );
+    const deadline = Date.now() + (opts.deadlineMs ?? DEFAULT_DEADLINE_MS);
     for (const t of order) {
       const model = MODELS[provider][t];
       try {
-        const res =
+        const res = await raceDeadline(
           provider === "anthropic"
-            ? await this.callAnthropic(model, prompt, opts)
-            : await this.callGemini(model, prompt, opts);
+            ? this.callAnthropic(model, prompt, opts)
+            : this.callGemini(model, prompt, opts),
+          deadline - Date.now()
+        );
         recordCall(this.db, feature, res.model, res.inputTokens, res.outputTokens);
         // A call that lands — on any tier — is the proof the app can be served, so health
         // (which gates the capture drain and enrichment) must not keep reporting an outage.
@@ -100,6 +126,12 @@ export class LlmClient {
         if (t !== tier) console.warn(`llm(${feature}) served by ${model} — ${tier} tier over quota`);
         return res;
       } catch (e) {
+        // Out of time is not an outage: don't mark health red or start a cooldown, and
+        // don't spend more of a budget that is already gone on the next tier.
+        if (e instanceof LlmTimeout) {
+          console.warn(`llm(${feature}/${model}) ${e.message}; degrading to deterministic`);
+          return null;
+        }
         // Classified and remembered so the UI can say WHY the app went deterministic —
         // silence here is what let an exhausted quota look like a styling change.
         const f = recordFailure(this.db, e, new Date(), t);
@@ -111,7 +143,7 @@ export class LlmClient {
         if (f.code !== "quota" && !overloaded) return null;
       }
     }
-    const g = await this.tryGroqBackstop(feature, prompt, opts);
+    const g = await this.tryGroqBackstop(feature, prompt, opts, deadline - Date.now());
     if (g) {
       clearFailure(this.db);
       return g;
@@ -202,10 +234,15 @@ export class LlmClient {
   }
 
   /** Try the Groq backstop; null (never a throw) when it too is unavailable. */
-  private async tryGroqBackstop(feature: string, prompt: string, opts: LlmOptions): Promise<LlmResult | null> {
+  private async tryGroqBackstop(
+    feature: string,
+    prompt: string,
+    opts: LlmOptions,
+    remainingMs: number = DEFAULT_DEADLINE_MS
+  ): Promise<LlmResult | null> {
     if (!this.secrets.get("GROQ_API_KEY")) return null;
     try {
-      const res = await this.callGroq(prompt, opts);
+      const res = await raceDeadline(this.callGroq(prompt, opts), remainingMs);
       recordCall(this.db, feature, res.model, res.inputTokens, res.outputTokens);
       console.warn(`llm(${feature}) served by groq backstop — gemini quota spent`);
       return res;
